@@ -91,7 +91,7 @@ def test_processor_is_immutable_and_json_strict_with_independent_max_pain():
                       "long_max_pain_liquidation_price": 98, "long_max_pain_liquidation_level": 1,
                       "short_max_pain_liquidation_price": 102, "short_max_pain_liquidation_level": 1}]}}},
               "quality": {"status": "available", "warnings": [], "errors": []}}
-    price = {"value": 100, "timestamp": T - 2, "source_family": "prices_ohlcv", "source_market": "futures",
+    price = {"value": 100, "timestamp": T - 2, "source_family": "prices_ohlcv", "source_market": "spot",
              "source_timeframe": "1m", "price_field": "close", "is_closed_bar": True}
     before_source, before_price = deepcopy(source), deepcopy(price)
     output = process_long_short_liquidations(source, reference_price_context=price)
@@ -124,7 +124,7 @@ def _event(**changes):
 
 
 def _price_context(timestamp=T):
-    return {"value": 100, "timestamp": timestamp, "source_family": "prices_ohlcv", "source_market": "futures",
+    return {"value": 100, "timestamp": timestamp, "source_family": "prices_ohlcv", "source_market": "spot",
             "source_timeframe": "1m", "price_field": "close", "is_closed_bar": True}
 
 
@@ -180,7 +180,7 @@ def test_processing_smoke(case):
         assert result["status"] == ("available" if case == 20 else "unavailable")
     elif case in {22, 23, 24}:
         age = {22: 120, 23: 121, 24: -1}[case]
-        context = {"value": 100, "timestamp": T - age, "source_family": "prices_ohlcv", "source_market": "futures",
+        context = {"value": 100, "timestamp": T - age, "source_family": "prices_ohlcv", "source_market": "spot",
                    "source_timeframe": "1m", "price_field": "close", "is_closed_bar": True}
         assert validate_reference_price_context(context, T)[0] == (100 if case == 22 else None)
     elif case in {25, 26}:
@@ -217,7 +217,7 @@ def test_processing_smoke(case):
         result = build_pressure_score(components)
         assert (result["status"] == {38: "available", 39: "partial", 40: "unavailable"}[case]) if case != 50 else 0 <= result["score"] <= 100
     elif case in {41, 42, 43, 44}:
-        source, reference, config = _contract(), {"value": 100, "timestamp": T, "source_family": "prices_ohlcv", "source_market": "futures",
+        source, reference, config = _contract(), {"value": 100, "timestamp": T, "source_family": "prices_ohlcv", "source_market": "spot",
             "source_timeframe": "1m", "price_field": "close", "is_closed_bar": True}, {"custom": [1]}
         before = deepcopy((source, reference, config))
         output = process_long_short_liquidations(source, reference_price_context=reference, config=config)

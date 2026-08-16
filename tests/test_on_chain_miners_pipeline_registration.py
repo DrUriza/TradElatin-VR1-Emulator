@@ -2,7 +2,7 @@ from processing_signals.classification.classification_pipeline import CLASSIFICA
 from processing_signals.input.input_pipeline import INPUT_FAMILY_HANDLERS
 from processing_signals.main.main_pipeline import VERTICAL_FAMILY_HANDLERS, run_main_pipeline
 from processing_signals.processing.processing_pipeline import PROCESSING_FAMILY_HANDLERS
-from test_on_chain_miners_input_vertical import NOW, FakeFetcher
+from on_chain_miners_test_helpers import NOW, FakeFetcher
 
 
 def test_family_is_registered_in_all_four_pipelines():

@@ -6,6 +6,8 @@ from typing  import Any
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="legacy synthetic Prices CLI/export retired; current entrypoint is main.py")
+
 from processing_signals.main.main_pipeline import _run_synthetic_vertical, export_prices_screen_json, main, write_prices_screen_json
 
 

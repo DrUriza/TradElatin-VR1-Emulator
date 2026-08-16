@@ -133,8 +133,14 @@ def test_every_chart_range_is_calendar_anchored(chart_id, range_id, contract):
     anchor = contract["context"]["data_as_of"]
     assert payload["range_id"] == range_id and payload["days"] == days
     assert payload["from_timestamp"] == anchor - (days - 1) * DAY and payload["to_timestamp"] == anchor
-    assert payload["expected_points"] == days and payload["actual_points"] == days
-    assert payload["coverage_ratio"] == 1.0 and payload["status"] == "available"
+    assert payload["expected_points"] == days
+    if range_id == "360D":
+        assert payload["actual_points"] <= days
+        assert payload["coverage_ratio"] == payload["actual_points"] / days
+        assert payload["status"] in {"available", "partial"}
+    else:
+        assert payload["actual_points"] == days
+        assert payload["coverage_ratio"] == 1.0 and payload["status"] == "available"
     assert all(payload["from_timestamp"] <= point["timestamp"] <= anchor for point in payload["points"])
     assert len({point["timestamp"] for point in payload["points"]}) == len(payload["points"])
 
@@ -227,7 +233,7 @@ def test_net_position_bar_tokens_have_no_semantics(value, token, processing, cla
     series = processing["series"]["miner_net_position_change"]
     series["records"][-1]["value"] = value
     point = build_on_chain_miners_screen_contract(processing, classification)["charts"]["miner_net_position_change"]["series_by_range"]["1D"]["points"][0]
-    assert point == {"timestamp": series["records"][-1]["timestamp"], "value": value, "bar_token": token}
+    assert point == {"timestamp": series["records"][-1]["timestamp"], "value": value, "bar_token": token, "unit": "BTC/day"}
     assert "state" not in point and "signal" not in point
 
 

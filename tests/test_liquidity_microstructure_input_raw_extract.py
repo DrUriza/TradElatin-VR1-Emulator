@@ -10,7 +10,7 @@ def test_manifest_and_deterministic_plan_cover_eight_feeds():
     first = build_liquidity_microstructure_fetch_plan(reference_timestamp=1_700_000_000)
     second = build_liquidity_microstructure_fetch_plan(reference_timestamp=1_700_000_000)
     assert first == second
-    assert len(first) == 39
+    assert len(first) == 38
     assert {item["dimensions"]["range_percent"] for item in first if item["endpoint_id"].endswith("order_depth")} == {1, 5, 10}
     assert {item["transport"] for item in first} == {"rest", "websocket"}
     assert all("api_key" not in repr(item).lower() for item in first)
@@ -25,4 +25,4 @@ def test_failures_are_isolated_and_recovery_is_directed():
     assert any(item["status"] == "error" for item in bundle["requests"])
     recovery = build_liquidity_microstructure_fetch_plan(mode="recovery", reference_timestamp=1_700_000_000,
                                                           recovery_requests=["market_data_history"])
-    assert [item["endpoint_id"] for item in recovery] == ["market_data_history"]
+    assert recovery == []

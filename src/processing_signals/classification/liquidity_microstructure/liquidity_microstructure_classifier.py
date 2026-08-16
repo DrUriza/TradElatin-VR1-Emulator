@@ -19,20 +19,46 @@ from .liquidity_microstructure_rules import (
 STATUSES = {"available", "partial", "unavailable", "invalid"}
 
 
-def _validate_json(value: Any, path: str = "root") -> None:
+def _find_invalid_json_path(value: Any, path: str) -> tuple[str, str] | None:
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
-                raise ValueError(f"non_string_key:{path}")
-            _validate_json(item, f"{path}.{key}")
+                return "non_string_key", path
+            found = _find_invalid_json_path(item, f"{path}.{key}")
+            if found is not None:
+                return found
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         for index, item in enumerate(value):
-            _validate_json(item, f"{path}[{index}]")
+            found = _find_invalid_json_path(item, f"{path}[{index}]")
+            if found is not None:
+                return found
     elif isinstance(value, float):
         if not math.isfinite(value) or (value == 0 and math.copysign(1, value) < 0):
-            raise ValueError(f"invalid_float:{path}")
+            return "invalid_float", path
     elif value is not None and not isinstance(value, (str, int, bool)):
-        raise ValueError(f"non_json_value:{path}")
+        return "non_json_value", path
+    return None
+
+
+def _validate_json(value: Any, path: str = "root") -> None:
+    """Validate JSON values without materializing a path for every valid node."""
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Mapping):
+            if any(not isinstance(key, str) for key in current):
+                kind, found = _find_invalid_json_path(value, path) or ("non_string_key", path)
+                raise ValueError(f"{kind}:{found}")
+            stack.extend(current.values())
+        elif isinstance(current, Sequence) and not isinstance(current, (str, bytes)):
+            stack.extend(current)
+        elif isinstance(current, float):
+            if not math.isfinite(current) or (current == 0 and math.copysign(1, current) < 0):
+                kind, found = _find_invalid_json_path(value, path) or ("invalid_float", path)
+                raise ValueError(f"{kind}:{found}")
+        elif current is not None and not isinstance(current, (str, int, bool)):
+            kind, found = _find_invalid_json_path(value, path) or ("non_json_value", path)
+            raise ValueError(f"{kind}:{found}")
 
 
 def _timestamp(value: Any, path: str) -> int:
@@ -81,7 +107,6 @@ def validate_liquidity_microstructure_processing(processing_contract: Mapping[st
     if processing_contract["quality"].get("status") not in {"ok", "partial", "invalid"}:
         raise ValueError("invalid_processing_quality")
     _validate_json(processing_contract)
-    json.dumps(processing_contract, ensure_ascii=False, allow_nan=False)
 
 
 def _classify_orderbook(node: dict[str, Any], thresholds: Mapping[str, float]) -> None:
@@ -174,7 +199,10 @@ def _invalid_output(source: Mapping[str, Any], thresholds: Mapping[str, float], 
 def classify_liquidity_microstructure(processing_contract: Mapping[str, Any], *, config: Mapping[str, Any] | None = None,
                                       now_timestamp: int | None = None) -> dict[str, Any]:
     validate_liquidity_microstructure_processing(processing_contract)
-    thresholds, source = validate_thresholds(config), deepcopy(processing_contract)
+    # Processing is an external read-only input.  Copy only the branches that
+    # Classification enriches instead of cloning the entire 50+ MB contract and
+    # then cloning those same branches a second time below.
+    thresholds, source = validate_thresholds(config), processing_contract
     execution = source["execution_timestamp"] if now_timestamp is None else _timestamp(now_timestamp, "now_timestamp")
     if source["quality"]["status"] == "invalid":
         return _invalid_output(source, thresholds, execution)
@@ -203,7 +231,8 @@ def classify_liquidity_microstructure(processing_contract: Mapping[str, Any], *,
                                                         markets["perpetual"]["summary"][timeframe]["execution_liquidity_state"],
                                                         source_timestamp=source["reference_timestamp"]) for timeframe in TIMEFRAMES}
     required = {f"markets.{market}.{feature}": markets[market][feature]["status"] for market in MARKETS for feature in ("orderbook", "order_depth", "large_trades")}
-    required.update({"whale_activity": whale["status"], "market_history": history["status"]})
+    required.update({"whale_activity": whale["status"]})
+    optional = {"market_history": history["status"]}
     invalid = [key for key, value in required.items() if value == "invalid"]
     partial = [key for key, value in required.items() if value == "partial"]
     unavailable = [key for key, value in required.items() if value == "unavailable"]
@@ -222,7 +251,7 @@ def classify_liquidity_microstructure(processing_contract: Mapping[str, Any], *,
                                                        "large_trades_may_have_incomplete_coverage", "whale_index_is_proprietary",
                                                        "range_10_is_not_full_book", "observed_conditions_not_absolute_global_liquidity"]}},
               "quality": {"status": quality, "reason": None if quality == "ok" else "one_or_more_required_groups_not_available",
-                          "required_groups": list(required), "optional_groups": ["execution_liquidity", "comparison.spot_perpetual",
+                          "required_groups": list(required), "optional_groups": ["market_history", "execution_liquidity", "comparison.spot_perpetual",
                               "pressure_alignment", "cross_market_execution_liquidity", "whale_rolling_classification"],
                           "available_groups": available, "partial_groups": partial, "unavailable_groups": unavailable,
                           "invalid_groups": invalid, "warnings": [], "errors": []}}

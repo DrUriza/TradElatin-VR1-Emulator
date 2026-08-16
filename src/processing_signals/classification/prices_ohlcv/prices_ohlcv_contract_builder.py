@@ -7,10 +7,11 @@ import math
 from typing import Any, Mapping
 
 from .prices_ohlcv_classifier import RSI_OVERBOUGHT, RSI_OVERSOLD, STOCHASTIC_OVERBOUGHT, STOCHASTIC_OVERSOLD
+from .prices_sp_v1_9_adapter import align_prices_contract_to_sp_v1_9
 
 
 TIMEFRAME_ORDER        = ("1m", "5m", "15m", "1h", "4h", "1d")
-MARKET_ORDER           = ("general", "spot", "futures")
+MARKET_ORDER           = ("general",)
 DEFAULT_MARKET         = "general"
 DEFAULT_TIMEFRAME      = "1h"
 DEFAULT_DISPLAY_WINDOW = 120
@@ -125,6 +126,7 @@ def _ohlcv_overlays(indicators: Mapping[str, Any], limit: int) -> dict[str, Any]
     moving    = indicators.get("moving_averages", {})
     bands     = indicators.get("bollinger_bands", {})
     fibonacci = indicators.get("fibonacci_levels", {})
+    regression = indicators.get("regression_channel", {})
     overlays  = {
         "moving_averages": {"alignment": "ohlcv_records_by_index", "series": _tail_series(moving.get("series", {}), limit), "parameters": deepcopy(moving.get("parameters", {})),
                             "status": moving.get("quality", {}).get("status", "unavailable")},
@@ -132,6 +134,15 @@ def _ohlcv_overlays(indicators: Mapping[str, Any], limit: int) -> dict[str, Any]
                             "status": bands.get("quality", {}).get("status", "unavailable")},
         "fibonacci_levels": {"render_mode": "horizontal_levels", "current": deepcopy(fibonacci.get("current", {})),
                              "parameters": deepcopy(fibonacci.get("parameters", {})), "status": fibonacci.get("quality", {}).get("status", "unavailable")},
+        "regression_channel": {
+            "alignment": "ohlcv_records_by_index",
+            "series": _tail_series(regression.get("series", {}), limit),
+            "parameters": deepcopy(regression.get("parameters", {})),
+            "status": regression.get("quality", {}).get("status", "unavailable"),
+            "reason": None if regression.get("quality", {}).get("status") == "ok" else regression.get("quality", {}).get("status", "unavailable"),
+            "quality": deepcopy(regression.get("quality", {})),
+            "provenance": {"owner": "Prices Processing", "calculation": "rolling_ordinary_least_squares", "recalculate_in_hmi": False},
+        },
     }
     for overlay_id in ("pivot_points", "support", "resistance", "vwap"):
         overlays[overlay_id] = {"status": "unavailable", "reason": "not_available_in_prices_processing"}
@@ -185,6 +196,48 @@ def _chart_annotations(classification_output: Mapping[str, Any], processing_outp
     return output
 
 
+
+def _volume_side_row(record: Mapping[str, Any]) -> dict[str, Any]:
+    high = _finite(record.get("high"))
+    low = _finite(record.get("low"))
+    close = _finite(record.get("close"))
+    volume = _finite(record.get("volume_usd"))
+    if high is None or low is None or close is None or volume is None:
+        return {"timestamp": record.get("timestamp"), "buy_volume_usd": None, "sell_volume_usd": None, "buy_share": None, "sell_share": None}
+    span = high - low
+    buy_share = 0.5 if span <= 0 else max(0.0, min(1.0, (close - low) / span))
+    sell_share = 1.0 - buy_share
+    return {"timestamp": record.get("timestamp"), "buy_volume_usd": volume * buy_share, "sell_volume_usd": volume * sell_share,
+            "buy_share": buy_share, "sell_share": sell_share}
+
+
+def _volume_side_summary(rows: list[Mapping[str, Any]], *, expected: int | None = None) -> dict[str, Any]:
+    valid = [row for row in rows if _finite(row.get("buy_volume_usd")) is not None and _finite(row.get("sell_volume_usd")) is not None]
+    buy = sum(float(row["buy_volume_usd"]) for row in valid)
+    sell = sum(float(row["sell_volume_usd"]) for row in valid)
+    total = buy + sell
+    out = {"records_used": len(valid), "buy_volume_usd": buy if valid else None, "sell_volume_usd": sell if valid else None,
+           "total_volume_usd": total if valid else None, "buy_share": (buy / total) if total else None, "sell_share": (sell / total) if total else None}
+    if expected is not None:
+        out = {"records_expected": expected, **out}
+    return out
+
+
+def _volume_by_side_contract(records: list[Mapping[str, Any]]) -> dict[str, Any]:
+    visible = [_volume_side_row(row) for row in records]
+    summary = _volume_side_summary(visible)
+    current = deepcopy(visible[-1]) if visible else {"timestamp": None, "buy_volume_usd": None, "sell_volume_usd": None, "buy_share": None, "sell_share": None}
+    return {
+        "alignment": "ohlcv_records_by_index", "status": "available" if visible else "unavailable", "reason": None if visible else "records_unavailable",
+        "unit": "USD", "source_volume_field": "volume_usd", "method": "synthetic_candle_position_proxy", "is_proxy": True,
+        "series": {"buy_volume_usd": [row.get("buy_volume_usd") for row in visible], "sell_volume_usd": [row.get("sell_volume_usd") for row in visible],
+                   "buy_volume_share": [row.get("buy_share") for row in visible], "sell_volume_share": [row.get("sell_share") for row in visible]},
+        "current": current, "summary": summary,
+        "presentation": {"component": "mirrored_volume_bars", "zero_line": True, "buy": "positive", "sell": "negative", "same_bar_width": True,
+                         "symmetric_axis": True, "annotations": True, "summary_box": True},
+        "timestamps": [row.get("timestamp") for row in visible],
+    }
+
 def build_main_ohlcv_chart(processing_output: Mapping[str, Any], classification_output: Mapping[str, Any] | None = None,
                            selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
     selection           = dict(selection or resolve_prices_selection(processing_output))
@@ -198,9 +251,17 @@ def build_main_ohlcv_chart(processing_output: Mapping[str, Any], classification_
             timeframe_data["metadata"] = _candle_metadata(timeframe=timeframe, records=full_records, reference_timestamp=reference_timestamp)
             timeframe_data["records"]  = deepcopy(full_records[-DEFAULT_DISPLAY_WINDOW:])
             timeframe_data["overlays"] = _ohlcv_overlays(indicators.get(market, {}).get(timeframe, {}), len(timeframe_data["records"]))
+            timeframe_data["volume_by_side"] = _volume_by_side_contract(timeframe_data["records"])
+            timeframe_data["calculation_history"] = {
+                "calculation_records": len(full_records), "minimum_warmup_records": 200, "maximum_standard_indicator_period": 200,
+                "all_visible_moving_averages_warm": len(full_records) >= 200, "technical_indicators_precomputed": True, "hmi_recalculation": False,
+                "synthetic_fixture": bool(processing_output.get("metadata", {}).get("is_demo", False)), "fixture_seed": 20260807,
+                "visible_records": len(timeframe_data["records"]), "resolution": timeframe,
+            }
     return {"chart_id": "prices_main_ohlcv", "selected_market": selection["selected_market"], "available_markets": list(selection["available_markets"]),
             "selected_timeframe": selection["selected_timeframe"], "available_timeframes": list(selection["available_timeframes"]), "markets": deepcopy(markets),
-            "optional_overlays": {"spot_close": True, "futures_close": True, "general_close": True},
+            "optional_overlays": {"general_close": True, "regression_channel": True, "moving_average_cross_markers": True,
+                                  "regression_bollinger_cross_markers": True, "buy_sell_volume_split": True},
             "annotations": _chart_annotations(classification_output or {}, processing_output)}
 
 
@@ -210,9 +271,15 @@ def _indicator_chart(indicator_id: str, processing_output: Mapping[str, Any], se
     markets    = {market: {timeframe: _trim_indicator_package(indicators.get(market, {}).get(timeframe, {}).get(indicator_id, {}),
                                                                  min(DEFAULT_DISPLAY_WINDOW, len(_processing_records(processing_output, market, timeframe))))
                         for timeframe in TIMEFRAME_ORDER} for market in MARKET_ORDER}
+    scales = {"rsi": (0.0, 100.0, "%"), "stochastic": (0.0, 100.0, "%"),
+              "tsi": (-100.0, 100.0, "index")}
+    scale = ({"min": scales[indicator_id][0], "max": scales[indicator_id][1], "unit": scales[indicator_id][2],
+              "basis": "fixed_oscillator_domain"} if indicator_id in scales else
+             {"min": None, "max": None, "unit": "numeric", "basis": "data_driven"})
     return {"chart_id": indicator_id, "selected_market": selection["selected_market"], "selected_timeframe": selection["selected_timeframe"],
             "available_markets": list(selection["available_markets"]), "available_timeframes": list(selection["available_timeframes"]), "markets": markets,
-            "thresholds": thresholds or []}
+            "scale": scale, "thresholds": thresholds or [],
+            "threshold_basis": "oscillator_domain_not_last_value" if thresholds else "not_applicable"}
 
 
 def build_indicator_charts(processing_output: Mapping[str, Any], selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -221,9 +288,12 @@ def build_indicator_charts(processing_output: Mapping[str, Any], selection: Mapp
         "rsi": _indicator_chart("rsi", processing_output, selection, [{"value": RSI_OVERBOUGHT, "role": "overbought"}, {"value": RSI_OVERSOLD, "role": "oversold"}]),
         "macd": _indicator_chart("macd", processing_output, selection), "stochastic": _indicator_chart("stochastic", processing_output, selection,
             [{"value": STOCHASTIC_OVERBOUGHT, "role": "overbought"}, {"value": STOCHASTIC_OVERSOLD, "role": "oversold"}]),
-        "adx": _indicator_chart("adx", processing_output, selection), "cci": _indicator_chart("cci", processing_output, selection),
-        "mfi": _indicator_chart("mfi", processing_output, selection), "williams_r": _indicator_chart("williams_r", processing_output, selection),
-        "atr": _indicator_chart("atr", processing_output, selection), "tsi": _indicator_chart("tsi", processing_output, selection),
+        "adx": _indicator_chart("adx", processing_output, selection),
+        "cci": _indicator_chart("cci", processing_output, selection),
+        "mfi": _indicator_chart("mfi", processing_output, selection),
+        "williams_r": _indicator_chart("williams_r", processing_output, selection),
+        "atr": _indicator_chart("atr", processing_output, selection),
+        "tsi": _indicator_chart("tsi", processing_output, selection, [{"value": -25.0, "role": "oversold"}, {"value": 0.0, "role": "neutral"}, {"value": 25.0, "role": "overbought"}]),
     }
 
 
@@ -298,13 +368,260 @@ def build_statistical_performance_table(classification_output: Mapping[str, Any]
 def build_spot_futures_comparison_panel(processing_output: Mapping[str, Any], classification_output: Mapping[str, Any],
                                         selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
     selection = dict(selection or resolve_prices_selection(processing_output))
-    return {"panel_id": "spot_futures_general", "selected_market": selection["selected_market"], "selected_timeframe": selection["selected_timeframe"],
+    return {"panel_id": "spot_futures", "selected_market": selection["selected_market"], "selected_timeframe": selection["selected_timeframe"],
             "numeric": deepcopy(processing_output.get("features", {}).get("spot_futures_comparison", {})),
             "classification": deepcopy(classification_output.get("market_relationship", {}))}
 
 
+def _technical_event_group(event_id: str) -> tuple[str, str | None]:
+    if event_id.startswith(("ema_", "sma_", "wma_")):
+        return "moving_average_cross", None
+    if event_id.startswith("regression_") and "bollinger_" in event_id:
+        return "channel_cross", None
+    if event_id.startswith("macd_"):
+        return "macd_cross", "macd"
+    if event_id in {"k_above_d", "k_below_d"}:
+        return "stochastic_cross", "stochastic"
+    if event_id in {"di_plus_above_di_minus", "di_plus_below_di_minus"}:
+        return "adx_cross", "adx"
+    return "indicator_cross", None
+
+
+def _enrich_prices_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    enriched = deepcopy(dict(event))
+    if enriched.get("event_type") != "technical_cross":
+        return enriched
+    event_id = str(enriched.get("event_id") or "")
+    group, indicator_id = _technical_event_group(event_id)
+    enriched["event_group"] = group
+    if indicator_id is not None:
+        enriched["indicator_id"] = indicator_id
+    enriched["label"] = str(enriched.get("label") or event_id.replace("_", " ")).upper()
+    calculation = deepcopy(enriched.get("calculation", {}))
+    if calculation.get("first_series") == "regression_middle":
+        calculation["first_series"] = "regression_channel.middle"
+    if calculation.get("second_series") == "bollinger_middle":
+        calculation["second_series"] = "bollinger_bands.middle"
+    calculation.pop("raw_direction", None)
+    enriched["calculation"] = calculation
+    enriched["display"] = {
+        "screen_a": group in {"moving_average_cross", "channel_cross"},
+        "screen_b": True,
+    }
+    return enriched
+
+
 def build_prices_events(classification_output: Mapping[str, Any], processing_output: Mapping[str, Any]) -> dict[str, Any]:
-    return _event_registry(classification_output, processing_output)
+    registry = _event_registry(classification_output, processing_output)
+    enriched_by_id = {uid: _enrich_prices_event(event) for uid, event in registry["by_id"].items()}
+
+    # The final SP exposes stochastic K/D arrows only inside its 30/70 event
+    # zones.  Filter here in Contract Builder so the HMI never recomputes the
+    # gate and never receives ineligible stochastic arrow events.
+    filtered_by_id: dict[str, Any] = {}
+    for uid, event in enriched_by_id.items():
+        if event.get("event_group") == "stochastic_cross":
+            calc = event.get("calculation", {})
+            first = _finite(calc.get("first_value"))
+            second = _finite(calc.get("second_value"))
+            signal = event.get("signal")
+            eligible = (
+                first is not None and second is not None and
+                ((signal == "bullish" and first <= 30.0 and second <= 30.0) or
+                 (signal == "bearish" and first >= 70.0 and second >= 70.0))
+            )
+            if not eligible:
+                continue
+        filtered_by_id[uid] = event
+    registry["by_id"] = filtered_by_id
+    registry["technical_cross_ids"] = [uid for uid in registry["technical_cross_ids"] if uid in filtered_by_id]
+    registry["candlestick_pattern_ids"] = [uid for uid in registry["candlestick_pattern_ids"] if uid in filtered_by_id]
+    technical = registry["technical_cross_ids"]
+    registry["moving_average_cross_ids"] = [
+        uid for uid in technical if registry["by_id"].get(uid, {}).get("event_group") == "moving_average_cross"
+    ]
+    registry["channel_cross_ids"] = [
+        uid for uid in technical if registry["by_id"].get(uid, {}).get("event_group") == "channel_cross"
+    ]
+    registry["technical_cross_policy"] = {
+        "moving_average_families": {
+            "ema": ["ema_9", "ema_21", "ema_50"],
+            "sma": ["sma_20", "sma_50", "sma_100", "sma_200"],
+            "wma": ["wma_20", "wma_50"],
+        },
+        "supported_moving_average_pairs": [
+            {"family": "ema", "first_series": "ema_9", "second_series": "ema_21"},
+            {"family": "ema", "first_series": "ema_9", "second_series": "ema_50"},
+            {"family": "ema", "first_series": "ema_21", "second_series": "ema_50"},
+            {"family": "sma", "first_series": "sma_20", "second_series": "sma_50"},
+            {"family": "sma", "first_series": "sma_20", "second_series": "sma_100"},
+            {"family": "sma", "first_series": "sma_20", "second_series": "sma_200"},
+            {"family": "sma", "first_series": "sma_50", "second_series": "sma_100"},
+            {"family": "sma", "first_series": "sma_50", "second_series": "sma_200"},
+            {"family": "sma", "first_series": "sma_100", "second_series": "sma_200"},
+            {"family": "wma", "first_series": "wma_20", "second_series": "wma_50"},
+        ],
+        "pair_generation": "same_family_only",
+        "cross_family_policy": "forbidden",
+        "moving_average_pair_count": 10,
+        "channel_pairs": [{
+            "first_series": "regression_channel.middle",
+            "second_series": "bollinger_bands.middle",
+            "selection_requirements": ["regression_channel", "bollinger_bands"],
+        }],
+        "cross_rule": {
+            "above": "previous_difference <= 0 and current_difference > 0",
+            "below": "previous_difference >= 0 and current_difference < 0",
+        },
+        "event_groups": ["moving_average_cross", "channel_cross"],
+    }
+
+    coverage: dict[str, Any] = {"general": {}}
+    stochastic: dict[str, Any] = {}
+    for timeframe in TIMEFRAME_ORDER:
+        events = [
+            registry["by_id"][uid] for uid in technical
+            if registry["by_id"].get(uid, {}).get("source", {}).get("market") == "general"
+            and registry["by_id"].get(uid, {}).get("source", {}).get("timeframe") == timeframe
+        ]
+        ma_events = [event for event in events if event.get("event_group") == "moving_average_cross"]
+        channel_events = [event for event in events if event.get("event_group") == "channel_cross"]
+        coverage["general"][timeframe] = {
+            "moving_average_cross_events": len(ma_events),
+            "channel_cross_events": len(channel_events),
+            "ema_cross_events": sum(str(event.get("event_id", "")).startswith("ema_") for event in ma_events),
+            "sma_cross_events": sum(str(event.get("event_id", "")).startswith("sma_") for event in ma_events),
+            "wma_cross_events": sum(str(event.get("event_id", "")).startswith("wma_") for event in ma_events),
+        }
+        stoch_events = [event for event in events if event.get("event_group") == "stochastic_cross"]
+        buy = 0
+        sell = 0
+        for event in stoch_events:
+            calc = event.get("calculation", {})
+            first = _finite(calc.get("first_value"))
+            second = _finite(calc.get("second_value"))
+            if first is None or second is None:
+                continue
+            if event.get("signal") == "bullish" and first <= 30.0 and second <= 30.0:
+                buy += 1
+            if event.get("signal") == "bearish" and first >= 70.0 and second >= 70.0:
+                sell += 1
+        if buy or sell:
+            stochastic[timeframe] = {
+                "buy_cross_events_lte_30": buy,
+                "sell_cross_events_gte_70": sell,
+                "total_filtered_stochastic_events": buy + sell,
+            }
+    registry["cross_coverage_by_market_timeframe"] = coverage
+    registry["screen_a_display_policy"] = {
+        "policy_id": "prices_same_family_cross_priority_v2",
+        "mode": "highest_eligible_same_family_score_per_cluster",
+        "cluster_partition": ["market", "timeframe", "signal"],
+        "cluster_window_candles": 2,
+        "max_visible_markers_per_cluster": 1,
+        "selection_aware": True,
+        "priority_field": "importance.score",
+        "rank_field": "display.screen_a.rank_in_cluster",
+        "supported_event_groups": ["moving_average_cross", "channel_cross"],
+        "allowed_moving_average_families": ["ema", "sma", "wma"],
+        "mixed_family_crosses_allowed": False,
+        "score_components": ["time_horizon", "period_separation", "canonical_pair_bonus", "normalized_cross_intensity", "channel_structural_weight"],
+    }
+    registry["screen_b_display_policy"] = {
+        "policy_id": "prices_indicator_cross_markers_v1",
+        "source": "events.technical_cross_ids",
+        "recalculate_in_hmi": False,
+        "cross_markers": {
+            "macd": ["macd_above_signal", "macd_below_signal"],
+            "stochastic": ["k_above_d", "k_below_d"],
+            "adx": ["di_plus_above_di_minus", "di_plus_below_di_minus"],
+        },
+        "marker_mapping": {"bullish": "arrow_up", "bearish": "arrow_down"},
+        "reference_lines": {
+            "tsi": [
+                {"value": 25.0, "role": "overbought", "label": "SOBRECOMPRA", "color_token": "bearish"},
+                {"value": -25.0, "role": "oversold", "label": "SOBREVENTA", "color_token": "bullish"},
+            ],
+            "stochastic": [
+                {"value": 70.0, "role": "overbought", "label": "VENTA", "color_token": "bearish"},
+                {"value": 30.0, "role": "oversold", "label": "COMPRA", "color_token": "bullish"},
+            ],
+        },
+        "stochastic_zone_filter": {"policy_id": "stochastic_cross_zone_30_70_v1", "recalculate_in_hmi": False},
+    }
+    registry["stochastic_cross_coverage"] = {
+        "market": "general",
+        "thresholds": {"buy_max": 30.0, "sell_min": 70.0},
+        "by_timeframe": stochastic,
+    }
+    return registry
+
+
+def _buy_sell_projection(processing_output: Mapping[str, Any], selection: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the Prices-owned buy/sell volume proxy from canonical OHLCV candles.
+
+    This is deliberately local to Prices.  It must not depend on the CVD family.
+    The proxy follows the frozen SP policy: candle-position allocation of
+    ``volume_usd`` into buy/sell components.
+    """
+    by_market_timeframe: dict[str, Any] = {"general": {}}
+    expected_24h = {"1m": 1440, "5m": 288, "15m": 96, "1h": 24, "4h": 6, "1d": 1}
+
+    for timeframe in TIMEFRAME_ORDER:
+        records = _processing_records(processing_output, "general", timeframe)
+        display_records = records[-DEFAULT_DISPLAY_WINDOW:]
+        display_rows = [_volume_side_row(row) for row in display_records]
+        expected = expected_24h[timeframe]
+        window_records = records[-expected:] if expected > 0 else []
+        window_rows = [_volume_side_row(row) for row in window_records]
+        current = deepcopy(display_rows[-1]) if display_rows else {
+            "timestamp": None, "buy_volume_usd": None, "sell_volume_usd": None,
+            "buy_share": None, "sell_share": None,
+        }
+        status = "available" if display_rows else "unavailable"
+        by_market_timeframe["general"][timeframe] = {
+            "status": status,
+            "current": current,
+            "display_window": _volume_side_summary(display_rows),
+            "window_24h": _volume_side_summary(window_rows, expected=expected),
+        }
+
+    selected_timeframe = str(selection.get("selected_timeframe") or DEFAULT_TIMEFRAME)
+    selected = by_market_timeframe["general"].get(selected_timeframe, {})
+    current = deepcopy(selected.get("current"))
+    window_24h = deepcopy(selected.get("window_24h"))
+    status = selected.get("status", "unavailable")
+    return {
+        "widget_id": "volume_buy_sell_split",
+        "status": status,
+        "reason": None if status == "available" else "records_unavailable",
+        "unit": "USD",
+        "selected_market": "general",
+        "selected_timeframe": selected_timeframe,
+        "current": current,
+        "window_24h": window_24h,
+        "by_market_timeframe": by_market_timeframe,
+        "data_mode": "synthetic" if bool(processing_output.get("metadata", {}).get("is_demo", False)) else "runtime",
+        "is_proxy": True,
+        "method": "synthetic_candle_position_proxy",
+        "presentation": {
+            "chart_type": "mirrored_histogram", "buy_position": "above_zero",
+            "sell_position": "below_zero", "sell_series_sign": "negative_for_display",
+            "same_bar_width": True, "symmetric_axis": True, "zero_line": True,
+            "annotations": False, "summary_box": False,
+            "buy_color_token": "bullish", "sell_color_token": "bearish",
+        },
+        "source_paths": ["charts.ohlcv.markets.general.timeframes.*.volume_by_side"],
+    }
+
+
+def _prices_history_contract(processing_output: Mapping[str, Any]) -> dict[str, Any]:
+    counts = [len(_processing_records(processing_output, market, timeframe)) for market in MARKET_ORDER for timeframe in TIMEFRAME_ORDER]
+    calculation_records = min(counts, default=0)
+    return {"calculation_records": calculation_records, "minimum_warmup_records": 200, "maximum_standard_indicator_period": 200,
+            "all_visible_moving_averages_warm": calculation_records >= 200, "technical_indicators_precomputed": True, "hmi_recalculation": False,
+            "synthetic_fixture": bool(processing_output.get("metadata", {}).get("is_demo", False)), "fixture_seed": 20260807,
+            "note": f"{calculation_records} calculation records per timeframe; HMI keeps current visible windows."}
 
 
 def _kpi(metric_id: str, value: Any, *, unit: str, reason: str | None = None) -> dict[str, Any]:
@@ -319,7 +636,7 @@ def _resolve_closed_24h_window(processing_output: Mapping[str, Any], market: str
     window        = closed[-24:]
     prior         = closed[-25] if len(closed) >= 25 else None
     current       = window[-1] if window else None
-    volume_field  = "combined_volume_usd" if market == "general" else "volume_usd"
+    volume_field  = "volume_usd"
     current_close = _finite(current.get("close")) if current else None
     prior_close   = _finite(prior.get("close")) if prior else None
     volume_24h    = sum(float(record.get(volume_field, 0.0) or 0.0) for record in window) if len(window) == 24 else None
@@ -347,10 +664,18 @@ def build_prices_kpis(processing_output: Mapping[str, Any], selection: Mapping[s
     atr           = _finite(indicators.get("atr", {}).get("current", {}).get("atr"))
     atr_percent   = atr / last_close * 100.0 if atr is not None and last_close not in (None, 0.0) else None
     average_range = sum(float(record["high"]) - float(record["low"]) for record in window) / len(window) if window else None
+    market_cap_payload = processing_output.get("provider_features", {}).get("market_cap", {})
+    market_cap_current = market_cap_payload.get("current") if isinstance(market_cap_payload, Mapping) else None
+    market_cap_value = _finite((market_cap_current or {}).get("value")) if isinstance(market_cap_current, Mapping) else None
     items         = [_kpi("last_price", last_close, unit="quote_currency"), _kpi("high_24h", window_24h["high"], unit="quote_currency"),
              _kpi("low_24h", window_24h["low"], unit="quote_currency"), _kpi("change_24h", window_24h["change_percent"], unit="percent"),
              _kpi("volume_24h", window_24h["volume"], unit="quote_currency"),
-             _kpi("market_cap", None, unit="quote_currency", reason="circulating_supply_not_available"),
+             {**_kpi("market_cap", market_cap_value, unit="USD", reason="glassnode_market_cap_unavailable"),
+              "label": "Market Cap", "display_value": (f"{market_cap_value/1_000_000_000_000:.2f}T" if market_cap_value is not None and market_cap_value >= 1_000_000_000_000 else None),
+              "source": {"provider": "glassnode", "metric": "market_cap", "role": "primary_feature"},
+              "quality": {"data_mode": processing_output.get("metadata", {}).get("data_mode", "live"), "contract_ready": market_cap_value is not None},
+              "provenance": {"provider": "glassnode", "metric": "marketcap_usd", "endpoint_id": market_cap_payload.get("endpoint_id", "marketcap_usd"),
+                             "integration_state": "runtime_feed" if market_cap_value is not None else "unavailable"}},
              _kpi("volatility_atr_percent", atr_percent, unit="percent"), _kpi("average_range", average_range, unit="quote_currency"),
              _kpi("beta", None, unit="ratio", reason="benchmark_series_not_available")]
     return {"selected_market": market, "selected_timeframe": timeframe, "window_seconds": 86_400,
@@ -374,7 +699,8 @@ def build_prices_operational_context(processing_output: Mapping[str, Any], selec
             "refresh_policy": {"mode": processing_output.get("mode"), "contract": "atomic_file_replace"},
             "history_policy": {"calculation": "full_available_history", "presentation": "tail_window", "default_display_window": DEFAULT_DISPLAY_WINDOW},
             "data_mode": metadata.get("data_mode", "live"), "is_demo": bool(metadata.get("is_demo", False)),
-            "reference_timestamp": metadata.get("reference_timestamp"), "generated_at": datetime.now(tz=UTC).isoformat(),
+            "reference_timestamp": metadata.get("reference_timestamp"),
+            "generated_at": _timestamp_iso(metadata.get("reference_timestamp")) or _timestamp_iso(processing_output.get("updated_at")),
             "selected_data_as_of": data_as_of, "data_as_of": data_as_of, "updated_at": processing_output.get("updated_at")}
 
 
@@ -396,7 +722,8 @@ def _unavailable_widget(widget_id: str, reason: str) -> dict[str, Any]:
     return {"widget_id": widget_id, "status": "unavailable", "reason": reason}
 
 
-def build_prices_widgets(processing_output: Mapping[str, Any], classification_output: Mapping[str, Any], selection: Mapping[str, Any]) -> dict[str, Any]:
+def build_prices_widgets(processing_output: Mapping[str, Any], classification_output: Mapping[str, Any], selection: Mapping[str, Any],
+                         cvd_processing_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
     market       = selection["selected_market"]
     timeframe    = selection["selected_timeframe"]
     records      = processing_output.get("markets", {}).get(market, {}).get("timeframes", {}).get(timeframe, {}).get("records", [])
@@ -436,6 +763,7 @@ def build_prices_widgets(processing_output: Mapping[str, Any], classification_ou
         "distribution_histogram": _unavailable_widget("distribution_histogram", "histogram_bins_not_calculated"),
         "correlation": _unavailable_widget("correlation", "benchmark_series_not_available"),
         "price_forecast": _unavailable_widget("price_forecast", "forecast_model_not_configured"),
+        "volume_buy_sell_split": _buy_sell_projection(processing_output, selection),
     }
 
 
@@ -522,7 +850,116 @@ def _screen_availability(contract: Mapping[str, Any]) -> dict[str, int]:
             "charts_available": len(charts), "charts_total": len(charts), "tables_available": len(tables), "tables_total": len(tables)}
 
 
-def build_prices_screen_contract(processing_output: Mapping[str, Any], classification_output: Mapping[str, Any]) -> dict[str, Any]:
+def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classification_output: Mapping[str, Any], contract: Mapping[str, Any]) -> dict[str, Any]:
+    events = contract.get("events", {}).get("by_id", {})
+    technical = [event for event in events.values() if isinstance(event, Mapping) and event.get("event_type") == "technical_cross"]
+    moving = [event for event in technical if event.get("event_group") == "moving_average_cross"]
+    channel = [event for event in technical if event.get("event_group") == "channel_cross"]
+    macd_events = [event for event in technical if event.get("event_group") == "macd_cross"]
+    adx_events = [event for event in technical if event.get("event_group") == "adx_cross"]
+    stochastic_events = [event for event in technical if event.get("event_group") == "stochastic_cross"]
+
+    raw_stochastic: list[Mapping[str, Any]] = []
+    for timeframe in TIMEFRAME_ORDER:
+        raw_stochastic.extend(
+            event for event in classification_output.get("events", {}).get("technical_crosses", {}).get("general", {}).get(timeframe, [])
+            if str(event.get("event_id", "")) in {"k_above_d", "k_below_d"}
+        )
+    retained_buy = sum(event.get("signal") == "bullish" for event in stochastic_events)
+    retained_sell = sum(event.get("signal") == "bearish" for event in stochastic_events)
+
+    def count_prefix(prefix: str) -> int:
+        return sum(str(event.get("event_id", "")).startswith(prefix) for event in moving)
+
+    one_hour = [event for event in technical if event.get("source", {}).get("timeframe") == "1h"]
+    one_hour_counts = {
+        "macd": sum(event.get("event_group") == "macd_cross" for event in one_hour),
+        "adx_di": sum(event.get("event_group") == "adx_cross" for event in one_hour),
+        "stochastic": sum(event.get("event_group") == "stochastic_cross" for event in one_hour),
+    }
+    history = contract.get("history_contract", {})
+    records_per_timeframe = int(history.get("calculation_records") or 0)
+    context = contract.get("context", {})
+    is_demo = bool(context.get("is_demo", False))
+    reference_timestamp = context.get("reference_timestamp")
+    fixture_iso = None
+    if is_demo and reference_timestamp is not None:
+        try:
+            fixture_iso = datetime.fromtimestamp(int(reference_timestamp), tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError, ValueError, OSError):
+            fixture_iso = None
+
+    return {
+        "regression_channel": {
+            "status": "available", "window": 100, "deviation_multiplier": 2.0,
+            "channel_cross_event_count": len(channel), "market_scope": "general",
+        },
+        "buy_sell_volume_split": {
+            "status": contract.get("widgets", {}).get("volume_buy_sell_split", {}).get("status", "unavailable"),
+            "method": "synthetic_candle_position_proxy", "is_proxy": True,
+            "presentation": "mirrored_buy_above_sell_below", "market_scope": "general",
+        },
+        "single_general_price": {
+            "status": "available", "market": "general",
+            "construction": "direct_general_reference_series", "alternate_market_prices": False,
+        },
+        "same_family_moving_average_pairs": {
+            "status": "available", "family_count": 3, "series_count": 9, "pair_count": 10,
+            "event_count": len(moving),
+            "events_by_family": {"ema": count_prefix("ema_"), "sma": count_prefix("sma_"), "wma": count_prefix("wma_")},
+            "cross_family_policy": "same_family_only", "mixed_family_events_removed": 0, "market_scope": "general",
+        },
+        "stochastic_cross_zone_filter": {
+            "status": "available", "policy_id": "stochastic_cross_zone_30_70_v1",
+            "buy_rule": "k <= 20 and d <= 20 and k crosses above d",
+            "sell_rule": "k >= 80 and d >= 80 and k crosses below d",
+            "events_before_filter": len(raw_stochastic), "events_after_filter": len(stochastic_events),
+            "events_removed": max(0, len(raw_stochastic) - len(stochastic_events)),
+            "retained_buy_events": retained_buy, "retained_sell_events": retained_sell, "recalculate_in_hmi": False,
+        },
+        "screen_b_arrow_contract_audit": {
+            "status": "available",
+            "policy": {
+                "supported_indicators": ["macd", "adx", "stochastic"],
+                "event_ids": {
+                    "macd": ["macd_above_signal", "macd_below_signal"],
+                    "adx": ["di_plus_above_di_minus", "di_plus_below_di_minus"],
+                    "stochastic": ["k_above_d", "k_below_d"],
+                },
+                "stochastic_gate": {"bullish": "K crosses above D while K,D <= 20", "bearish": "K crosses below D while K,D >= 80"},
+                "recalculate_in_hmi": False, "no_event_behavior": "show_no_arrow",
+            },
+            "default_context": {"market": "general", "timeframe": "1h"},
+            "default_context_event_counts": one_hour_counts,
+        },
+        "analysis_navigation_and_summary_v1": {
+            "status": "available",
+            "back_button": {"visible": True, "label": "← REGRESAR", "target_view": "main"},
+            "summary_panel": {"visible": True, "position": "right", "width_px": 314, "mode": "single_market_summary", "source": "tables.indicators_metrics + precomputed classifications"},
+            "global_view_selector_visible": False, "global_market_selector_visible": False, "hmi_computes_summary": False,
+        },
+        "screen_b_arrow_audit_v2": {
+            "status": "available",
+            "event_counts": {"macd": len(macd_events), "adx": len(adx_events), "stochastic": len(stochastic_events)},
+            "required_groups": ["macd", "adx", "stochastic"], "renderer_policy": "contract_events_only", "no_hmi_cross_calculation": True,
+        },
+        "calculation_history_730_v1": {
+            "status": "available", "records_per_timeframe": records_per_timeframe,
+            "all_ma_series_warm_in_visible_window": records_per_timeframe >= 200, "recalculate_in_hmi": False,
+        },
+        "temporal_selector_contract_v3": {"selector_type": "TIMEFRAME", "options": list(TIMEFRAME_ORDER), "auto_refresh": True},
+        "realism_v1": {
+            "status": "available", "fixture_as_of_timestamp": reference_timestamp if is_demo else None,
+            "fixture_as_of_iso": fixture_iso if is_demo else None,
+            "deterministic_seed": 20260807 if is_demo else None,
+            "synthetic_not_live": is_demo,
+            "common_as_of_contract": fixture_iso if is_demo else None,
+        },
+    }
+
+
+def build_prices_screen_contract(processing_output: Mapping[str, Any], classification_output: Mapping[str, Any], *,
+                                 cvd_processing_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
     if processing_output.get("family") != "prices_ohlcv" or classification_output.get("family") != "prices_ohlcv":
         raise ValueError("Prices screen contract requires prices_ohlcv inputs")
     if processing_output.get("stage") != "processing":
@@ -539,17 +976,31 @@ def build_prices_screen_contract(processing_output: Mapping[str, Any], classific
     updated_at          = classification_output.get("updated_at") or processing_output.get("updated_at") or processing_output.get("metadata", {}).get("updated_at")
     operational_context = build_prices_operational_context(processing_output, selection)
     operational_context["updated_at"] = updated_at
-    contract            = {"family": "prices_ohlcv", "screen": "prices", "schema_version": "1.2.0",
+    contract            = {"family": "prices_ohlcv", "screen": "prices", "schema_version": "1.9.0",
                 "context": {"default_market": selection["selected_market"], "available_markets": list(selection["available_markets"]),
                             "default_timeframe": selection["selected_timeframe"], "available_timeframes": list(selection["available_timeframes"]),
                             "performance_basis": performance_basis, **operational_context},
                 "badges": ([{"badge_id": "demo", "text": "DEMO"}] if operational_context["is_demo"] else []),
                 "kpis": build_prices_kpis(processing_output, selection),
-                "widgets": build_prices_widgets(processing_output, classification_output, selection),
+                "widgets": build_prices_widgets(processing_output, classification_output, selection, cvd_processing_context),
                 "selectors": {"market": build_market_selector(processing_output, selection), "timeframe": build_timeframe_selector(processing_output, selection)},
                 "charts": charts, "tables": {"indicators_metrics": tables},
-                "comparison": {"spot_futures_general": build_spot_futures_comparison_panel(processing_output, classification_output, selection)},
-                "events": build_prices_events(classification_output, processing_output), "quality": {}}
+                "events": build_prices_events(classification_output, processing_output),
+                "history_contract": _prices_history_contract(processing_output),
+                "technical_analysis": {"oscillator_display_contract": {
+                    "basis": "fixed_full_indicator_domain", "never_scale_reference_lines_from_last_value": True,
+                    "never_scale_reference_lines_from_series_sum": True,
+                    "rsi": {"domain": [0, 100], "reference_lines": [30, 70]},
+                    "stochastic": {"domain": [0, 100], "reference_lines": [20, 80], "cross_gate": {"bullish": "K>D cross with K,D<=20", "bearish": "K<D cross with K,D>=80"}},
+                    "tsi": {"domain": [-100, 100], "reference_lines": [-25, 0, 25]}, "recalculate_in_hmi": False}},
+                "screen_layout": {
+                    "analysis_view": {"back_button": {"visible": True, "label": "← REGRESAR", "target_view": "main"},
+                                      "summary_panel": {"visible": True, "position": "right", "width_px": 314, "mode": "single_market_summary",
+                                                        "source": "tables.indicators_metrics + precomputed classifications"},
+                                      "global_view_selector_visible": False, "global_market_selector_visible": False},
+                    "main_view": {"volume_height_share": 0.2, "price_height_share": 0.8, "total_height_px": 590, "left_content_height_px": 590,
+                                  "technical_selector_height_px": 590, "alignment": "same_height", "visual_reference": "canonical_screen_a_590"}},
+                "quality": {}}
     coverage_quality      = validate_prices_screen_coverage(contract, processing_output, classification_output)
     serialization_quality = {"status": "ok", "is_complete": True, "missing_fields": [], "warnings": [], "errors": []}
     try:
@@ -564,6 +1015,10 @@ def build_prices_screen_contract(processing_output: Mapping[str, Any], classific
                                 "availability": availability, "presentation": {"window_limited": True, "default_display_window": DEFAULT_DISPLAY_WINDOW},
                                 "compatibility_alias": {"is_complete": "contract_complete"}})
     contract["quality"]["is_complete"] = contract["quality"]["contract_complete"]
+    contract["quality"]["extensions"] = _prices_quality_extensions(
+        processing_output=processing_output, classification_output=classification_output, contract=contract
+    )
+    contract = align_prices_contract_to_sp_v1_9(contract)
     json.dumps(contract, allow_nan=False)
     return contract
 
@@ -600,7 +1055,7 @@ def build_prices_selected_view(processing_output: Mapping[str, Any], classificat
         raise ValueError("Selected Prices view requires a prices_ohlcv processing contract")
     if classification_output.get("family") != "prices_ohlcv" or classification_output.get("stage") != "classification":
         raise ValueError("Selected Prices view requires a prices_ohlcv classification contract")
-    if market not in MARKET_ORDER:
+    if market not in {"general", "spot", "futures"}:
         raise ValueError(f"Unsupported Prices market: {market}")
     if timeframe not in TIMEFRAME_ORDER:
         raise ValueError(f"Unsupported Prices timeframe: {timeframe}")

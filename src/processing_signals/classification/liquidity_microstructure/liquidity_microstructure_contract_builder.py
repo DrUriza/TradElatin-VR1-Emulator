@@ -11,12 +11,14 @@ import json
 import math
 from typing import Any
 
+from .liquidity_microstructure_sp_v1_2_adapter import align_liquidity_microstructure_to_sp_v1_2
+
 FAMILY = SCREEN_ID = "liquidity_microstructure"
 SCREEN_SCHEMA = "trad_elatin.liquidity_microstructure.screen.v1"
-SCREEN_VERSION = "1.0.0"
+SCREEN_VERSION = "1.2.0"
 SCREEN_ROUTE = "/liquidity"
 SCREEN_TITLE = "LIQUIDITY MICROSTRUCTURE"
-SCREEN_SUBTITLE = "Order-book depth, large trades, whale activity & market context"
+SCREEN_SUBTITLE = "Order-book depth, whale orders, large trades & liquidity context"
 STAGE = "screen_contract"
 MARKETS = ("spot", "perpetual")
 TIMEFRAMES = ("1m", "5m", "15m", "1h")
@@ -25,15 +27,17 @@ DEFAULT_TIMEFRAME = "1m"
 DISPLAY_DEPTH_BASIS = "base_quantity"
 REFERENCE_DEPTH_RANGE_PERCENT = 10
 DISPLAY_POINT_LIMIT = 220
-ORDERBOOK_TABLE_LIMIT = 12
-LARGE_TRADE_TABLE_LIMIT = 50
+ORDERBOOK_TABLE_LIMIT = 50
+LARGE_TRADE_TABLE_LIMIT = 120
 KPI_IDS = ("bid_depth", "ask_depth", "spread", "liquidity_imbalance", "mid_price", "impact_1_btc")
-CHART_IDS = ("order_depth_aggregated", "order_depth_zero_to_one", "order_depth_one_to_five", "large_trades_flow", "whale_activity", "market_history")
-TABLE_IDS = ("orderbook_snapshot_aggregated", "orderbook_snapshot_zero_to_one", "orderbook_snapshot_one_to_five", "large_trades")
+CHART_IDS = ("order_depth", "whale_liquidity_profile", "executed_liquidity_profile", "large_trades_flow", "whale_activity", "market_history")
+TABLE_IDS = ("orderbook_snapshot", "whale_orders", "large_trades")
 WIDGET_IDS = ("observed_liquidity", "large_trade_pressure", "whale_activity_state", "market_context", "spot_perpetual_comparison", "source_status")
 DRILLDOWN_IDS = ("orderbook_details", "market_impact_details", "large_trades_details", "whale_activity_details", "market_history_details", "cross_market_details")
-LIMITATIONS = ("coinglass_only", "no_glassnode", "no_cryptoquant", "large_trade_collection_may_be_incomplete", "whale_index_is_proprietary",
-               "range_10_is_not_full_book", "observed_conditions_not_global_absolute_liquidity", "provider_is_coinglass_exchange_is_binance")
+LIMITATIONS = ("coinglass_only", "no_glassnode", "no_cryptoquant", "range_10_is_not_full_book",
+               "observed_conditions_not_global_absolute_liquidity", "provider_is_coinglass_exchange_is_binance",
+               "whale_orders_from_large_limit_order_endpoint",
+               "executed_liquidity_is_footprint_price_bin_aggregation_not_individual_trade_tape")
 
 
 def _number(value: Any, *, positive: bool = False, nullable: bool = False) -> None:
@@ -192,7 +196,10 @@ def build_liquidity_microstructure_screen_contract(bundle: Mapping[str, Any], *,
     validate_liquidity_microstructure_builder_inputs(bundle, runtime_context=runtime_context, selected_market=selected_market,
                                                       selected_timeframe=selected_timeframe, display_point_limit=display_point_limit,
                                                       orderbook_table_limit=orderbook_table_limit, large_trade_table_limit=large_trade_table_limit)
-    p, c, runtime = deepcopy(bundle["processing"]), deepcopy(bundle["classification"]), deepcopy(runtime_context)
+    # The builder treats both upstream contracts as read-only and explicitly
+    # copies every projected mutable branch below.  Avoid cloning the complete
+    # Processing and Classification trees merely to read from them.
+    p, c, runtime = bundle["processing"], bundle["classification"], dict(runtime_context)
     market_path = f"markets.{selected_market}"; ob_path = f"{market_path}.orderbook.timeframes.{selected_timeframe}"
     depth_path = f"{market_path}.order_depth.timeframes.{selected_timeframe}"
     ob, cob = p["markets"][selected_market]["orderbook"]["timeframes"][selected_timeframe], c["markets"][selected_market]["orderbook"]["timeframes"][selected_timeframe]
@@ -208,37 +215,87 @@ def build_liquidity_microstructure_screen_contract(bundle: Mapping[str, Any], *,
             _kpi("liquidity_imbalance", "Liquidity Imbalance", base.get("imbalance_percent"), "%", "percent", base.get("status", "unavailable"), [f"{depth_path}.direct_ranges[range_percent=10].base_quantity.imbalance_percent"], timestamp, depth_class.get("display_color_token", "neutral"), base | {"basis": DISPLAY_DEPTH_BASIS, "range_percent": 10}),
             _kpi("mid_price", "Mid Price", current.get("mid_price"), "USD", "usd", current.get("status", "unavailable"), [f"{ob_path}.current.mid_price"], current.get("timestamp"), metadata={"best_bid": current.get("best_bid"), "best_ask": current.get("best_ask")}),
             _kpi("impact_1_btc", "Impact 1 BTC", worst if filled else None, "bps", "bps", impact.get("status", "unavailable") if filled else "partial", [f"{ob_path}.current.market_impact.worst_side_impact_bps"], current.get("timestamp"), ob_class.get("market_impact", {}).get("worst_side", {}).get("display_color_token", "neutral"), impact)]
-    charts = {"order_depth_aggregated": _depth_chart("order_depth_aggregated", "ORDER DEPTH (AGGREGATED)", current, display_point_limit, None, ob_path),
-              "order_depth_zero_to_one": _depth_chart("order_depth_zero_to_one", "ORDER DEPTH (0–1%)", current, display_point_limit, (-1e-15, 1), ob_path),
-              "order_depth_one_to_five": _depth_chart("order_depth_one_to_five", "ORDER DEPTH (1–5%)", current, display_point_limit, (1, 5), ob_path)}
+    order_depth = _depth_chart("order_depth", "ORDER DEPTH", current, display_point_limit, None, ob_path)
+    for row in order_depth["records"]:
+        distance = row.get("distance_percent")
+        row["band"] = "0_to_1" if distance is not None and distance <= 1 else "1_to_5" if distance is not None and distance <= 5 else "over_5"
+    order_depth["metadata"].update(bands=["0_to_1", "1_to_5", "over_5"], provenance={"provider": "coinglass", "source_path": ob_path})
+    charts = {"order_depth": order_depth}
     bands = current.get("bands", {})
-    tables = {"orderbook_snapshot_aggregated": _table("orderbook_snapshot_aggregated", "ORDER BOOK SNAPSHOT (AGGREGATED)", charts["order_depth_aggregated"], bands.get("full_visible_book", {}), orderbook_table_limit, ob_path),
-              "orderbook_snapshot_zero_to_one": _table("orderbook_snapshot_zero_to_one", "ORDER BOOK SNAPSHOT (0–1%)", charts["order_depth_zero_to_one"], bands.get("zero_to_one", {}), orderbook_table_limit, ob_path),
-              "orderbook_snapshot_one_to_five": _table("orderbook_snapshot_one_to_five", "ORDER BOOK SNAPSHOT (1–5%)", charts["order_depth_one_to_five"], bands.get("one_to_five", {}), orderbook_table_limit, ob_path)}
+    tables = {"orderbook_snapshot": _table("orderbook_snapshot", "ORDER BOOK SNAPSHOT", charts["order_depth"], bands.get("full_visible_book", {}), orderbook_table_limit, ob_path)}
+    for side in ("bids", "asks"):
+        for row in tables["orderbook_snapshot"][side]:
+            distance = row.get("distance_percent")
+            row["band"] = "0_to_1" if distance is not None and distance <= 1 else "1_to_5" if distance is not None and distance <= 5 else "over_5"
+    tables["orderbook_snapshot"]["columns"].extend(["side", "band"])
+    tables["orderbook_snapshot"]["metadata"]["provenance"] = {"provider": "coinglass", "source_path": ob_path}
     trades = p["markets"][selected_market]["large_trades"]; c_trades = c["markets"][selected_market]["large_trades"]
     windows = [{"window": window, **deepcopy(row), "status": trades["status"], "reason": trades.get("reason")} for window, row in trades.get("windows", {}).items()]
     charts["large_trades_flow"] = _component("large_trades_flow", "LARGE TRADES", trades["status"], [f"{market_path}.large_trades.windows"], chart_id="large_trades_flow", chart_type="overlapping_window_flow", selector_behavior="selected_market_and_timeframe", data_as_of=trades.get("coverage", {}).get("observed_last_timestamp"), series=["buy_volume_usd", "sell_volume_usd", "net_flow_usd"], items=windows, metadata={"window_semantics": "overlapping_lookback_windows", "selected_window": selected_timeframe, **deepcopy(trades.get("coverage", {}))})
     events = sorted((deepcopy(row) for row in trades.get("large_trade_events", []) if row.get("meets_configured_threshold") is True), key=lambda row: row["timestamp"], reverse=True)
     tables["large_trades"] = _component("large_trades", "LARGE TRADES — RECENT EVENTS", trades["status"], [f"{market_path}.large_trades.large_trade_events"], table_id="large_trades", columns=list(events[0]) if events else [], rows=events[:large_trade_table_limit], bids=[], asks=[], summary={}, metadata={"events_available": len(events), "events_returned": min(len(events), large_trade_table_limit), "events_truncated": len(events) > large_trade_table_limit, **deepcopy(trades.get("coverage", {}))})
+    profiles = p["features"]["profiles"][selected_market][selected_timeframe]
+    def profile_chart(identifier: str, title: str, records: list[dict[str, Any]], series: list[str], source_path: str) -> dict[str, Any]:
+        return _component(identifier, title, "available" if records else "unavailable", [source_path], chart_id=identifier,
+            chart_type="mirrored_cumulative_profile", selector_behavior="selected_market_and_timeframe",
+            data_as_of=max((row["timestamp"] for row in records), default=None), series=series,
+            records=deepcopy(records[:display_point_limit]), metadata={"unit": "BTC", "profile_dynamic": True,
+                "records_available": len(records), "records_returned": min(len(records), display_point_limit),
+                "provenance": {"source_path": source_path}, "calculation_history": deepcopy(profiles["calculation_history"])})
+    charts["whale_liquidity_profile"] = profile_chart("whale_liquidity_profile", "WHALE LIQUIDITY PROFILE", profiles["whale_liquidity_profile"], ["Buy Concentration", "Sell Concentration"], f"features.profiles.{selected_market}.{selected_timeframe}.whale_liquidity_profile")
+    charts["executed_liquidity_profile"] = profile_chart("executed_liquidity_profile", "EXECUTED LIQUIDITY PROFILE", profiles["executed_liquidity_profile"], ["Buy Executed", "Sell Executed"], f"features.profiles.{selected_market}.{selected_timeframe}.executed_liquidity_profile")
+    whale_orders = deepcopy(profiles["whale_orders"][:large_trade_table_limit])
+    tables["whale_orders"] = _component("whale_orders", "WHALE ORDERS", "available" if whale_orders else "unavailable", [f"features.profiles.{selected_market}.{selected_timeframe}.whale_orders"], table_id="whale_orders", columns=list(whale_orders[0]) if whale_orders else [], display_columns=["timestamp", "side", "price", "quantity_base", "notional_quote", "exchange", "order_state"], rows=whale_orders, summary={}, metadata={"records_available": len(profiles["whale_orders"]), "records_returned": len(whale_orders), "cardinality": "dynamic", "provenance": {"source": "real_orderbook_snapshot"}})
     whale, c_whale = p["whale_activity"]["timeframes"][selected_timeframe], c["whale_activity"]["timeframes"][selected_timeframe]
     whale_records = deepcopy(whale.get("records", [])[-display_point_limit:])
     charts["whale_activity"] = _component("whale_activity", "WHALE ACTIVITY", whale["status"], [f"whale_activity.timeframes.{selected_timeframe}"], chart_id="whale_activity", chart_type="line", selector_behavior="fixed_perpetual_market_selected_timeframe", data_as_of=(whale.get("current") or {}).get("timestamp"), series=["whale_index_value"], records=whale_records, metadata={"scope": "perpetual", "statistics": deepcopy(whale.get("statistics", {})), "indicator": "provider_proprietary"})
     history = p["market_history"]; history_records = deepcopy(history.get("records", [])[-display_point_limit:])
-    charts["market_history"] = _component("market_history", "MARKET HISTORY", history["status"], ["market_history.records"], chart_id="market_history", chart_type="multi_series_line", selector_behavior="fixed_asset_daily_context", data_as_of=(history.get("current") or {}).get("timestamp"), series=["price", "market_cap", "circulating_supply"], records=history_records, metadata={"scope": "asset_level_daily", "changes": deepcopy(history.get("changes", {}))})
+    charts["market_history"] = _component("market_history", "MARKET HISTORY", history["status"], ["market_history.records"], chart_id="market_history", chart_type="multi_series_line", selector_behavior="fixed_asset_daily_context", data_as_of=(history.get("current") or {}).get("timestamp"), series=["price", "market_cap", "circulating_supply"], records=history_records, metadata={"scope": "asset_level_daily", "changes": deepcopy(history.get("changes", {})), "optional": True, "cardinality": "dynamic"})
+    charts["market_history"]["calculation_history"] = {"records_available": len(history.get("records", [])), "records_returned": len(history_records), "resolution": history.get("provenance", {}).get("interval"), "fabricated_records": 0}
     trade_atom = c_trades.get("classification", {}).get(selected_timeframe, {}); whale_atom = c_whale.get("classification", {})
     widgets = {"observed_liquidity": _component("observed_liquidity", "OBSERVED LIQUIDITY CONDITIONS", c["quality"]["status"] if c["quality"]["status"] != "ok" else "available", ["summary.observed_liquidity"], widget_id="observed_liquidity", current=deepcopy(c["markets"][selected_market]["summary"][selected_timeframe]), items=[], data_as_of=current.get("timestamp"), scope="observed_not_global_absolute_liquidity"),
                "large_trade_pressure": _component("large_trade_pressure", "LARGE TRADE PRESSURE", trade_atom.get("status", "unavailable"), [f"markets.{selected_market}.large_trades.classification.{selected_timeframe}"], widget_id="large_trade_pressure", current=deepcopy(trade_atom), items=[], data_as_of=trade_atom.get("source_timestamp")),
                "whale_activity_state": _component("whale_activity_state", "WHALE ACTIVITY STATE", whale_atom.get("status", "unavailable"), [f"whale_activity.timeframes.{selected_timeframe}.classification"], widget_id="whale_activity_state", current=deepcopy(whale_atom) | {"rolling_z_score_20": whale.get("statistics", {}).get("rolling_z_score_20"), "scope": "perpetual"}, items=[], data_as_of=(whale.get("current") or {}).get("timestamp")),
                "market_context": _component("market_context", "MARKET CONTEXT", history["status"], ["market_history", "classification.market_history"], widget_id="market_context", current=deepcopy(history.get("current")), items=[deepcopy(row) for row in c["market_history"].get("changes", {}).values()], data_as_of=(history.get("current") or {}).get("timestamp")),
                "spot_perpetual_comparison": _component("spot_perpetual_comparison", "SPOT / PERPETUAL COMPARISON", c["comparison"]["spot_perpetual"].get("status", "unavailable"), ["comparison.spot_perpetual"], widget_id="spot_perpetual_comparison", current=deepcopy(c["comparison"]["spot_perpetual"]), items=[], data_as_of=current.get("timestamp")),
-               "source_status": _component("source_status", "SOURCE STATUS", "available", ["quality", "runtime_context"], widget_id="source_status", current=None, data_as_of=max(filter(lambda value: isinstance(value, int), [current.get("timestamp"), timestamp, (history.get("current") or {}).get("timestamp")]), default=None), items=[{"provider_id": "coinglass", "label": "CoinGlass", "exchange": "Binance", "status": runtime["connection_status"]}, {"provider_id": "internal_processing", "label": "Internal Processing", "status": p["quality"]["status"]}, {"provider_id": "internal_classification", "label": "Internal Classification", "status": c["quality"]["status"]}])}
+               "source_status": _component("source_status", "SOURCE STATUS", "available", ["processing.quality", "classification.quality"], widget_id="source_status", current=None, data_as_of=max(filter(lambda value: isinstance(value, int), [current.get("timestamp"), timestamp, (history.get("current") or {}).get("timestamp")]), default=None), items=[{"provider_id": "coinglass", "label": "CoinGlass", "exchange": "Binance", "status": runtime["connection_status"]}, {"provider_id": "internal_processing", "label": "Internal Processing", "status": p["quality"]["status"]}, {"provider_id": "internal_classification", "label": "Internal Classification", "status": c["quality"]["status"]}])}
     data_as_of = widgets["source_status"]["data_as_of"]
-    drilldowns = {"orderbook_details": deepcopy(current), "market_impact_details": deepcopy(impact), "large_trades_details": deepcopy(trades),
-                  "whale_activity_details": deepcopy(whale), "market_history_details": deepcopy(history), "cross_market_details": deepcopy(c["comparison"]["spot_perpetual"])}
-    drilldowns = {key: _component(key, key.replace("_", " ").upper(), value.get("status", "available"), [key], drilldown_id=key, enabled=True, current=value.get("current"), details=value) for key, value in drilldowns.items()}
-    required_components = {**{f"kpis.{row['metric_id']}": row for row in kpis}, **{f"charts.{key}": value for key, value in charts.items()},
-                           **{f"tables.{key}": value for key, value in tables.items()}, **{f"widgets.{key}": value for key, value in widgets.items() if key != "spot_perpetual_comparison"}}
-    optional_components = {"widgets.spot_perpetual_comparison": widgets["spot_perpetual_comparison"], **{f"drilldowns.{key}": value for key, value in drilldowns.items()}}
+    drilldown_values = {
+        "orderbook_details": deepcopy(current),
+        "market_impact_details": deepcopy(impact),
+        "large_trades_details": deepcopy(trades),
+        "whale_activity_details": deepcopy(whale),
+        "market_history_details": deepcopy(history),
+        "cross_market_details": deepcopy(c["comparison"]["spot_perpetual"]),
+    }
+    drilldown_sources = {
+        "orderbook_details": f"processing.features.current_orderbooks.{selected_market}.{selected_timeframe}",
+        "market_impact_details": f"processing.features.order_depth.{selected_market}.{selected_timeframe}",
+        "large_trades_details": f"processing.features.large_trades.{selected_market}",
+        "whale_activity_details": f"processing.features.whale_activity.timeframes.{selected_timeframe}",
+        "market_history_details": "processing.features.market_history",
+        "cross_market_details": "classification.comparison.spot_perpetual",
+    }
+    drilldowns = {
+        key: _component(
+            key, key.replace("_", " ").upper(), value.get("status", "available"),
+            [drilldown_sources[key]], drilldown_id=key, enabled=True,
+            current=value.get("current"), details=value,
+        )
+        for key, value in drilldown_values.items()
+    }
+    required_components = {
+        **{f"kpis.{row['metric_id']}": row for row in kpis},
+        **{f"charts.{key}": value for key, value in charts.items() if key != "market_history"},
+        **{f"tables.{key}": value for key, value in tables.items()},
+        **{f"widgets.{key}": value for key, value in widgets.items() if key not in {"spot_perpetual_comparison", "market_context"}},
+    }
+    optional_components = {
+        "charts.market_history": charts["market_history"],
+        "widgets.market_context": widgets["market_context"],
+        "widgets.spot_perpetual_comparison": widgets["spot_perpetual_comparison"],
+        **{f"drilldowns.{key}": value for key, value in drilldowns.items()},
+    }
     entry = lambda value: {"status": value["status"], "reason": value.get("reason"), "source_paths": deepcopy(value.get("source_paths", []))}
     availability = {"required": {key: entry(value) for key, value in required_components.items()}, "optional": {key: entry(value) for key, value in optional_components.items()}}
     availability["summary"] = {"required_available": sum(value["status"] == "available" for value in required_components.values()), "required_total": len(required_components),
@@ -251,8 +308,13 @@ def build_liquidity_microstructure_screen_contract(bundle: Mapping[str, Any], *,
               "context": {"asset": p["context"].get("asset"), "base_asset": "BTC", "quote_asset": "USDT", "spot_symbol": p["markets"]["spot"]["orderbook"]["timeframes"][selected_timeframe].get("current", {}).get("symbol"), "perpetual_symbol": p["markets"]["perpetual"]["orderbook"]["timeframes"][selected_timeframe].get("current", {}).get("symbol"), "selected_symbol": current.get("symbol"), "selected_market": selected_market, "selected_timeframe": selected_timeframe, "provider": {"id": "coinglass", "label": "CoinGlass"}, "exchange": "Binance", "reference_timestamp": p["reference_timestamp"], "processing_execution_timestamp": p["execution_timestamp"], "classification_execution_timestamp": c["execution_timestamp"], "data_as_of": data_as_of, **runtime, "display_depth_basis": DISPLAY_DEPTH_BASIS, "reference_depth_range_percent": 10, "market_impact_quantity_base": p["configuration"]["market_impact_quantity_base"], "calibration_status": c["configuration"]["calibration_status"], "calculation_history": "upstream_preserved", "presentation_policy": "select_filter_truncate_without_recalculation", "units": {"depth": "BTC", "spread": "bps", "impact": "bps"}, "limitations": list(LIMITATIONS)},
               "badges": badges, "selectors": {"market": {"selector_id": "liquidity_market", "selected": selected_market, "options": list(MARKETS), "behavior": "contract_rebuild_required"}, "timeframe": {"selector_id": "liquidity_timeframe", "selected": selected_timeframe, "options": list(TIMEFRAMES), "behavior": "contract_rebuild_required"}},
               "operational_status": {"status": "invalid" if quality_status == "invalid" else "partial" if quality_status == "partial" or runtime["connection_status"] in {"degraded", "disconnected"} else "available", "provider": "coinglass", "exchange": "Binance", **runtime, "data_as_of": data_as_of, "quality_status": quality_status, "reason": None},
-              "kpis": {"items": kpis}, "charts": charts, "tables": tables, "widgets": widgets, "drilldowns": drilldowns, "availability": availability,
+              "kpis": {"items": kpis}, "charts": charts, "tables": tables, "widgets": widgets, "drilldowns": drilldowns,
+              "history_contract": {"calculation_history": deepcopy(profiles["calculation_history"]), "cardinality": "dynamic",
+                  "market_history": {"status": history["status"], "optional": True,
+                      "records_available": len(history.get("records", [])), "fabricated_records": 0}, "hmi_recalculation": False},
+              "availability": availability,
               "quality": {"status": quality_status, "contract_complete": True, "data_complete": not partial and not unavailable, "processing_status": p["quality"]["status"], "classification_status": c["quality"]["status"], "availability": deepcopy(availability["summary"]), "missing_required_components": unavailable, "partial_components": partial, "unavailable_components": unavailable, "invalid_components": invalid, "warnings": [], "errors": [], "data_as_of": data_as_of}}
+    output = align_liquidity_microstructure_to_sp_v1_2(output, p, c, runtime)
     _validate_json(output); json.dumps(output, ensure_ascii=False, allow_nan=False)
     return output
 

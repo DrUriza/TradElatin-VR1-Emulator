@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import copy
 import math
+from collections import deque
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from typing import Any
 
 CVD_VOLUME_ORDERFLOW_FAMILY = "cvd_volume_orderflow"
 PROCESSING_STAGE             = "processing"
 PROCESSING_VERSION           = "0.1.0"
-MARKETS                      = ("spot", "futures", "general")
+MARKETS                      = ("spot", "futures")
 BASE_TIMEFRAMES              = ("1m", "15m")
 TARGET_TIMEFRAMES            = ("1m", "5m", "15m", "1h", "4h", "1d")
 TIMEFRAME_SECONDS            = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
@@ -70,20 +72,6 @@ def validate_base_records(records: Any) -> list[dict[str, Any]]:
     return output
 
 
-def build_general_base(spot_records: Sequence[Mapping[str, Any]], futures_records: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    spot, futures = {row["timestamp"]: row for row in spot_records}, {row["timestamp"]: row for row in futures_records}
-    aligned = sorted(set(spot) & set(futures))
-    records = []
-    for timestamp in aligned:
-        buy = spot[timestamp]["taker_buy_volume_usd"] + futures[timestamp]["taker_buy_volume_usd"]
-        sell = spot[timestamp]["taker_sell_volume_usd"] + futures[timestamp]["taker_sell_volume_usd"]
-        records.append({"timestamp": timestamp, **volume_features(buy, sell), "provider_cvd_reference_usd": None})
-    metadata = {"spot_records": len(spot), "futures_records": len(futures), "aligned_records": len(aligned),
-        "spot_only_timestamps": sorted(set(spot) - set(futures)), "futures_only_timestamps": sorted(set(futures) - set(spot))}
-    metadata["alignment_complete"] = not metadata["spot_only_timestamps"] and not metadata["futures_only_timestamps"]
-    return records, metadata
-
-
 def resample_records(records: Sequence[Mapping[str, Any]], source_timeframe: str, target_timeframe: str) -> list[dict[str, Any]]:
     if SOURCE_TIMEFRAME.get(target_timeframe) != source_timeframe:
         raise ValueError("invalid_source_target_timeframe")
@@ -104,6 +92,15 @@ def resample_records(records: Sequence[Mapping[str, Any]], source_timeframe: str
             "source_records_expected": expected, "source_records_used": len(source), "coverage_complete": coverage,
             "is_partial": not coverage, "first_source_timestamp": source[0]["timestamp"], "last_source_timestamp": source[-1]["timestamp"],
             "provider_cvd_reference_usd": provider, "_source_deltas": [row["volume_delta_usd"] for row in source]})
+    # A finite bootstrap commonly starts/ends inside a larger UTC bucket.  Those
+    # edge buckets are not gaps in the observed source series and must not poison
+    # the cumulative path forever.  Interior incomplete buckets are retained and
+    # still break continuity.
+    if any(not row["is_partial"] for row in output):
+        while output and output[0]["is_partial"]:
+            output.pop(0)
+        while output and output[-1]["is_partial"]:
+            output.pop()
     return output
 
 
@@ -159,21 +156,46 @@ def build_cvd_bars(records: Sequence[Mapping[str, Any]], target_timeframe: str,
     return output, breaks, anchor
 
 
-def apply_rolling_features(records: Sequence[Mapping[str, Any]], period: int = DELTA_MA_PERIOD) -> list[dict[str, Any]]:
-    output = copy.deepcopy(list(records))
-    for index, row in enumerate(output):
-        window = output[max(0, index - period + 1):index + 1]
+def apply_rolling_features(records: Sequence[Mapping[str, Any]], period: int = DELTA_MA_PERIOD,
+                           *, copy_records: bool = True) -> list[dict[str, Any]]:
+    """Add rolling fields, optionally taking ownership of a freshly built list.
+
+    The public default preserves the original no-mutation contract.  The feature
+    pipeline passes its private ``bars`` list with ``copy_records=False`` because
+    no other object can observe or reuse those records after this call.
+    """
+    output = copy.deepcopy(list(records)) if copy_records else list(records)
+    if period <= 0:
+        # Preserve deterministic non-positive-period behavior; production uses period 21.
+        for index, row in enumerate(output):
+            window = output[max(0, index - period + 1):index + 1]
+            consecutive = len(window) == period and all(item["coverage_complete"] and item["continuity_status"] == "complete" for item in window)
+            consecutive = consecutive and all(b["timestamp"] - a["timestamp"] > 0 for a, b in zip(window, window[1:]))
+            if not consecutive:
+                reason = "partial_or_broken_window" if row["is_partial"] or row["continuity_status"] == "broken" else "rolling_warmup_incomplete"
+                row["delta_ma_21_usd"] = None
+                row["flow_efficiency"] = _metric(None, reason)
+                continue
+            deltas = [item["volume_delta_usd"] for item in window]
+            row["delta_ma_21_usd"] = sum(deltas) / period
+            denominator = sum(abs(value) for value in deltas)
+            row["flow_efficiency"] = _metric(abs(sum(deltas)) / denominator) if denominator else _metric(None, "zero_absolute_delta_path")
+        return output
+
+    window: deque[Mapping[str, Any]] = deque(maxlen=period)
+    for row in output:
+        window.append(row)
         consecutive = len(window) == period and all(item["coverage_complete"] and item["continuity_status"] == "complete" for item in window)
-        consecutive = consecutive and all(b["timestamp"] - a["timestamp"] > 0 for a, b in zip(window, window[1:]))
+        consecutive = consecutive and all(b["timestamp"] - a["timestamp"] > 0 for a, b in pairwise(window))
         if not consecutive:
             reason = "partial_or_broken_window" if row["is_partial"] or row["continuity_status"] == "broken" else "rolling_warmup_incomplete"
             row["delta_ma_21_usd"] = None
             row["flow_efficiency"] = _metric(None, reason)
             continue
-        deltas = [item["volume_delta_usd"] for item in window]
-        row["delta_ma_21_usd"] = sum(deltas) / period
-        denominator = sum(abs(value) for value in deltas)
-        row["flow_efficiency"] = _metric(abs(sum(deltas)) / denominator) if denominator else _metric(None, "zero_absolute_delta_path")
+        total_delta = sum(item["volume_delta_usd"] for item in window)
+        row["delta_ma_21_usd"] = total_delta / period
+        denominator = sum(abs(item["volume_delta_usd"]) for item in window)
+        row["flow_efficiency"] = _metric(abs(total_delta) / denominator) if denominator else _metric(None, "zero_absolute_delta_path")
     return output
 
 
@@ -224,20 +246,6 @@ def build_footprint_vwap(footprint: Mapping[str, Any] | None, *, window_seconds:
         "calculation_basis": "available_normalized_footprint_levels", "aggregation_scope": "complete_input_scope" if scope_complete else "partial_input_scope"}
 
 
-def build_general_vwap(spot: Mapping[str, Any], futures: Mapping[str, Any]) -> dict[str, Any]:
-    base = spot.get("base_volume", 0.0) + futures.get("base_volume", 0.0)
-    quote = spot.get("quote_volume", 0.0) + futures.get("quote_volume", 0.0)
-    if base <= 0:
-        return {"vwap_usd": None, "base_volume": base, "quote_volume": quote, "records_used": spot.get("records_used", 0) + futures.get("records_used", 0),
-            "levels_used": spot.get("levels_used", 0) + futures.get("levels_used", 0), "status": "unavailable", "reason": "footprint_data_not_available",
-            "calculation_basis": "available_normalized_footprint_levels", "aggregation_scope": "partial_input_scope"}
-    complete = spot.get("status") == futures.get("status") == "available"
-    return {"vwap_usd": quote / base, "base_volume": base, "quote_volume": quote,
-        "records_used": spot.get("records_used", 0) + futures.get("records_used", 0), "levels_used": spot.get("levels_used", 0) + futures.get("levels_used", 0),
-        "status": "available" if complete else "partial", "reason": None if complete else "footprint_exchange_or_timeframe_scope_not_preserved",
-        "calculation_basis": "available_normalized_footprint_levels", "aggregation_scope": "complete_input_scope" if complete else "partial_input_scope"}
-
-
 def build_price_vs_vwap(vwap: Mapping[str, Any], price_reference: Mapping[str, Any] | None) -> dict[str, Any]:
     if vwap.get("vwap_usd") is None or vwap.get("vwap_usd", 0) <= 0:
         return {"value": None, "status": "unavailable", "reason": "vwap_not_available", "price_timestamp": None, "price_usd": None}
@@ -252,7 +260,6 @@ def build_price_vs_vwap(vwap: Mapping[str, Any], price_reference: Mapping[str, A
 
 class CvdVolumeOrderflowFeatureBuilder:
     validate_base_records       = staticmethod(validate_base_records)
-    build_general_base          = staticmethod(build_general_base)
     resample_records            = staticmethod(resample_records)
     build_cvd_bars              = staticmethod(build_cvd_bars)
     apply_rolling_features      = staticmethod(apply_rolling_features)
@@ -267,7 +274,7 @@ class CvdVolumeOrderflowFeatureBuilder:
             source = SOURCE_TIMEFRAME[target]
             resampled = resample_records(base_records[source], source, target)
             bars, breaks, anchor = build_cvd_bars(resampled, target, (declared_gaps or {}).get(source, ()))
-            timeframes[target] = {"records": apply_rolling_features(bars), "continuity_breaks": breaks, **anchor}
+            timeframes[target] = {"records": apply_rolling_features(bars, copy_records=False), "continuity_breaks": breaks, **anchor}
         return timeframes
 
 

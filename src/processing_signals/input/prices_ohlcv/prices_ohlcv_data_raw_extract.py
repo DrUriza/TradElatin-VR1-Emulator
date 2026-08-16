@@ -4,14 +4,19 @@ from typing          import Any
 
 PRICES_FAMILY        = "prices_ohlcv"
 COINGLASS_PROVIDER   = "coinglass"
+GLASSNODE_PROVIDER    = "glassnode"
 SPOT_ENDPOINT_ID     = "spot_ohlcv"
 FUTURES_ENDPOINT_ID  = "futures_ohlcv"
+GLASSNODE_PRICE_OHLC_ENDPOINT_ID = "price_usd_ohlc"
+GLASSNODE_MARKET_CAP_ENDPOINT_ID = "marketcap_usd"
+GLASSNODE_PRICE_OHLC_PATH = "/v1/metrics/market/price_usd_ohlc"
+GLASSNODE_MARKET_CAP_PATH = "/v1/metrics/market/marketcap_usd"
 ENDPOINT_PATHS       = {"spot": "/api/spot/price/history", "futures": "/api/futures/price/history"}
 BOOTSTRAP_TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
 INCREMENTAL_LIMITS   = {"1m": 15, "15m": 8}
 VALID_MODES          = {"bootstrap", "incremental", "recovery"}
 
-PricesFetcher = Callable[..., Mapping[str, Any]]
+PricesFetcher = Callable[..., Any]
 
 
 def build_prices_fetch_plan(*, mode: str, requests: Sequence[Mapping[str, Any]] | None = None, bootstrap: int = 500,
@@ -70,6 +75,35 @@ def build_coinglass_ohlc_params(*, symbol: str, exchange: str, timeframe: str, l
         params["end_time"] = int(end_time)
     return params
 
+
+def build_glassnode_market_params(*, asset: str = "BTC", interval: str = "1h", start_time: int | None = None, end_time: int | None = None) -> dict[str, Any]:
+    """Build Glassnode market-metric parameters for Prices confirmation data."""
+    params: dict[str, Any] = {"a": asset.upper(), "i": interval}
+    if start_time is not None:
+        params["s"] = int(start_time)
+    if end_time is not None:
+        params["u"] = int(end_time)
+    return params
+
+
+def extract_glassnode_prices_raw(*, fetcher: PricesFetcher, asset: str = "BTC", interval: str = "1h") -> dict[str, Any]:
+    """Fetch Glassnode Price OHLC for validation/fallback and Market Cap for the KPI."""
+    params = build_glassnode_market_params(asset=asset, interval=interval)
+    output: dict[str, Any] = {}
+    for endpoint_id, path in (
+        (GLASSNODE_PRICE_OHLC_ENDPOINT_ID, GLASSNODE_PRICE_OHLC_PATH),
+        (GLASSNODE_MARKET_CAP_ENDPOINT_ID, GLASSNODE_MARKET_CAP_PATH),
+    ):
+        try:
+            response = fetcher(provider=GLASSNODE_PROVIDER, endpoint_id=endpoint_id, path=path, params=params)
+            output[endpoint_id] = {"status": "ok", "params": dict(params), "response": response}
+        except Exception as exc:
+            # Glassnode is confirmation/fallback for Price and primary only for Market Cap.
+            # A provider failure must not invalidate CoinGlass Spot OHLC ingestion.
+            output[endpoint_id] = {"status": "error", "params": dict(params), "response": None, "error": str(exc)}
+    return {"provider": GLASSNODE_PROVIDER, "interval": interval, "metrics": output}
+
+
 def _extract_market_ohlcv_raw(*, market: str, fetcher: PricesFetcher, fetch_plan: Sequence[Mapping[str, Any]], symbol: str, exchange: str) -> dict[str, Any]:
     endpoint_id = SPOT_ENDPOINT_ID if market == "spot" else FUTURES_ENDPOINT_ID
     timeframes: dict[str, dict[str, Any]] = {}
@@ -96,12 +130,13 @@ class PricesOhlcvRawExtractor:
     """Stateful CoinGlass adapter for the two external Prices markets."""
     def __init__(self, *, fetcher: PricesFetcher, symbol: str = "BTCUSDT", exchange: str = "Binance", bootstrap: int = 500,
                  incremental: Mapping[str, int] | None = None, bootstrap_limit: int | None = None,
-                 incremental_limits: Mapping[str, int] | None = None) -> None:
+                 incremental_limits: Mapping[str, int] | None = None, include_glassnode: bool = True) -> None:
         self.fetcher            = fetcher
         self.symbol             = symbol
         self.exchange           = exchange
         self.bootstrap_limit    = bootstrap_limit if bootstrap_limit is not None else bootstrap
         self.incremental_limits = dict(incremental_limits if incremental_limits is not None else (incremental or {}))
+        self.include_glassnode   = bool(include_glassnode)
 
     def build_fetch_plan(self, *, mode: str, requests: Sequence[Mapping[str, Any]] | None = None) -> list[dict[str, Any]]:
         return build_prices_fetch_plan(mode=mode, requests=requests, bootstrap=self.bootstrap_limit, incremental=self.incremental_limits)
@@ -118,11 +153,15 @@ class PricesOhlcvRawExtractor:
 
     def run(self, *, mode: str, requests: Sequence[Mapping[str, Any]] | None = None, recovery_requests: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
         fetch_plan = self.build_fetch_plan(mode=mode, requests=recovery_requests if recovery_requests is not None else requests)
-        return {"family": PRICES_FAMILY, "mode": mode, "raw": {"spot": self.extract_spot(fetch_plan), "futures": self.extract_futures(fetch_plan)}}
+        raw: dict[str, Any] = {"spot": self.extract_spot(fetch_plan), "futures": self.extract_futures(fetch_plan)}
+        if self.include_glassnode:
+            asset = self.symbol.upper().removesuffix("USDT").removesuffix("USD") or "BTC"
+            raw["glassnode"] = extract_glassnode_prices_raw(fetcher=self.fetcher, asset=asset, interval="1h")
+        return {"family": PRICES_FAMILY, "mode": mode, "raw": raw}
 
 def extract_prices_ohlcv_raw(*, fetcher: PricesFetcher, mode: str, symbol: str = "BTCUSDT", exchange: str = "Binance",
                              requests: Sequence[Mapping[str, Any]] | None = None, bootstrap: int = 500,
-                             incremental: Mapping[str, int] | None = None) -> dict[str, Any]:
+                             incremental: Mapping[str, int] | None = None, include_glassnode: bool = True) -> dict[str, Any]:
     """Public compatibility facade for the OO raw extractor."""
-    extractor = PricesOhlcvRawExtractor(fetcher=fetcher, symbol=symbol, exchange=exchange, bootstrap=bootstrap, incremental=incremental)
+    extractor = PricesOhlcvRawExtractor(fetcher=fetcher, symbol=symbol, exchange=exchange, bootstrap=bootstrap, incremental=incremental, include_glassnode=include_glassnode)
     return extractor.run(mode=mode, requests=requests)

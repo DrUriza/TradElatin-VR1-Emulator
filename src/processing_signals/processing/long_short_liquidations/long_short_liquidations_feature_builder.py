@@ -36,8 +36,27 @@ def _number(value: Any, *, nonnegative: bool = False, positive: bool = False) ->
 
 
 def window_end_for_hourly(reference_timestamp: int, records: Sequence[Mapping[str, Any]]) -> int:
-    latest = max((int(r["timestamp"]) for r in records), default=reference_timestamp - 3600)
-    return min(reference_timestamp // 3600 * 3600, latest + 3600)
+    """Return a closed-data semi-open end on the provider's hourly grid.
+
+    A record timestamp equal to the runtime reference cannot be assumed to
+    represent a fully closed future hour.  Use the latest provider grid boundary
+    that does not exceed ``reference_timestamp``; this prevents downstream screen
+    contracts from receiving a required timestamp in the future.
+    """
+    reference = int(reference_timestamp)
+    candidates = sorted(
+        int(record["timestamp"])
+        for record in records
+        if isinstance(record, Mapping)
+        and isinstance(record.get("timestamp"), int)
+        and not isinstance(record.get("timestamp"), bool)
+        and int(record["timestamp"]) <= reference
+    )
+    if not candidates:
+        return reference
+    latest = candidates[-1]
+    next_boundary = latest + 3600
+    return next_boundary if next_boundary <= reference else latest
 
 
 def aggregate_regular_window(records: Sequence[Mapping[str, Any]], *, window_end: int,
@@ -141,10 +160,17 @@ def build_exchange_distribution(records: Sequence[Mapping[str, Any]]) -> dict[st
                      "computed_total_usd": computed, "provider_total_usd": provider,
                      "provider_total_difference_usd": provider - computed,
                      "provider_total_difference_ratio": None if computed == 0 else (provider - computed) / computed})
-    total = sum(r["computed_total_usd"] for r in rows)
+    # CoinGlass exchange-list responses may include an aggregate "All" row in
+    # addition to exchange rows.  Never count that aggregate a second time when
+    # computing exchange shares/concentration.
+    aggregate_keys = {"all", "all_exchange", "aggregate"}
+    detail_rows = [row for row in rows if str(row.get("exchange_key", "")).lower() not in aggregate_keys]
+    basis_rows = detail_rows if detail_rows else rows
+    total = sum(r["computed_total_usd"] for r in basis_rows)
     for row in rows:
-        row["exchange_share"] = None if total == 0 else row["computed_total_usd"] / total
-    metrics = concentration([r["computed_total_usd"] for r in rows], count_name="effective_exchange_count")
+        key = str(row.get("exchange_key", "")).lower()
+        row["exchange_share"] = (None if key in aggregate_keys else (None if total == 0 else row["computed_total_usd"] / total))
+    metrics = concentration([r["computed_total_usd"] for r in basis_rows], count_name="effective_exchange_count")
     if total == 0:
         metrics["reason"] = "zero_exchange_total"
     return {"status": metrics["status"], "reason": metrics["reason"], "valid_exchange_total_usd": total,
@@ -331,15 +357,25 @@ def build_event_window(events: Sequence[Mapping[str, Any]], *, window_end: int, 
             valid.append(event)
         except ValueError:
             pass
+    coverage = {"coverage_start": start if coverage_complete else None,
+                "coverage_end": window_end if coverage_complete else None,
+                "expected_window_seconds": window_seconds,
+                "covered_window_seconds": window_seconds if coverage_complete else 0,
+                "coverage_ratio": 1.0 if coverage_complete else 0.0,
+                "missing_intervals": [] if coverage_complete else [{"start": start, "end": window_end}],
+                "source_complete": bool(coverage_complete),
+                "first_event": min((event["timestamp"] for event in valid), default=None),
+                "last_event": max((event["timestamp"] for event in valid), default=None)}
     if not valid and not coverage_complete:
-        return {"status": "unavailable", "reason": "incomplete_event_coverage", "is_lower_bound": False}
+        return {"status": "unavailable", "reason": "incomplete_event_coverage", "is_lower_bound": False,
+                "event_count": 0, "coverage": coverage}
     values = [float(e["usd_value"]) for e in valid]
     maximum = max(valid, key=lambda e: (e["usd_value"], e["timestamp"], e["event_id"])) if valid else None
     return {"status": "available" if coverage_complete else "partial", "reason": None if coverage_complete else "incomplete_event_coverage",
             "is_lower_bound": not coverage_complete, "window_start": start, "window_end": window_end,
             "event_count": len(valid), "event_usd_total": sum(values), "event_usd_mean": mean(values) if values else None,
             "event_usd_median": median(values) if values else None, "event_usd_max": max(values) if values else None,
-            "max_event": dict(maximum) if maximum else None}
+            "max_event": dict(maximum) if maximum else None, "coverage": coverage}
 
 
 def empirical_percentile(value: float, baseline: Sequence[float], minimum: int) -> float | None:

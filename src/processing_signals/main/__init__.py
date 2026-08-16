@@ -1,11 +1,8 @@
-from __future__ import annotations
+"""Public ETF Exchange Flows main vertical API."""
 
-__all__ = ["VERTICAL_FAMILY_HANDLERS", "run_main_pipeline"]
+from .etf_exchange_flows.etf_exchange_flows_vertical import (
+    DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH,
+    run_etf_exchange_flows_vertical,
+)
 
-
-def __getattr__(name: str):
-    if name in __all__:
-        from .main_pipeline import VERTICAL_FAMILY_HANDLERS, run_main_pipeline
-
-        return {"VERTICAL_FAMILY_HANDLERS": VERTICAL_FAMILY_HANDLERS, "run_main_pipeline": run_main_pipeline}[name]
-    raise AttributeError(name)
+__all__ = ["DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH", "run_etf_exchange_flows_vertical"]

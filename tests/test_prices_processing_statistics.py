@@ -75,7 +75,7 @@ def test_sharpe_uses_timeframe_annualization():
 
 def test_all_markets_and_timeframes_have_serializable_statistical_packages():
     result = calculate_all_prices_statistics(markets=_markets())
-    assert set(result) == {"general", "spot", "futures"}
+    assert set(result) == {"spot", "futures", "general"}
     for market in result.values():
         assert tuple(market) == TIMEFRAME_ORDER
         for package in market.values():

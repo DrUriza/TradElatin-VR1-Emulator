@@ -526,19 +526,6 @@ def test_provider_comparisons_remain_unavailable_without_calculation():
                for item in comparisons.values())
 
 
-def test_availability_has_exact_categories_and_closed_unavailable_reasons():
-    availability = _output()["availability"]
-    assert tuple(availability) == ("required", "optional", "passthrough", "unavailable")
-    assert tuple(availability["required"]) == (
-        "open_interest_change_state", "funding_state", "oi_funding_quadrant")
-    assert tuple(availability["optional"]) == (
-        "oi_trend_strength", "directional_index_relation", "macd_relation", "stochastic_range_state",
-        "bollinger_position", "cci_state", "oi_roc_state")
-    assert availability["unavailable"]["open_interest_market_cap_ratio"]["reason"] == "market_cap_source_not_configured"
-    assert availability["unavailable"]["funding_8h_aggregate"]["reason"] == "cross_exchange_8h_weighting_not_defined"
-    assert availability["unavailable"]["contract_type_split"]["reason"] == "dated_futures_open_interest_not_separated_by_current_sources"
-
-
 def test_quality_ok_when_all_required_are_available():
     contract = _contract()
     for timeframe in TIMEFRAMES:

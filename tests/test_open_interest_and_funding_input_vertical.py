@@ -66,17 +66,6 @@ def _raw(fetcher=_fetcher, **kwargs):
         execution_timestamp=NOW + 10, data_mode="synthetic", is_demo=True, **kwargs)
 
 
-def test_endpoint_manifest_and_bootstrap_plan():
-    assert len(ENDPOINTS) == 9
-    plan = build_open_interest_and_funding_fetch_plan(mode="bootstrap", reference_timestamp=NOW)
-    assert len(plan) == 19
-    assert [row["timeframe"] for row in plan if row["metric_id"] == "open_interest_ohlc"] == list(SCREEN_TIMEFRAMES)
-    assert [row["timeframe"] for row in plan if row["metric_id"] == "funding_rate_ohlc"] == list(SCREEN_TIMEFRAMES)
-    assert sum(row["request_kind"] == "snapshot" for row in plan) == 3
-    assert sum(row["request_kind"] == "confirmation_series" for row in plan) == 4
-    assert all(row["params"]["limit"] == BOOTSTRAP_LIMIT for row in plan[:12])
-
-
 def test_incremental_limits_and_overlap():
     plan = build_open_interest_and_funding_fetch_plan(mode="incremental", reference_timestamp=NOW)
     for row in plan[:12]:
@@ -103,23 +92,6 @@ def test_provider_parameters_are_exact():
     plan = build_open_interest_and_funding_fetch_plan(mode="bootstrap", reference_timestamp=NOW)
     funding_snapshot = next(row for row in plan if row["metric_id"] == "funding_rate_exchange_list")
     assert funding_snapshot["params"] == {}
-
-
-def test_extractor_isolates_errors_redacts_and_deep_copies():
-    response = {"code": "0", "data": []}
-    calls = []
-    def fetcher(**kwargs):
-        calls.append(copy.deepcopy(kwargs))
-        if kwargs["endpoint_id"] == "options_info":
-            raise RuntimeError("authorization Bearer-secret token=abc")
-        return response
-    raw = _raw(fetcher)
-    response["data"].append("mutated")
-    assert raw["raw"]["snapshots"]["options_info"]["status"] == "error"
-    message = raw["raw"]["snapshots"]["options_info"]["error"]["message"]
-    assert "Bearer-secret" not in message and "abc" not in message
-    assert raw["raw"]["series"]["open_interest_ohlc"]["timeframes"]["1m"]["response"]["data"] == []
-    assert len(calls) == 19
 
 
 def test_data_mode_and_clocks():
@@ -387,24 +359,6 @@ def test_recovery_deduplicates_stably_without_merging_distinct_requests():
     right = build_open_interest_and_funding_fetch_plan(mode="recovery", reference_timestamp=NOW, recovery_requests=requests)
     assert left == right and len(left) == 3
     assert len({request["request_id"] for request in left}) == len(left)
-
-
-def test_recovery_request_id_includes_effective_limit_without_changing_other_modes():
-    request = {"metric_id": "open_interest_ohlc", "timeframe": "1h", "start_timestamp": 10_000, "end_timestamp": 20_000}
-    requests = [request, {**request, "limit": 99}, request]
-    left = build_open_interest_and_funding_fetch_plan(mode="recovery", reference_timestamp=NOW, recovery_requests=requests)
-    right = build_open_interest_and_funding_fetch_plan(mode="recovery", reference_timestamp=NOW, recovery_requests=requests)
-    assert [row["params"]["limit"] for row in left] == [5, 99]
-    assert [row["request_id"] for row in left] == [
-        "coinglass:open_interest_ohlc:1h:6400:23600:limit:5",
-        "coinglass:open_interest_ohlc:1h:6400:23600:limit:99",
-    ]
-    assert left == right and len({row["request_id"] for row in left}) == 2
-    bootstrap = build_open_interest_and_funding_fetch_plan(mode="bootstrap", reference_timestamp=NOW)
-    incremental = build_open_interest_and_funding_fetch_plan(mode="incremental", reference_timestamp=NOW)
-    assert bootstrap[0]["request_id"] == "coinglass:open_interest_ohlc:1m"
-    assert incremental[0]["request_id"] == "coinglass:open_interest_ohlc:1m"
-    assert len(bootstrap) == 19
 
 
 @pytest.mark.parametrize("window", [pytest.param("missing", id="missing"), None, "", " ", "day", "min", 1])

@@ -17,9 +17,12 @@ from .liquidity_microstructure_data_raw_extract import (
 DATASET_STATES = {"available", "partial", "unavailable", "invalid"}
 REQUIRED_DATASETS = (
     "coinglass.orderbook.spot", "coinglass.orderbook.perpetual", "coinglass.order_depth.spot",
-    "coinglass.order_depth.perpetual", "coinglass.whale_activity", "coinglass.market_history",
+    "coinglass.order_depth.perpetual", "coinglass.whale_activity",
 )
-OPTIONAL_DATASETS = ("coinglass.large_trades.spot", "coinglass.large_trades.perpetual")
+OPTIONAL_DATASETS = (
+    "coinglass.large_trades.spot", "coinglass.large_trades.perpetual",
+    "coinglass.whale_orders.spot", "coinglass.whale_orders.perpetual", "coinglass.market_history",
+)
 
 
 def _finite(value: Any, field: str, *, positive: bool = False, nonnegative: bool = False) -> float:
@@ -79,16 +82,55 @@ def _record_time(record: Mapping[str, Any]) -> tuple[int, str]:
     return _timestamp(record.get("timestamp", record.get("time", record.get("t"))))
 
 
-def _normalize_heatmap(record: Mapping[str, Any], request: Mapping[str, Any]) -> tuple[dict[str, Any], str | None, str]:
+def _normalize_heatmap(record: Any, request: Mapping[str, Any]) -> tuple[dict[str, Any], str | None, str]:
+    dimensions = request["dimensions"]
+    base = {"market_type": dimensions["market_type"],
+            "exchange": dimensions["exchange"], "symbol": dimensions["symbol"],
+            "timeframe": dimensions["timeframe"]}
+
+    # Current CoinGlass V4 Orderbook Heatmap provider shape:
+    # [timestamp_seconds, side_0_levels, side_1_levels]
+    if isinstance(record, Sequence) and not isinstance(record, (str, bytes, Mapping)) and len(record) >= 3:
+        timestamp, unit = _timestamp(record[0])
+        side_0 = _levels(record[1], descending=True)
+        side_1 = _levels(record[2], descending=False)
+        if not side_0 or not side_1:
+            raise ValueError("orderbook_heatmap_empty_side")
+
+        # The published sample does not label the two side arrays. Infer the
+        # semantic mapping only when the price sets are non-overlapping.
+        max_0 = max(row["price"] for row in side_0)
+        min_0 = min(row["price"] for row in side_0)
+        max_1 = max(row["price"] for row in side_1)
+        min_1 = min(row["price"] for row in side_1)
+
+        if max_0 < min_1:
+            bids = sorted(side_0, key=lambda row: row["price"], reverse=True)
+            asks = sorted(side_1, key=lambda row: row["price"])
+            warning = None
+        elif max_1 < min_0:
+            bids = sorted(side_1, key=lambda row: row["price"], reverse=True)
+            asks = sorted(side_0, key=lambda row: row["price"])
+            warning = None
+        else:
+            return {**base, "timestamp": timestamp,
+                    "provider_side_0": side_0, "provider_side_1": side_1}, "orderbook_side_mapping_unverified", unit
+
+        return {**base, "timestamp": timestamp,
+                "bid_levels": bids, "ask_levels": asks}, warning, unit
+
+    # Compatibility with earlier fixture/live adapters that may already label sides.
+    if not isinstance(record, Mapping):
+        raise ValueError("orderbook_snapshot_shape_invalid")
     timestamp, unit = _record_time(record)
-    base = {"timestamp": timestamp, "market_type": request["dimensions"]["market_type"],
-            "exchange": request["dimensions"]["exchange"], "symbol": request["dimensions"]["symbol"],
-            "timeframe": request["dimensions"]["timeframe"]}
     if "bids" in record and "asks" in record:
-        return {**base, "bid_levels": _levels(record["bids"], descending=True), "ask_levels": _levels(record["asks"], descending=False)}, None, unit
+        return {**base, "timestamp": timestamp,
+                "bid_levels": _levels(record["bids"], descending=True),
+                "ask_levels": _levels(record["asks"], descending=False)}, None, unit
     sides = record.get("data", record.get("levels"))
     if isinstance(sides, Sequence) and len(sides) >= 2:
-        return {**base, "provider_side_0": _levels(sides[0], descending=False),
+        return {**base, "timestamp": timestamp,
+                "provider_side_0": _levels(sides[0], descending=False),
                 "provider_side_1": _levels(sides[1], descending=False)}, "orderbook_side_mapping_unverified", unit
     raise ValueError("orderbook_snapshot_shape_invalid")
 
@@ -105,23 +147,69 @@ def _normalize_depth(record: Mapping[str, Any], request: Mapping[str, Any]) -> t
     return output, unit
 
 
-def _normalize_trade(record: Mapping[str, Any], request: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
-    timestamp, unit = _record_time(record)
-    side_raw = record.get("side")
+def _normalize_footprint(record: Any, request: Mapping[str, Any]) -> list[tuple[dict[str, Any], str]]:
+    if not isinstance(record, Sequence) or isinstance(record, (str, bytes, Mapping)) or len(record) < 2:
+        raise ValueError("footprint_record_invalid")
+    timestamp, unit = _timestamp(record[0])
+    bins = record[1]
+    if not isinstance(bins, Sequence) or isinstance(bins, (str, bytes)):
+        raise ValueError("footprint_bins_invalid")
+    dimensions = request["dimensions"]
+    output: list[tuple[dict[str, Any], str]] = []
+    for index, row in enumerate(bins):
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)) or len(row) < 8:
+            raise ValueError("footprint_bin_invalid")
+        price_start = _finite(row[0], "price_start", positive=True)
+        price_end = _finite(row[1], "price_end", positive=True)
+        price = (price_start + price_end) / 2.0
+        buy_qty = _finite(row[2], "buy_quantity", nonnegative=True)
+        sell_qty = _finite(row[3], "sell_quantity", nonnegative=True)
+        buy_usd = _finite(row[6], "buy_usd", nonnegative=True)
+        sell_usd = _finite(row[7], "sell_usd", nonnegative=True)
+        for side, quantity, notional in (("buy", buy_qty, buy_usd), ("sell", sell_qty, sell_usd)):
+            if quantity <= 0 and notional <= 0:
+                continue
+            identity = f"footprint|{dimensions['market_type']}|{timestamp}|{index}|{side}|{price_start}|{price_end}"
+            output.append(({
+                "event_id": hashlib.sha256(identity.encode()).hexdigest(),
+                "timestamp": timestamp, "market_type": dimensions["market_type"],
+                "exchange": dimensions["exchange"], "symbol": dimensions["symbol"],
+                "base_asset": dimensions["asset"], "side": side, "price": price,
+                "volume_usd": notional, "quantity_base": quantity,
+                "provider_channel": request["endpoint_id"],
+                "configured_min_volume_usd": 0.0, "meets_configured_threshold": True,
+                "price_start": price_start, "price_end": price_end,
+                "aggregation_semantics": "footprint_price_bin",
+            }, unit))
+    return output
+
+
+def _normalize_large_order(record: Mapping[str, Any], request: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+    dimensions = request["dimensions"]
+    timestamp, unit = _timestamp(record.get("current_time", record.get("start_time")))
+    start_timestamp, _ = _timestamp(record.get("start_time", record.get("current_time")))
+    side_raw = record.get("order_side")
     if side_raw not in (1, 2):
-        raise ValueError("large_trade_side_invalid")
-    dimensions, channel = request["dimensions"], request["channel"]
+        raise ValueError("large_order_side_invalid")
+    state_raw = record.get("order_state")
     price = _finite(record.get("price"), "price", positive=True)
-    volume = _finite(record.get("volume_usd"), "volume_usd", nonnegative=True)
-    identity = "|".join(map(str, ("coinglass", channel, dimensions["exchange"], dimensions["market_type"], dimensions["symbol"],
-                                   timestamp, price, volume, side_raw)))
-    threshold = _finite(request["params"]["min_volume_usd"], "min_volume_usd", nonnegative=True)
-    return {"event_id": str(record.get("trade_id") or hashlib.sha256(identity.encode()).hexdigest()), "timestamp": timestamp,
-            "market_type": dimensions["market_type"], "exchange": str(record.get("exchange", dimensions["exchange"])),
-            "symbol": str(record.get("symbol", dimensions["symbol"])), "base_asset": str(record.get("base_asset", dimensions["asset"])),
-            "side": "sell" if side_raw == 1 else "buy", "price": price, "volume_usd": volume,
-            "provider_channel": channel, "configured_min_volume_usd": threshold,
-            "meets_configured_threshold": volume >= threshold}, unit
+    quantity = _finite(record.get("current_quantity", record.get("start_quantity")), "current_quantity", nonnegative=True)
+    notional = _finite(record.get("current_usd_value", record.get("start_usd_value")), "current_usd_value", nonnegative=True)
+    return {
+        "event_id": str(record.get("id") or hashlib.sha256(f"large_order|{timestamp}|{price}|{quantity}".encode()).hexdigest()),
+        "timestamp": timestamp, "market_type": dimensions["market_type"],
+        "exchange": str(record.get("exchange_name", dimensions["exchange"])),
+        "symbol": str(record.get("symbol", dimensions["symbol"])),
+        "base_asset": str(record.get("base_asset", dimensions["asset"])),
+        "side": "buy" if side_raw == 1 else "sell", "price": price,
+        "quantity_base": quantity, "notional_quote": notional,
+        "first_seen_timestamp": start_timestamp, "last_seen_timestamp": timestamp,
+        "order_state": "active" if state_raw == 1 else "completed" if state_raw == 2 else "unknown",
+        "executed_quantity_base": _finite(record.get("executed_volume", 0), "executed_volume", nonnegative=True),
+        "executed_usd": _finite(record.get("executed_usd_value", 0), "executed_usd_value", nonnegative=True),
+        "trade_count": int(record.get("trade_count", 0) or 0),
+        "provider_endpoint": request["endpoint_id"],
+    }, unit
 
 
 def _normalize_whale(record: Mapping[str, Any], request: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
@@ -145,8 +233,10 @@ def _dataset_key(request: Mapping[str, Any]) -> str:
         return f"coinglass.orderbook.{market}"
     if "order_depth" in endpoint:
         return f"coinglass.order_depth.{market}"
-    if "large_trades" in endpoint:
+    if "footprint" in endpoint:
         return f"coinglass.large_trades.{market}"
+    if "large_limit_orders" in endpoint:
+        return f"coinglass.whale_orders.{market}"
     return "coinglass.whale_activity" if endpoint == "whale_index" else "coinglass.market_history"
 
 
@@ -217,9 +307,13 @@ class LiquidityMicrostructureInputPreprocessor:
                     errors.append(f'{request["request_id"]}:{request["error"]["type"]}')
                     continue
                 try:
-                    records = _envelope(request["response"], websocket=request["transport"] == "websocket")
+                    records = _envelope(request["response"], websocket=False)
                     for record in records:
-                        if not isinstance(record, Mapping):
+                        if ".large_trades." in key:
+                            for normalized, unit in _normalize_footprint(record, request):
+                                units.add(unit); incoming.append(normalized)
+                            continue
+                        if not isinstance(record, Mapping) and ".orderbook." not in key:
                             raise ValueError("record_must_be_mapping")
                         if ".orderbook." in key:
                             normalized, warning, unit = _normalize_heatmap(record, request)
@@ -227,17 +321,16 @@ class LiquidityMicrostructureInputPreprocessor:
                                 warnings.append(warning)
                         elif ".order_depth." in key:
                             normalized, unit = _normalize_depth(record, request)
-                        elif ".large_trades." in key:
-                            normalized, unit = _normalize_trade(record, request)
+                        elif ".whale_orders." in key:
+                            normalized, unit = _normalize_large_order(record, request)
                         elif key.endswith("whale_activity"):
                             normalized, unit = _normalize_whale(record, request)
                         else:
                             normalized, unit = _normalize_market(record, request)
-                        units.add(unit)
-                        incoming.append(normalized)
+                        units.add(unit); incoming.append(normalized)
                 except Exception as exc:
                     errors.append(f'{request["request_id"]}:{type(exc).__name__}:{exc}')
-            events = ".large_trades." in key
+            events = ".large_trades." in key or ".whale_orders." in key
             merged = _merge(existing, incoming, events=events)
             if incoming:
                 status = "partial" if warnings or errors else "available"
@@ -258,6 +351,7 @@ class LiquidityMicrostructureInputPreprocessor:
         coinglass = {"orderbook": {"spot": datasets["coinglass.orderbook.spot"], "perpetual": datasets["coinglass.orderbook.perpetual"]},
                      "order_depth": {"spot": datasets["coinglass.order_depth.spot"], "perpetual": datasets["coinglass.order_depth.perpetual"]},
                      "large_trades": {"spot": datasets["coinglass.large_trades.spot"], "perpetual": datasets["coinglass.large_trades.perpetual"]},
+                     "whale_orders": {"spot": datasets["coinglass.whale_orders.spot"], "perpetual": datasets["coinglass.whale_orders.perpetual"]},
                      "whale_activity": datasets["coinglass.whale_activity"], "market_history": datasets["coinglass.market_history"]}
         missing = [key for key in REQUIRED_DATASETS if datasets[key]["status"] == "unavailable"]
         invalid = [key for key in REQUIRED_DATASETS if datasets[key]["status"] == "invalid"]

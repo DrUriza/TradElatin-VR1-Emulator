@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .on_chain_miners_sp_v1_3_adapter import align_on_chain_miners_to_sp_v1_3
+
 import copy
 import json
 import math
@@ -13,9 +15,9 @@ ON_CHAIN_MINERS_TITLE            = "ON-CHAIN & MINERS METRICS"
 ON_CHAIN_MINERS_CONTRACT_SCHEMA  = "trad_elatin.on_chain_miners.screen.v1"
 ON_CHAIN_MINERS_CONTRACT_VERSION = "1.0.0"
 
-RANGE_OPTIONS = ("1D", "7D", "30D", "90D")
+RANGE_OPTIONS = ("1D", "7D", "30D", "90D", "360D")
 DEFAULT_RANGE = "30D"
-RANGE_DAYS    = {"1D": 1, "7D": 7, "30D": 30, "90D": 90}
+RANGE_DAYS    = {"1D": 1, "7D": 7, "30D": 30, "90D": 90, "360D": 360}
 SECONDS_PER_DAY = 86_400
 
 VALID_MODES            = {"bootstrap", "incremental", "recovery"}
@@ -238,6 +240,7 @@ def _point(record: Mapping[str, Any], *, bar: bool) -> dict[str, Any]:
     point = {"timestamp": record["timestamp"], "value": record["value"]}
     if bar:
         point["bar_token"] = "positive" if record["value"] > 0 else "negative" if record["value"] < 0 else "neutral"
+        point["unit"] = "BTC/day"
     return point
 
 
@@ -307,6 +310,19 @@ def build_chart(chart_id: str, processing: Mapping[str, Any], *, data_as_of: int
         status = "available"
     chart = {"chart_id": chart_id, "title": title, "subtitle": subtitle, "chart_type": chart_type, "unit": unit, "provider": provider,
              "status": status, "current": current, "series_by_range": ranges, "warnings": warnings, "errors": errors}
+    available_records = len(series.get("records", [])) if isinstance(series.get("records"), Sequence) else 0
+    chart["calculation_history"] = {"records_available": available_records,
+        "first_timestamp": series.get("records", [{}])[0].get("timestamp") if available_records else None,
+        "last_timestamp": series.get("records", [{}])[-1].get("timestamp") if available_records else None,
+        "source_resolution": "1d", "fabricated_records": 0}
+    chart["history_contract"] = {"requested_days": 360, "available_days": available_records,
+        "status": "available" if available_records >= 360 else "blocked_upstream",
+        "reason": None if available_records >= 360 else "provider_history_beyond_available_daily_records_unproven"}
+    if chart_id != "miner_net_position_change":
+        chart["preferred_representation"] = chart_type
+        chart["ohlc_contract"] = {"status": "blocked_upstream", "reason": "daily_scalar_source_has_no_intra_bucket_observations",
+            "source_resolution": "1d_scalar", "required_capability": "multiple_temporal_observations_per_daily_bucket",
+            "fabricated_ohlc": False}
     if chart_id == "sopr_7d":
         chart["reference_lines"] = [{"value": 1.0, "label": "Breakeven", "token": "neutral"}]
     if chart_id == "miner_net_position_change":
@@ -522,6 +538,11 @@ def build_drilldowns(processing: Mapping[str, Any], classification: Mapping[str,
                 ("nupl_phases", lambda: build_nupl_drilldown(processing, classification, data_as_of=data_as_of)))
     for drilldown_id, builder in builders:
         drilldowns[drilldown_id], item_errors = builder()
+        item = drilldowns[drilldown_id]
+        ranges = item.get("series_by_range") or item.get("miner_specific", {}).get("series_by_range") or item.get("network_context", {}).get("snapshots_by_range") or {}
+        item["calculation_history"] = {"source": "processing_full_available_history", "fabricated_records": 0,
+            "ranges": {range_id: {"actual_points": payload.get("actual_points"), "expected_points": payload.get("expected_points"),
+                "status": payload.get("status")} for range_id, payload in ranges.items() if isinstance(payload, Mapping)}}
         errors.extend(f"drilldown_build_error:{drilldown_id}:{error}" for error in item_errors)
     return drilldowns, errors
 
@@ -634,7 +655,17 @@ class OnChainMinersContractBuilder:
                   "operational_status": {"data_mode": context.get("data_mode"), "is_demo": context.get("is_demo"), "quality_status": quality["status"],
                                          "connection_status": "not_reported", "cache_status": "not_reported", "generated_at": context.get("generated_at"),
                                          "data_as_of": quality["data_as_of"]},
-                  "charts": charts, "widgets": widgets, "drilldowns": drilldowns, "quality": quality}
+                  "charts": charts, "widgets": widgets, "drilldowns": drilldowns,
+                  "technical_analysis": {"status": "blocked_upstream", "recalculate_in_hmi": False,
+                      "targets": {chart_id: {"status": "blocked_upstream", "reason": "daily_scalar_source_has_no_legitimate_ohlc",
+                          "required_capability": "multiple_temporal_observations_per_daily_bucket", "indicator_ids": [],
+                          "technical_event_ids": []} for chart_id in ("miner_reserve", "sopr_7d", "hashrate", "difficulty")},
+                      "event_indexes": {"by_id": {}, "technical_event_ids": []}},
+                  "history_contract": {"requested_days": 360, "available_days": min(
+                      len(processing["series"][series_id].get("records", [])) for series_id, *_ in SERIES_CONFIG.values()),
+                      "status": "blocked_upstream", "fabricated_records": 0},
+                  "quality": quality}
+        output = align_on_chain_miners_to_sp_v1_3(output, processing, classification)
         copied, copy_errors = copy_json_safe_value(output, path="screen_contract")
         if copy_errors:
             output = _fallback(mode, copy_errors)

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Reusable signal processing library for Fourier, Wavelet, TDA and Micro-Doppler."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "pandas>=2.0"]
+dependencies = ["numpy>=1.24", "pandas>=2.0", "requests>=2.31", "websocket-client>=1.8"]
 
 [project.optional-dependencies]
 tda = ["ripser>=0.6", "persim>=0.3"]
@@ -26,3 +26,7 @@ preview        = true
 
 [tool.ruff.lint]
 ignore = ["E221", "E241", "E272"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "--basetemp=.pytest-tmp"

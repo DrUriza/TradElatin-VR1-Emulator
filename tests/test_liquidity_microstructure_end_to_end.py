@@ -11,5 +11,5 @@ def test_end_to_end_deterministic_immutable_and_complete():
     two = run_liquidity_microstructure_vertical(**args)
     screen = one["screen_contract"]
     assert screen == two["screen_contract"] and args["runtime_context"] == original
-    assert (len(screen["charts"]), len(screen["tables"]), len(screen["widgets"]), len(screen["drilldowns"])) == (6, 4, 6, 6)
+    assert (len(screen["charts"]), len(screen["tables"]), len(screen["widgets"]), len(screen["drilldowns"])) == (6, 3, 6, 6)
     assert screen["context"]["provider"]["label"] == "CoinGlass" and screen["context"]["exchange"] == "Binance"

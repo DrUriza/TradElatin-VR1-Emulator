@@ -7,9 +7,9 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .volatility_market_regimes_data_raw_extract import (
-    BASE_INTERVAL, COINGLASS_POSITIONING_ENDPOINT_ID, COINGLASS_PROVIDER, DERIBIT_PROVIDER,
-    DERIBIT_VOLATILITY_INDEX_ENDPOINT_ID, ENDPOINT_MANIFEST, GLASSNODE_PROVIDER,
-    GLASSNODE_REALIZED_VOL_ENDPOINT_ID, INTERVAL_SECONDS, VALID_MODES, VOLATILITY_MARKET_REGIMES_FAMILY,
+    BASE_INTERVAL, BOOTSTRAP_HISTORY_DAYS, COINGLASS_POSITIONING_ENDPOINT_ID, COINGLASS_PROVIDER,
+    ENDPOINT_MANIFEST, GLASSNODE_PROVIDER,
+    GLASSNODE_REALIZED_VOL_ENDPOINT_ID, GLASSNODE_DVOL_ENDPOINT_ID, INTERVAL_SECONDS, VALID_MODES, VOLATILITY_MARKET_REGIMES_FAMILY,
 )
 
 PERCENT_SUM_TOLERANCE = 0.25
@@ -18,7 +18,7 @@ STALE_TOLERANCE       = 2 * INTERVAL_SECONDS
 DATASETS = {
     (COINGLASS_PROVIDER, COINGLASS_POSITIONING_ENDPOINT_ID): ("coinglass", "top_position_ratio"),
     (GLASSNODE_PROVIDER, GLASSNODE_REALIZED_VOL_ENDPOINT_ID): ("glassnode", "realized_volatility"),
-    (DERIBIT_PROVIDER, DERIBIT_VOLATILITY_INDEX_ENDPOINT_ID): ("deribit", "volatility_index"),
+    (GLASSNODE_PROVIDER, GLASSNODE_DVOL_ENDPOINT_ID): ("glassnode", "dvol"),
 }
 DATASET_IDS = tuple(f"{provider}.{name}" for provider, name in DATASETS.values())
 
@@ -78,18 +78,6 @@ def unwrap_glassnode_realized_volatility_response(response: Any) -> list[Any]:
     return list(response)
 
 
-def unwrap_deribit_volatility_index_response(response: Any) -> list[Any]:
-    if not isinstance(response, Mapping) or response.get("jsonrpc") != "2.0" or "error" in response:
-        raise ValueError("invalid_envelope")
-    result = response.get("result")
-    if not isinstance(result, Mapping) or not _sequence(result.get("data")):
-        raise ValueError("invalid_envelope")
-    continuation = result.get("continuation")
-    if continuation is not None and type(continuation) is not int:
-        raise ValueError("invalid_envelope")
-    return list(result["data"])
-
-
 def normalize_coinglass_positioning_record(record: Any) -> dict[str, Any]:
     if not isinstance(record, Mapping):
         raise ValueError("invalid_record")
@@ -112,17 +100,22 @@ def normalize_glassnode_realized_volatility_record(record: Any) -> dict[str, Any
         "value_percent": 0.0 if value == 0 else value * 100}
 
 
-def normalize_deribit_volatility_index_record(record: Any) -> dict[str, Any]:
-    if not _sequence(record) or len(record) != 5:
-        raise ValueError("invalid_candle")
-    timestamp = _timestamp(record[0], "timestamp", milliseconds=True)
-    open_, high, low, close = (_finite(value, name, non_negative=True) for value, name in
-        zip(record[1:], ("open", "high", "low", "close"), strict=True))
-    if high < max(open_, low, close) or low > min(open_, high, close):
-        raise ValueError("invalid_ohlc")
-    return {"timestamp": timestamp, "open_native": open_, "high_native": high, "low_native": low, "close_native": close,
-        "open_percent": open_ * 100 if open_ else 0.0, "high_percent": high * 100 if high else 0.0,
-        "low_percent": low * 100 if low else 0.0, "close_percent": close * 100 if close else 0.0}
+
+
+def normalize_glassnode_dvol_record(record: Any) -> dict[str, Any]:
+    if not isinstance(record, Mapping):
+        raise ValueError("invalid_record")
+    timestamp = _timestamp(record.get("t"), "timestamp")
+    # Glassnode DVOL is an OHLC metric. Accept both flat OHLC fields and a nested v payload.
+    payload = record.get("v") if isinstance(record.get("v"), Mapping) else record
+    open_value = _finite(payload.get("o"), "dvol_open", non_negative=True)
+    high_value = _finite(payload.get("h"), "dvol_high", non_negative=True)
+    low_value = _finite(payload.get("l"), "dvol_low", non_negative=True)
+    close_value = _finite(payload.get("c"), "dvol_close", non_negative=True)
+    if high_value < max(open_value, close_value) or low_value > min(open_value, close_value):
+        raise ValueError("invalid_dvol_ohlc")
+    return {"timestamp": timestamp, "open": open_value, "high": high_value,
+            "low": low_value, "close": close_value}
 
 
 def upsert_timestamp_records(existing_records: Sequence[Mapping[str, Any]],
@@ -149,10 +142,15 @@ def _previous(existing: Mapping[str, Any] | None, provider: str, name: str) -> M
 
 def _dataset(*, requests: Sequence[Mapping[str, Any]], existing: Mapping[str, Any], provider: str, endpoint_id: str,
              reference_timestamp: int, execution_timestamp: int) -> dict[str, Any]:
-    normalizer = {COINGLASS_PROVIDER: normalize_coinglass_positioning_record,
-        GLASSNODE_PROVIDER: normalize_glassnode_realized_volatility_record, DERIBIT_PROVIDER: normalize_deribit_volatility_index_record}[provider]
-    unwrapper = {COINGLASS_PROVIDER: unwrap_coinglass_positioning_response,
-        GLASSNODE_PROVIDER: unwrap_glassnode_realized_volatility_response, DERIBIT_PROVIDER: unwrap_deribit_volatility_index_response}[provider]
+    normalizer = {
+        (COINGLASS_PROVIDER, COINGLASS_POSITIONING_ENDPOINT_ID): normalize_coinglass_positioning_record,
+        (GLASSNODE_PROVIDER, GLASSNODE_REALIZED_VOL_ENDPOINT_ID): normalize_glassnode_realized_volatility_record,
+        (GLASSNODE_PROVIDER, GLASSNODE_DVOL_ENDPOINT_ID): normalize_glassnode_dvol_record,
+    }[(provider, endpoint_id)]
+    unwrapper = {
+        COINGLASS_PROVIDER: unwrap_coinglass_positioning_response,
+        GLASSNODE_PROVIDER: unwrap_glassnode_realized_volatility_response,
+    }[provider]
     incoming_by_timestamp, invalid_count, envelope_invalid = {}, 0, False
     successful, failed, empty = 0, 0, 0
     warnings, errors = [], []
@@ -241,7 +239,7 @@ class VolatilityMarketRegimesInputPreprocessor:
 
     def run(self, raw_bundle: Mapping[str, Any]) -> dict[str, Any]:
         if (not isinstance(raw_bundle, Mapping) or raw_bundle.get("family") != VOLATILITY_MARKET_REGIMES_FAMILY
-                or raw_bundle.get("stage") != "input_raw" or raw_bundle.get("mode") not in VALID_MODES
+                or raw_bundle.get("stage") != "extracted_raw" or raw_bundle.get("mode") not in VALID_MODES
                 or not isinstance(raw_bundle.get("requests"), list)):
             raise ValueError("invalid_raw_bundle")
         mode, reference, execution = raw_bundle["mode"], raw_bundle.get("reference_timestamp"), raw_bundle.get("execution_timestamp")
@@ -267,7 +265,8 @@ class VolatilityMarketRegimesInputPreprocessor:
                     targeted.append(f"{provider}.{name}")
         required = targeted if mode == "recovery" else list(DATASET_IDS)
         quality = evaluate_volatility_market_regimes_input_quality(providers, mode=mode, required_datasets=required)
-        return {"family": VOLATILITY_MARKET_REGIMES_FAMILY, "stage": "input_preprocessed", "mode": mode,
+        return {"schema": {"id": "trad_elatin.volatility_market_regimes.input.v1", "version": "1.0.0"},
+            "family": VOLATILITY_MARKET_REGIMES_FAMILY, "stage": "input", "mode": mode,
             "reference_timestamp": reference, "execution_timestamp": execution,
             "dimensions": {"asset": "BTC", "symbol": "BTCUSDT", "exchange": "Binance", "interval": BASE_INTERVAL},
             "providers": providers, "quality": quality}
@@ -276,3 +275,26 @@ class VolatilityMarketRegimesInputPreprocessor:
 def preprocess_volatility_market_regimes_input(raw_bundle: Mapping[str, Any], *,
                                                existing_contract: Mapping[str, Any] | None = None) -> dict[str, Any]:
     return VolatilityMarketRegimesInputPreprocessor(existing_contract=existing_contract).run(raw_bundle)
+
+
+def run_volatility_market_regimes_input(*, fetcher, reference_timestamp: int,
+                                        existing_contract: Mapping[str, Any] | None = None,
+                                        requested_mode: str | None = None,
+                                        recovery_requests: Sequence[Mapping[str, Any]] | None = None,
+                                        clock=None, bootstrap_history_days: int = BOOTSTRAP_HISTORY_DAYS,
+                                        incremental_hours: int = 12) -> dict[str, Any]:
+    """Public Input facade aligned with the other seven families."""
+    from .volatility_market_regimes_data_raw_extract import VolatilityMarketRegimesRawExtractor
+    mode = determine_volatility_market_regimes_input_mode(
+        existing_contract=existing_contract,
+        recovery_requests=recovery_requests,
+        requested_mode=requested_mode,
+    )
+    raw = VolatilityMarketRegimesRawExtractor(fetcher, clock=clock).run(
+        mode=mode,
+        reference_timestamp=reference_timestamp,
+        recovery_requests=recovery_requests,
+        bootstrap_history_days=bootstrap_history_days,
+        incremental_hours=incremental_hours,
+    )
+    return VolatilityMarketRegimesInputPreprocessor(existing_contract=existing_contract).run(raw)

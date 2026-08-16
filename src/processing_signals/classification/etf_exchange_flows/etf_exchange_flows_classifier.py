@@ -160,17 +160,12 @@ def _atom(feature: Any, *, path: str, unit: str, generated_timestamp: int,
           extra_evidence: Mapping[str, Any] | None = None, extra_warnings: list[str] | None = None,
           processing_data_as_of: Any = None) -> dict[str, Any]:
     if isinstance(feature, Mapping) and feature.get("status") in {"available", "partial"}:
+        # Processing.data_as_of is the conservative shared anchor across required
+        # features, not an upper bound for each independently fresher feature.
         source_value = feature.get("data_as_of")
-        if processing_data_as_of is None:
-            source_timestamp = _strict_data_as_of(source_value)
-            processing_timestamp = None
-            coherent = source_timestamp is not None
-        else:
-            coherent, source_timestamp, processing_timestamp = _validate_source_data_as_of(
-                feature_data_as_of=source_value, processing_data_as_of=processing_data_as_of)
-        if not coherent:
+        if _strict_data_as_of(source_value) is None:
             return _wrapper(state=None, status="invalid", reason="processing_timestamp_inconsistent", data_as_of=None,
-                            evidence=_inconsistent_timestamp_evidence(source_value, processing_timestamp),
+                            evidence=_inconsistent_timestamp_evidence(source_value, _strict_data_as_of(processing_data_as_of)),
                             source_features=[path], parameters=parameters,
                             warnings=["processing_timestamp_inconsistent"])
     status, value, data_as_of, reason, warnings = _source(feature, path, unit, generated_timestamp)
@@ -411,7 +406,8 @@ def _blocked(contract: Mapping[str, Any], generated_at: Any, parameters: Mapping
         "composite_capital_flow_regime": deepcopy(atom), "data_confidence": deepcopy(atom)}
     return {"family": FAMILY, "stage": "classification", "version": VERSION, "mode": contract.get("mode"),
         "data_mode": contract.get("data_mode"), "is_demo": contract.get("is_demo"), "generated_at": deepcopy(generated_at),
-        "data_as_of": None, "classifications": classifications, "provenance": {"source_family": FAMILY,
+        "data_as_of": None, "classifications": classifications, "technical_events": {"events": [], "indexes": {}},
+        "provenance": {"source_family": FAMILY,
         "source_stage": "processing", "source_version": VERSION, "source_processing_data_as_of": contract.get("data_as_of"),
         "parameters": deepcopy(dict(parameters)), "warnings": []}, "quality": {"status": "invalid", "required": [],
         "optional": [], "available": [], "partial": [], "unavailable": [], "invalid": ["processing"],
@@ -450,6 +446,39 @@ def classify_etf_exchange_flows(*, processing_contract: Mapping[str, Any], gener
     composite = classify_composite_capital_flow_regime(directions["1d"], pressure, persistence, netflow)
     anomalies = _at(contract, "provenance.anomalies") or {}
     confidence = classify_data_confidence(quality, directions["1d"], pressure, anomalies)
+    technical = contract.get("technical_analysis", {}) if isinstance(contract.get("technical_analysis"), Mapping) else {}
+    candidates = technical.get("cross_candidates", []) if isinstance(technical.get("cross_candidates"), list) else []
+    events = []
+    indexes: dict[str, list[str]] = {"moving_average_cross": [], "macd": [], "adx": [], "stochastic": []}
+    for item in candidates:
+        if not isinstance(item, Mapping):
+            continue
+        timestamp = _timestamp(item.get("timestamp"))
+        cross_id = item.get("cross_id")
+        first, second = item.get("first_series"), item.get("second_series")
+        direction = item.get("direction")
+        if timestamp is None or not isinstance(cross_id, str) or direction not in {-1, 1}:
+            continue
+        indicator_id = None
+        if (first, second) == ("k", "d"):
+            group, index_name, indicator_id = "stochastic_cross", "stochastic", "stochastic"
+        elif (first, second) == ("macd", "signal"):
+            group, index_name, indicator_id = "macd_cross", "macd", "macd"
+        elif (first, second) == ("di_plus", "di_minus"):
+            group, index_name, indicator_id = "adx_cross", "adx", "adx"
+        else:
+            group, index_name = "moving_average_cross", "moving_average_cross"
+        signal = "bullish" if direction == 1 else "bearish"
+        event_uid = f"all_exchange:1d:{timestamp}:technical_cross:{cross_id}"
+        event = {"event_uid": event_uid, "timestamp": timestamp, "event_id": cross_id,
+            "event_type": "technical_cross", "event_group": group, "signal": signal,
+            "label": cross_id.replace("_", " ").upper(), "marker": "arrow_up" if direction == 1 else "arrow_down",
+            "source": {"market": "all_exchange", "timeframe": "1d"},
+            "display": {"screen_a": indicator_id is None, "screen_b": True}}
+        if indicator_id is not None:
+            event["indicator_id"] = indicator_id
+        events.append(event)
+        indexes[index_name].append(event_uid)
     classifications = {"etf_flow_direction": directions, "etf_flow_persistence": persistence,
         "gbtc_premium_regime": premium, "exchange_pressure_regime": pressure,
         "exchange_netflow_regime": netflow, "aum_reconciliation_state": aum,
@@ -476,6 +505,7 @@ def classify_etf_exchange_flows(*, processing_contract: Mapping[str, Any], gener
     result = {"family": FAMILY, "stage": "classification", "version": VERSION, "mode": contract.get("mode"),
         "data_mode": contract.get("data_mode"), "is_demo": contract.get("is_demo"),
         "generated_at": deepcopy(effective_generated_at), "data_as_of": data_as_of, "classifications": classifications,
+        "technical_events": {"events": events, "indexes": indexes},
         "provenance": {"source_family": FAMILY, "source_stage": "processing", "source_version": VERSION,
             "source_processing_data_as_of": contract.get("data_as_of"), "parameters": deepcopy(configured), "warnings": []},
         "quality": {"status": quality_status, "required": list(required), "optional": list(optional),

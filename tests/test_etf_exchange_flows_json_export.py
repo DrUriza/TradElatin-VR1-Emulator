@@ -27,7 +27,7 @@ def arguments(**extra):
 
 
 def test_etf_export_default_path_is_canonical():
-    assert DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH.as_posix() == "runtime/contracts/etf_exchange_flows_screen.json"
+    assert DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH.as_posix() == "runtime/contracts/hmi_contract/etf_exchange_flows_screen.json"
 
 
 def test_etf_vertical_remains_in_memory_by_default(tmp_path, monkeypatch):

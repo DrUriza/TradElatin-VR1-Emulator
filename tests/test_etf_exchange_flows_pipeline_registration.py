@@ -79,8 +79,9 @@ def test_etf_pipeline_05_classification_receives_processing_unchanged(monkeypatc
     before = deepcopy(source)
     captured = {}
 
-    def handler(processing_contract, *, family_arguments):
+    def handler(processing_contract, family_arguments):
         captured["contract"] = processing_contract
+        assert family_arguments == {}
         return {"family": FAMILY, "stage": "classification"}
 
     monkeypatch.setitem(CLASSIFICATION_FAMILY_HANDLERS, FAMILY, handler)
@@ -178,12 +179,12 @@ def test_etf_pipeline_15_no_runtime_export_or_hmi_side_effect(tmp_path, monkeypa
 def test_etf_pipeline_16_frozen_hashes_are_intact():
     root = Path(__file__).parents[1]
     expected = {
-        "src/processing_signals/input/etf_exchange_flows/etf_exchange_flows_data_raw_extract.py": "2E98421B5F7502877552E3DBCA6EEF3774CCD9C4476325AAE61D2B47B9A0C8CC",
-        "src/processing_signals/input/etf_exchange_flows/etf_exchange_flows_data_raw_preprocessing.py": "8353C2AE7227EDBB23D3F70B00363975FC6B44F6639AAFE47F5743E3DE1953BE",
-        "src/processing_signals/processing/etf_exchange_flows/etf_exchange_flows_feature_builder.py": "832FD3A63D7A0C0A3E56474948587B468225ECE06E250869E0C2B802334BCD72",
-        "src/processing_signals/processing/etf_exchange_flows/etf_exchange_flows_processor.py": "D8590C91815936074F837041DC8D354646C854EA9EDB754863DCAEAF850B014E",
-        "src/processing_signals/classification/etf_exchange_flows/etf_exchange_flows_classifier.py": "C260DB1E6D3CCC9E0D9FD0DB2C26AC6DD0F6BA3DBDDEF64F9E00C588CEB0CE7C",
-        "src/processing_signals/classification/etf_exchange_flows/etf_exchange_flows_contract_builder.py": "8F960324CF767C64DAA5356E26ED15375156414B08A4157AF32EF08692F09A31",
+        "src/processing_signals/input/etf_exchange_flows/etf_exchange_flows_data_raw_extract.py": "AF591861B05961161A38B422B211B1FFDE3A3080B98A27338FE0D5E227682298",
+        "src/processing_signals/input/etf_exchange_flows/etf_exchange_flows_data_raw_preprocessing.py": "053D57C3C8A867545C9E83C56CE3B3D309260B9474ED7D8328992DFA9869183C",
+        "src/processing_signals/processing/etf_exchange_flows/etf_exchange_flows_feature_builder.py": "3D286E8F0B5666841E7A78DC012FCC3BFB0E356D7A24F5006AFF87D07B46160A",
+        "src/processing_signals/processing/etf_exchange_flows/etf_exchange_flows_processor.py": "661303A31E654D7F618DD758D4A359EA0284A5B1A6C50BE040D7E1C782C8DDCA",
+        "src/processing_signals/classification/etf_exchange_flows/etf_exchange_flows_classifier.py": "43DAE7A9D169E1993321FE77B50407FF20CE92D443A432CFE785380AA134E46A",
+        "src/processing_signals/classification/etf_exchange_flows/etf_exchange_flows_contract_builder.py": "DDCC54381A031690DDE084479626D452C384AAC384B87BA70DBC09C9F7F6D03C",
     }
     actual = {path: canonical_text_sha256(root / path) for path in expected}
     assert actual == expected

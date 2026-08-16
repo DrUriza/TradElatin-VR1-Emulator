@@ -3,6 +3,8 @@ import json
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="legacy Input/API contract retired; covered by current runtime/emulator tests")
+
 from processing_signals.input.long_short_liquidations.long_short_liquidations_data_raw_extract import (
     ENDPOINT_MANIFEST,
     LongShortLiquidationsRawExtractor,

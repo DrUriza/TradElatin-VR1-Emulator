@@ -252,7 +252,7 @@ class EtfExchangeFlowsInputPreprocessor:
         self.existing = deepcopy(dict(existing_contract or {}))
 
     def run(self, raw_contract: Mapping[str, Any], *, generated_at: str) -> dict[str, Any]:
-        if raw_contract.get("family") != FAMILY or raw_contract.get("stage") != "raw_extract":
+        if raw_contract.get("family") != FAMILY or raw_contract.get("stage") != "extracted_raw":
             raise ValueError("invalid_raw_contract")
         datasets, invalid, warnings, endpoint_quality = _empty_datasets(), {}, [], {}
         for provider, endpoints in raw_contract.get("raw", {}).items():
@@ -339,11 +339,27 @@ class EtfExchangeFlowsInputPreprocessor:
             provenance["providers"][provider] = {"requested_endpoints": names,
                 "successful_endpoints": [name for name in names if endpoint_quality[name]["status"] in {"available", "partial"}],
                 "failed_endpoints": [name for name in names if endpoint_quality[name]["status"] in {"unavailable", "invalid"}]}
-        output = {"family": FAMILY, "stage": "input", "mode": raw_contract["mode"], "data_mode": raw_contract["data_mode"],
-            "is_demo": raw_contract["is_demo"], "requested_at": raw_contract["requested_at"], "generated_at": generated_at,
-            "data_as_of": provenance["data_as_of"], "datasets": datasets, "invalid_records": invalid,
-            "provenance": provenance, "quality": {"status": global_status, "endpoints": endpoint_quality,
-                "warnings": list(dict.fromkeys(warnings)), "errors": []}}
+        output = {
+            "schema": {"id": "trad_elatin.etf_exchange_flows.input.v1", "version": "1.0.0"},
+            "family": FAMILY,
+            "stage": "input",
+            "mode": raw_contract["mode"],
+            "data_mode": raw_contract["data_mode"],
+            "is_demo": raw_contract["is_demo"],
+            "context": deepcopy(raw_contract.get("context", {})),
+            "requested_at": raw_contract["requested_at"],
+            "generated_at": generated_at,
+            "data_as_of": provenance["data_as_of"],
+            "datasets": datasets,
+            "invalid_records": invalid,
+            "provenance": provenance,
+            "quality": {
+                "status": global_status,
+                "endpoints": endpoint_quality,
+                "warnings": list(dict.fromkeys(warnings)),
+                "errors": [],
+            },
+        }
         json.dumps(output, allow_nan=False)
         return output
 

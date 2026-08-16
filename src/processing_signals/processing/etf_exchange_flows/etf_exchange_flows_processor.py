@@ -214,6 +214,7 @@ def process_etf_exchange_flows(*, input_contract: Mapping[str, Any], generated_a
     output = {"family": FAMILY, "stage": STAGE, "version": VERSION, "mode": source.get("mode"), "data_mode": source.get("data_mode"),
         "is_demo": source.get("is_demo"), "generated_at": _iso(generated_timestamp), "data_as_of": quality["data_as_of"],
         "features": deepcopy(payload["features"]), "series": deepcopy(payload["series"]),
+        "technical_analysis": deepcopy(payload.get("technical_analysis", {})),
         "series_metadata": deepcopy(payload.get("series_metadata", {})), "snapshots": deepcopy(payload["snapshots"]),
         "provenance": _provenance(payload, source, exchange_scope), "quality": quality}
     json.dumps(output, ensure_ascii=False, allow_nan=False, sort_keys=False)

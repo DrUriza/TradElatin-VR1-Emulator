@@ -8,7 +8,7 @@ import pytest
 import processing_signals.main.screen_contract_export as exporter
 from processing_signals.main.on_chain_miners import run_on_chain_miners_vertical
 from processing_signals.main.screen_contract_export import export_on_chain_miners_screen_json, write_on_chain_miners_screen_json
-from test_on_chain_miners_input_vertical import NOW, FakeFetcher
+from on_chain_miners_test_helpers import NOW, FakeFetcher
 
 
 @pytest.fixture

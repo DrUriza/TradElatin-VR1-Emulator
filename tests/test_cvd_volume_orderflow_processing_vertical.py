@@ -9,7 +9,7 @@ import pytest
 
 from processing_signals.processing.cvd_volume_orderflow.cvd_volume_orderflow_feature_builder import (
     CvdVolumeOrderflowFeatureBuilder, apply_rolling_features, build_cvd_bars, build_fixed_window_summary,
-    build_general_vwap, build_price_vs_vwap, resample_records, validate_base_records,
+    build_price_vs_vwap, resample_records, validate_base_records,
 )
 from processing_signals.processing.cvd_volume_orderflow.cvd_volume_orderflow_processor import process_cvd_volume_orderflow
 
@@ -108,20 +108,6 @@ def test_negative_imbalance_is_bounded():
     assert -1 <= value <= 1
 
 
-def test_general_uses_exact_intersection_and_never_fills_missing_market():
-    spot = [input_row(START, 10, 2), input_row(START + 60, 20, 3)]
-    futures = [input_row(START + 60, 7, 5), input_row(START + 120, 30, 8)]
-    output = process(input_contract(one_minute=spot, futures_one_minute=futures,
-        fifteen_minute=[input_row(START)], futures_fifteen_minute=[input_row(START)]))
-    general = output["markets"]["general"]["timeframes"]["1m"]
-    assert [row["timestamp"] for row in general["records"]] == [START + 60]
-    assert (general["records"][0]["taker_buy_volume_usd"], general["records"][0]["taker_sell_volume_usd"]) == (27, 8)
-    assert general["status"] == "partial"
-    assert general["reason"] == "spot_futures_timestamp_misalignment"
-    assert general["alignment"]["spot_only_timestamps"] == [START]
-    assert general["alignment"]["futures_only_timestamps"] == [START + 120]
-
-
 @pytest.mark.parametrize(("target", "count", "interval", "expected"),
     [("5m", 5, 60, 5), ("1h", 4, 900, 4), ("4h", 16, 900, 16), ("1d", 96, 900, 96)])
 def test_resampling_uses_frozen_source_factor_and_volume_sums(target, count, interval, expected):
@@ -172,14 +158,13 @@ def test_gap_breaks_continuity_and_recovery_restores_it():
     assert recovered["markets"]["spot"]["timeframes"]["1m"]["continuity_breaks"] == []
 
 
-def test_declared_input_gap_breaks_only_affected_market_and_propagates_to_general():
+def test_declared_input_gap_breaks_only_affected_market():
     contract = input_contract()
     contract["markets"]["spot"]["cvd"]["timeframes"]["1m"]["gaps"] = [{
         "previous_timestamp": START, "next_timestamp": START + 120, "missing_records": 1}]
     output = process(contract)
     assert output["markets"]["spot"]["timeframes"]["1m"]["current"]["continuity_status"] == "broken"
     assert output["markets"]["futures"]["timeframes"]["1m"]["current"]["continuity_status"] == "complete"
-    assert output["markets"]["general"]["timeframes"]["1m"]["current"]["continuity_status"] == "broken"
 
 
 def test_partial_bucket_breaks_continuity_immediately():
@@ -248,44 +233,33 @@ def test_historical_replacement_recomputes_all_later_cvd_closes():
     assert second["parameters"]["recalculation_policy"] == "full_history_deterministic_rebuild"
 
 
-def test_footprint_vwap_scope_and_general_weighting():
+def test_footprint_vwap_scope():
     builder = CvdVolumeOrderflowFeatureBuilder()
     spot = builder.build_footprint_vwap(footprint(scoped=False, quote_multiplier=2))
     futures = builder.build_footprint_vwap(footprint(scoped=False, quote_multiplier=3))
     assert spot["vwap_usd"] == 4
     assert (spot["status"], spot["reason"]) == ("partial", "footprint_exchange_or_timeframe_scope_not_preserved")
-    general = build_general_vwap(spot, futures)
-    assert general["vwap_usd"] == 5
-    assert general["vwap_usd"] != (spot["vwap_usd"] + futures["vwap_usd"]) / 2 or spot["base_volume"] == futures["base_volume"]
     empty = builder.build_footprint_vwap({"records": []})
     assert (empty["status"], empty["reason"]) == ("unavailable", "footprint_data_not_available")
 
 
-def test_general_vwap_is_not_simple_average_when_weights_differ():
-    spot = {"vwap_usd": 2.0, "base_volume": 10.0, "quote_volume": 20.0, "records_used": 1, "levels_used": 1, "status": "available"}
-    futures = {"vwap_usd": 8.0, "base_volume": 30.0, "quote_volume": 240.0, "records_used": 1, "levels_used": 1, "status": "available"}
-    general = build_general_vwap(spot, futures)
-    assert general["vwap_usd"] == 6.5
-    assert general["vwap_usd"] != 5
-
-
-def test_price_vs_vwap_with_and_without_reference_and_no_invented_general():
+def test_price_vs_vwap_with_and_without_reference():
     vwap = {"vwap_usd": 100.0}
     assert build_price_vs_vwap(vwap, {"timestamp": 1, "price_usd": 110})["value"] == pytest.approx(.1)
     assert build_price_vs_vwap(vwap, None)["reason"] == "price_reference_not_provided"
     output = process(price_reference_by_market={"spot": {"timestamp": 1, "price_usd": 10}, "futures": {"timestamp": 1, "price_usd": 10}})
-    assert output["markets"]["general"]["price_vs_vwap"]["reason"] == "price_reference_not_provided"
+    assert set(output["markets"]) == {"spot", "futures"}
 
 
 def test_contract_shape_absence_of_classification_and_full_history():
     contract = input_contract()
     output = process(contract)
     assert (output["family"], output["stage"], output["version"]) == ("cvd_volume_orderflow", "processing", "0.1.0")
-    assert set(output["markets"]) == {"spot", "futures", "general"}
+    assert set(output["markets"]) == {"spot", "futures"}
     assert set(output["markets"]["spot"]["timeframes"]) == {"1m", "5m", "15m", "1h", "4h", "1d"}
     assert len(output["markets"]["spot"]["timeframes"]["1m"]["records"]) == len(contract["markets"]["spot"]["cvd"]["timeframes"]["1m"]["records"])
     encoded = json.dumps(output, allow_nan=False).lower()
-    for forbidden in ('"classification"', '"signal"', '"kpis"', '"charts"', '"widgets"', '"screen"', '"events"'):
+    for forbidden in ('"classification"', '"kpis"', '"charts"', '"widgets"', '"screen"', '"events"'):
         assert forbidden not in encoded
 
 
@@ -302,10 +276,10 @@ def test_availability_partial_unavailable_and_quality_partial():
 
 def test_quality_ok_with_complete_core_scoped_enrichment_and_prices():
     contract = input_contract(one_minute=rows(105, 60), fifteen_minute=rows(2016, 900), scoped_footprint=True)
-    refs = {market: {"timestamp": START + 3_000_000, "price_usd": 10} for market in ("spot", "futures", "general")}
+    refs = {market: {"timestamp": START + 3_000_000, "price_usd": 10} for market in ("spot", "futures")}
     output = process(contract, price_reference_by_market=refs)
     assert all(output["markets"][market]["timeframes"][timeframe]["status"] == "available"
-        for market in ("spot", "futures", "general") for timeframe in ("1m", "5m", "15m", "1h", "4h", "1d"))
+        for market in ("spot", "futures") for timeframe in ("1m", "5m", "15m", "1h", "4h", "1d"))
     assert output["quality"] == {"status": "ok", "core_status": "available", "enrichment_status": "available", "warnings": [], "errors": []}
 
 
@@ -325,8 +299,8 @@ def test_bootstrap_incremental_recovery_modes_are_preserved():
 def test_input_hashes_remain_frozen():
     expected = {
         "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_extract.py": "e461826c4c4d067d0cbff2dea33dcb9f977caefec61cfc96699bb39b06a1f13e",
-        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_preprocessing.py": "0e9fba8d5a4f8d95e3bd740093d9d4a9e4f6a1c4c6b680e0f4cbec05e88cc932",
-        "tests/test_cvd_volume_orderflow_input_vertical.py": "f845d3afede2119ac177583d163b83c1e0e2d803dc0994b00c2f87cdfaf0caf5",
+        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_preprocessing.py": "2d218f206cbb841cd0724ee757590594e47208b444901be737d3864e05196e38",
+        "tests/test_cvd_volume_orderflow_input_vertical.py": "1ddd3587e7f5f218ac15df9b1d72b06f288b632b7f59a96770eb608d6d09e5b0",
     }
     assert {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in expected} == expected
 

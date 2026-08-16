@@ -182,19 +182,20 @@ def classify_miner_pressure(basis: Mapping[str, Any]) -> dict[str, Any]:
     current    = basis.get("current") if isinstance(basis, Mapping) else None
     status     = _basis_status(basis, current)
     source     = _source_current("miner_pressure_basis", current)
-    source.update({"previous": basis.get("previous"), "change_1d": basis.get("change_1d")})
+    source.update({"components": copy.deepcopy(basis.get("components", current.get("components") if isinstance(current, Mapping) else {})),
+                   "previous": basis.get("previous"), "change_1d": basis.get("change_1d")})
     thresholds = {"low_pressure_max": MPI_LOW_PRESSURE_MAX, "high_pressure_min": MPI_HIGH_PRESSURE_MIN}
     if status in {"invalid", "unavailable"}:
         return _empty("miner_pressure", status, f"miner_pressure_basis_{status}", source, thresholds)
     value = source["value"]
     if not _finite(value):
-        return _empty("miner_pressure", "invalid", "mpi_value_not_finite", source, thresholds)
+        return _empty("miner_pressure", "invalid", "miner_outflow_z_value_not_finite", source, thresholds)
     if value < MPI_LOW_PRESSURE_MAX:
-        state, signal, label, token, reason = "low_selling_pressure", "bullish", "LOW", "positive", "mpi_below_zero"
+        state, signal, label, token, reason = "low_selling_pressure", "bullish", "LOW", "positive", "reserve_outflow_z_below_zero"
     elif value <= MPI_HIGH_PRESSURE_MIN:
-        state, signal, label, token, reason = "moderate_selling_pressure", "neutral", "MODERATE", "warning", "mpi_between_zero_and_two"
+        state, signal, label, token, reason = "moderate_selling_pressure", "neutral", "MODERATE", "warning", "reserve_outflow_z_between_zero_and_two"
     else:
-        state, signal, label, token, reason = "high_selling_pressure", "bearish", "HIGH", "negative", "mpi_above_two"
+        state, signal, label, token, reason = "high_selling_pressure", "bearish", "HIGH", "negative", "reserve_outflow_z_above_two"
     result = {"classification_id": "miner_pressure", "status": status, "state": state, "signal": signal, "display_label": label,
               "display_color_token": token, "source": source, "thresholds": thresholds, "reason": reason, "warnings": [], "errors": []}
     if status == "partial":
@@ -242,11 +243,11 @@ def classify_net_position(basis: Mapping[str, Any]) -> dict[str, Any]:
     if not _finite(value):
         return _empty("net_position", "invalid", "net_position_value_not_finite", source)
     if value > 0:
-        state, signal, label, token, reason = "net_accumulation", "bullish", "ACCUMULATION", "positive", "reserve_delta_positive"
+        state, signal, label, token, reason = "net_accumulation", "bullish", "ACCUMULATION", "positive", "glassnode_miner_net_position_positive"
     elif value < 0:
-        state, signal, label, token, reason = "net_distribution", "bearish", "DISTRIBUTION", "negative", "reserve_delta_negative"
+        state, signal, label, token, reason = "net_distribution", "bearish", "DISTRIBUTION", "negative", "glassnode_miner_net_position_negative"
     else:
-        state, signal, label, token, reason = "balanced", "neutral", "BALANCED", "neutral", "reserve_delta_zero"
+        state, signal, label, token, reason = "balanced", "neutral", "BALANCED", "neutral", "glassnode_miner_net_position_zero"
     result = {"classification_id": "net_position", "status": status, "state": state, "signal": signal, "display_label": label,
               "display_color_token": token, "source": source, "thresholds": {}, "reason": reason, "warnings": [], "errors": []}
     if status == "partial":

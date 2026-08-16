@@ -7,6 +7,8 @@ from typing      import Any
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="legacy synthetic Prices vertical retired; current Main uses runtime_orchestrator")
+
 from processing_signals.main.main_pipeline import SYNTHETIC_REFERENCE_TIMESTAMP, SyntheticPricesFetcher, _run_synthetic_vertical
 from processing_signals.main.prices_ohlcv  import build_prices_view
 

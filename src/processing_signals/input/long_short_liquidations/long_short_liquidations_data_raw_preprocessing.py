@@ -282,9 +282,21 @@ def _provenance(requests: Sequence[Mapping[str, Any]], raw: Mapping[str, Any],
     first = requests[0]
     previous = existing.get("provenance", {}) if existing else {}
     request_ids = list(previous.get("request_ids", [])) + [item["request_id"] for item in requests]
+    coverage_intervals = list(previous.get("coverage_intervals", []))
+    for request in requests:
+        params = request.get("params", {})
+        start, end = params.get("start_time"), params.get("end_time")
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            coverage_intervals.append({
+                "start": int(start / 1000 if start > 10**11 else start),
+                "end": int(end / 1000 if end > 10**11 else end),
+                "status": "complete" if request.get("status") == "ok" and
+                          "event_endpoint_record_limit_reached" not in request.get("warnings", []) else "incomplete",
+            })
     return {"provider": first["provider"], "endpoint_id": first["endpoint_id"],
             "path": first["path"], "params": deepcopy(requests[-1]["params"]),
             "request_ids": list(dict.fromkeys(request_ids)),
+            "coverage_intervals": coverage_intervals,
             "reference_timestamp": raw["reference_timestamp"],
             "execution_timestamp": raw["execution_timestamp"]}
 
@@ -517,7 +529,7 @@ def validate_long_short_liquidations_raw_bundle(raw_bundle: Any) -> None:
         raise ValueError("raw_bundle_must_be_mapping")
     if raw_bundle.get("family") != LONG_SHORT_LIQUIDATIONS_FAMILY:
         raise ValueError("invalid_raw_family")
-    if raw_bundle.get("stage") != "input_raw":
+    if raw_bundle.get("stage") != "extracted_raw":
         raise ValueError("invalid_raw_stage")
     if raw_bundle.get("mode") not in VALID_MODES:
         raise ValueError("invalid_raw_mode")
@@ -735,7 +747,8 @@ class LongShortLiquidationsInputPreprocessor:
             mode=raw["mode"], raw_requests=requests, existing_contract=self.existing_contract,
         )
         quality = self._quality(providers, required)
-        output = {"family": LONG_SHORT_LIQUIDATIONS_FAMILY, "stage": "input", "mode": raw.get("mode"),
+        output = {"schema": {"id": "trad_elatin.long_short_liquidations.input.v1", "version": "1.0.0"},
+                  "family": LONG_SHORT_LIQUIDATIONS_FAMILY, "stage": "input", "mode": raw.get("mode"),
                   "reference_timestamp": raw.get("reference_timestamp"),
                   "execution_timestamp": raw.get("execution_timestamp"), "providers": providers,
                   "quality": quality}

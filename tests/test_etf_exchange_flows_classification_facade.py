@@ -16,8 +16,22 @@ def test_public_facades_are_equivalent_and_shape_is_canonical():
     assert direct == run_etf_exchange_flows_classification(processing_contract=processing, generated_at=NOW)
     assert direct == EtfExchangeFlowsClassifier().classify(processing_contract=processing, generated_at=NOW)
     assert set(direct) == {"family", "stage", "version", "mode", "data_mode", "is_demo", "generated_at",
-                           "data_as_of", "classifications", "provenance", "quality"}
+                           "data_as_of", "classifications", "technical_events", "provenance", "quality"}
     assert (direct["family"], direct["stage"], direct["version"]) == ("etf_exchange_flows", "classification", "0.1")
+
+
+def test_technical_cross_candidates_become_indexed_semantic_events():
+    processing = cloned_processing()
+    processing["technical_analysis"]["cross_candidates"] = [{"timestamp": NOW, "cross_id": "macd_above_signal",
+        "first_series": "macd", "second_series": "signal", "direction": 1,
+        "previous_difference": -1.0, "current_difference": 1.0}]
+    technical = classify_etf_exchange_flows(processing_contract=processing, generated_at=NOW)["technical_events"]
+    event = technical["events"][0]
+    assert set(event) == {"event_uid", "timestamp", "event_id", "event_type", "event_group", "indicator_id", "signal",
+                          "label", "marker", "source", "display"}
+    assert event["indicator_id"] == "macd"
+    assert event["display"] == {"screen_a": False, "screen_b": True}
+    assert technical["indexes"]["macd"] == [event["event_uid"]]
 
 
 def test_generated_at_priority_does_not_change_data_as_of():

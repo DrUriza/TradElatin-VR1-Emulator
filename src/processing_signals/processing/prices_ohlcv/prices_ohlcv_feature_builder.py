@@ -5,7 +5,7 @@ from typing import Any, Mapping
 
 
 TIMEFRAME_ORDER = ("1m", "5m", "15m", "1h", "4h", "1d")
-MARKET_ORDER    = ("general", "spot", "futures")
+MARKET_ORDER    = ("spot", "futures", "general")
 
 
 def build_market_series_features(market: Mapping[str, Any]) -> dict[str, Any]:
@@ -27,23 +27,26 @@ def build_market_series_features(market: Mapping[str, Any]) -> dict[str, Any]:
 def build_main_ohlcv_features(markets: Mapping[str, Any]) -> dict[str, Any]:
     return {
         market: build_market_series_features(markets.get(market, {}))
-        for market in ("spot", "futures", "general")
+        for market in MARKET_ORDER
     }
 
 
 def build_market_selector_features(markets: Mapping[str, Any]) -> dict[str, Any]:
-    available = [
-        market
-        for market in MARKET_ORDER
-        if any(
-            markets.get(market, {}).get("timeframes", {}).get(timeframe, {}).get("records")
-            for timeframe in TIMEFRAME_ORDER
-        )
-    ]
+    # Prices-only presentation contract: HMI exposes one canonical market,
+    # ``general``, whose data is an exact alias of Spot.  Spot/Futures remain
+    # in Processing for internal comparison and confirmation.
+    available = ["general"] if any(
+        markets.get("general", {}).get("timeframes", {}).get(timeframe, {}).get("records")
+        for timeframe in TIMEFRAME_ORDER
+    ) else []
     return {
         "default_market": "general",
+        "selected_market": "general",
         "available_markets": available,
         "timeframes": list(TIMEFRAME_ORDER),
+        "default_timeframe": "1h",
+        "selected_timeframe": "1h",
+        "canonical_source_market": "spot",
     }
 
 
@@ -63,7 +66,7 @@ def build_spot_futures_comparison_features(
 
 
 def build_indicator_placeholders() -> dict[str, dict[str, Any]]:
-    return {"general": {}, "spot": {}, "futures": {}}
+    return {market: {} for market in MARKET_ORDER}
 
 
 def build_timeframe_indicator_features(indicators: Mapping[str, Any]) -> dict[str, Any]:

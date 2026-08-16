@@ -17,10 +17,20 @@ def test_public_api_and_exact_root_metadata():
     assert output["family"] == "etf_exchange_flows" and output["stage"] == "processing" and output["version"] == "0.1"
     assert output["mode"] == "bootstrap" and output["data_mode"] == "live" and output["is_demo"] is False
     assert set(output) == {"family", "stage", "version", "mode", "data_mode", "is_demo", "generated_at", "data_as_of",
-                           "features", "series", "series_metadata", "snapshots", "provenance", "quality"}
+                           "features", "series", "series_metadata", "snapshots", "provenance", "quality", "technical_analysis"}
     assert run_etf_exchange_flows_processing(input_contract=cloned_input(), generated_at=NOW) == output
     assert EtfExchangeFlowsProcessor().process(input_contract=cloned_input(), generated_at=NOW) == output
     assert EtfExchangeFlowsFeatureBuilder().build(input_contract=cloned_input(), generated_at=NOW)["features"] == output["features"]
+
+
+def test_exchange_balance_ta_is_precomputed_in_processing():
+    output = process_etf_exchange_flows(input_contract=cloned_input(hourly=240), generated_at=NOW)
+    candles = output["series"]["exchange_balance"]
+    technical = output["technical_analysis"]
+    assert candles and technical["status"] == "available"
+    assert set(technical["regression_channel"]["series"]) == {"middle", "upper", "lower"}
+    assert all(len(values) == len(candles) for values in technical["regression_channel"]["series"].values())
+    assert set(technical["indicators"]["tsi"]["series"]) == {"tsi", "signal"}
 
 
 @pytest.mark.parametrize("contract", [None, {}, {"family": "wrong"}])

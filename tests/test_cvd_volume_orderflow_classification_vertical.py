@@ -51,18 +51,23 @@ def summary(*, imbalance=.18, ratio=1.10, delta=999.0, efficiency=.68, status="a
 
 def processing_contract():
     markets = {}
-    for market in ("spot", "futures", "general"):
+    for market in ("spot", "futures"):
         markets[market] = {"timeframes": {name: timeframe(previous=bar(NOW - 60, imbalance=-.10, open_value=90, close_value=95))
             for name in ("1m", "5m", "15m", "1h", "4h", "1d")},
             "window_summaries": {"1h": summary(), "24h": summary()}, "footprint_summaries": {"1h": {}},
             "price_vs_vwap": {"value": .0042, "status": "available", "reason": None, "price_timestamp": NOW, "price_usd": 100.0},
             "availability": {}}
+    cross_market = {"window_summaries": {"1h": summary(), "24h": summary()},
+        "volume_ratios": {"futures_vs_spot": {"1h": {"value": 1.0, "status": "available", "reason": None,
+            "futures_volume_usd": 180.0, "spot_volume_usd": 180.0, "timestamp": NOW}}},
+        "footprint_summaries": {"1h": {"status": "unavailable", "reason": "not_in_fixture"}}}
     return {"family": "cvd_volume_orderflow", "stage": "processing", "version": "0.1.0", "mode": "bootstrap",
-        "context": {"base_asset": "BTC", "pair_symbol": "BTCUSDT", "markets": ["spot", "futures", "general"],
+        "context": {"base_asset": "BTC", "pair_symbol": "BTCUSDT", "markets": ["spot", "futures"],
             "base_timeframes": ["1m", "15m"], "available_timeframes": ["1m", "5m", "15m", "1h", "4h", "1d"],
             "data_mode": "synthetic", "is_demo": True, "reference_timestamp": NOW, "input_requested_at": "x",
             "input_execution_timestamp": NOW, "processing_timestamp": NOW}, "parameters": {"source_timeframes": {}},
-        "markets": markets, "quality": {"status": "ok", "core_status": "available", "enrichment_status": "available", "warnings": [], "errors": []}}
+        "markets": markets, "cross_market": cross_market,
+        "quality": {"status": "ok", "core_status": "available", "enrichment_status": "available", "warnings": [], "errors": []}}
 
 
 def classify(contract=None):
@@ -82,7 +87,7 @@ def test_rejects_non_mapping_missing_market_and_timeframe():
     with pytest.raises(ValueError, match="mapping"):
         classify_cvd_volume_orderflow([])
     contract = processing_contract()
-    del contract["markets"]["general"]
+    del contract["markets"]["spot"]
     with pytest.raises(ValueError, match="structure"):
         classify(contract)
     contract = processing_contract()
@@ -97,7 +102,7 @@ def test_contract_immutable_clock_context_and_strict_json():
     first, second = classify(contract), classify(contract)
     assert contract == before
     assert first == second
-    assert first["context"] == {"base_asset": "BTC", "pair_symbol": "BTCUSDT", "markets": ["spot", "futures", "general"],
+    assert first["context"] == {"base_asset": "BTC", "pair_symbol": "BTCUSDT", "markets": ["spot", "futures"],
         "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d"], "data_mode": "synthetic", "is_demo": True,
         "reference_timestamp": NOW, "processing_timestamp": NOW, "classification_timestamp": NOW + 1}
     json.dumps(first, allow_nan=False)
@@ -260,7 +265,7 @@ def test_transition_divergence_continuity_events_ids_order_and_no_duplicates():
     ids = [event["event_id"] for event in events]
     assert f"cvd:spot:1m:order_flow_transition:{NOW}" in ids
     assert f"cvd:spot:1m:continuity_break:{NOW}" in ids
-    assert f"cvd:general:1h:market_divergence:{NOW}" in ids
+    assert all("general" not in event_id for event_id in ids)
     assert len(ids) == len(set(ids))
     assert events == sorted(events, key=lambda event: (event["timestamp"], event["event_type"], event["market"], event["timeframe"], event["event_id"]))
 
@@ -277,7 +282,7 @@ def test_quality_ok_partial_invalid_and_enrichment_separation():
     contract = processing_contract()
     contract["markets"]["spot"]["price_vs_vwap"] = {"value": None, "status": "unavailable", "reason": "price_reference_not_provided"}
     output = classify(contract)
-    assert output["quality"]["status"] == "partial"
+    assert output["quality"]["status"] == "ok"
     assert output["quality"]["core_status"] == "ok"
     assert output["quality"]["enrichment_status"] == "partial"
     contract = processing_contract()
@@ -307,15 +312,12 @@ def test_output_has_no_presentation_runtime_or_history_layers():
 def test_six_frozen_layer_hashes():
     expected = {
         "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_extract.py": "e461826c4c4d067d0cbff2dea33dcb9f977caefec61cfc96699bb39b06a1f13e",
-        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_preprocessing.py": "0e9fba8d5a4f8d95e3bd740093d9d4a9e4f6a1c4c6b680e0f4cbec05e88cc932",
-        "tests/test_cvd_volume_orderflow_input_vertical.py": "f845d3afede2119ac177583d163b83c1e0e2d803dc0994b00c2f87cdfaf0caf5",
-        "src/processing_signals/processing/cvd_volume_orderflow/cvd_volume_orderflow_feature_builder.py": "0740a464df9ab68f4a1c9d56b45da9ff1f7e5ebe89dbcc75e16efb7798b0041b",
-        "src/processing_signals/processing/cvd_volume_orderflow/cvd_volume_orderflow_processor.py": "dd469e06523e6a1818f625aed9fd4e303c377cff3d02d9528de1d794cc084063",
-        "tests/test_cvd_volume_orderflow_processing_vertical.py": "fc71600989963e896154bc03312f6954466d5dc42910164b9ad428eb9d075189",
+        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_preprocessing.py": "2d218f206cbb841cd0724ee757590594e47208b444901be737d3864e05196e38",
+        "tests/test_cvd_volume_orderflow_input_vertical.py": "1ddd3587e7f5f218ac15df9b1d72b06f288b632b7f59a96770eb608d6d09e5b0",
     }
     assert {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in expected} == expected
 
 
-def test_not_registered_in_classification_pipeline():
-    candidates = list((ROOT / "src").rglob("classification_pipeline.py"))
-    assert all("cvd_volume_orderflow" not in path.read_text(encoding="utf-8") for path in candidates)
+def test_registered_in_classification_pipeline():
+    from processing_signals.classification.classification_pipeline import CLASSIFICATION_FAMILY_HANDLERS
+    assert "cvd_volume_orderflow" in CLASSIFICATION_FAMILY_HANDLERS

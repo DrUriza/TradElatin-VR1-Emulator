@@ -10,6 +10,8 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
+from .long_short_liquidations_sp_v1_2_adapter import align_long_short_liquidations_to_sp_v1_2
+
 VALID_STATUS = {"available", "partial", "unavailable", "invalid"}
 INTERVALS = {
     "1m": (None, "1m", None), "5m": (None, "5m", None), "15m": (None, "15m", "classifications.events.15m"),
@@ -404,9 +406,10 @@ def _aggregate_map(processing: Mapping[str, Any], classification: Mapping[str, A
                                                generated_at=generated_at)[0]
     reference_view = {"value": deepcopy(reference.get("value")) if _usable(ref_status) else None,
         "display_value": str(reference.get("value")) if _usable(ref_status) and reference.get("value") is not None else "â€”",
-        "classification": None, "confidence": 0., "status": ref_status, "reason": deepcopy(ref_reason),
+        "unit": context["quote_asset"], "classification": None, "confidence": 0., "status": ref_status, "reason": deepcopy(ref_reason),
         "color_token": _token(ref_status), "timestamp": ref_timestamp,
-        "provenance": deepcopy(reference.get("provenance", {}))}
+        "provenance": {"source_family": reference.get("source_family"), "source_market": reference.get("source_market"),
+            "source_timeframe": reference.get("source_timeframe"), "price_field": reference.get("price_field")}}
     buckets = deepcopy(source.get("buckets", {"status": "unavailable", "reason": "missing_buckets", "items": []}))
     series = []
     items = aligned.get("buckets", {}).get("items", {}) if _usable(_status(aligned.get("status"), "maps.aligned_exchanges.status")) else {}
@@ -415,30 +418,83 @@ def _aggregate_map(processing: Mapping[str, Any], classification: Mapping[str, A
                        "unit": "provider_level", "points": deepcopy(points)})
     bucket_items = buckets.get("items", []) if isinstance(buckets, Mapping) else []
     central = [deepcopy(item) for item in bucket_items if isinstance(item, Mapping) and item.get("region") == "central"]
-    return {"id": "aggregate_liquidation_map", "title": f"{context['base_asset']} Exchange Liquidation Map",
+    exchange_points = {item["exchange"]: {point["bucket_index"]: point for point in item["points"]} for item in series}
+    long_curve = {item["price"]: item["cumulative_share"] for item in source.get("curves", {}).get("estimated_long", [])}
+    short_curve = {item["price"]: item["cumulative_share"] for item in source.get("curves", {}).get("estimated_short", [])}
+    visual_buckets = [{"bucket_index": item["bucket_index"], "price_low": item["lower_price"],
+        "price_center": item["center_price"], "price_high": item["upper_price"],
+        "bars": {exchange.lower(): exchange_points.get(exchange, {}).get(item["bucket_index"], {}).get("level_total", 0)
+            for exchange in exchange_points}, "cumulative_long": long_curve.get(item["center_price"], 0),
+        "cumulative_short": short_curve.get(item["center_price"], 0)} for item in bucket_items]
+    axes = {"x": {"field": "price_center", "unit": context["quote_asset"], "type": "linear"},
+        "bar_axis": {"unit": "provider_level", "side": "left"},
+        "cumulative_axis": {"unit": "normalized_level", "side": "right", "range": [0, 1]}}
+    return {"id": "aggregate_liquidation_map", "chart_id": "aggregate_liquidation_map", "title": f"{context['base_asset']} Exchange Liquidation Map",
         "map_semantics": "estimated", "map_time_semantics": "snapshot", "provider": "coinglass",
-        "snapshot_observed_at": _validate_timestamp_anchor(source.get("provenance", {}).get("source_snapshot_timestamp"),
-            path="maps.aggregated.provenance.source_snapshot_timestamp", generated_at=generated_at)[0],
-        "reference_price": reference_view, "provider_levels": deepcopy(source.get("provider_levels", [])) if _usable(status) else [],
-        "buckets": buckets if _usable(status) else {"status": status, "reason": deepcopy(reason), "items": []},
-        "series_by_exchange": series, "estimated_long_curve": deepcopy(source.get("curves", {}).get("estimated_long", [])) if _usable(status) else [],
+        "current_price": reference_view["value"], "reference_price": reference_view, "axes": axes,
+        "bar_series": [{"series_id": exchange.lower(), "label": exchange} for exchange in exchange_points],
+        "buckets": visual_buckets if _usable(status) else [], "series_by_exchange": series,
+        "provider_levels": deepcopy(source.get("provider_levels", [])) if _usable(status) else [],
+        "estimated_long_curve": deepcopy(source.get("curves", {}).get("estimated_long", [])) if _usable(status) else [],
         "estimated_short_curve": deepcopy(source.get("curves", {}).get("estimated_short", [])) if _usable(status) else [],
-        "curve_metadata": {"source_order": "processing", "render_order": "source"},
         "estimated_side": _classification_model(_at(classification, "classifications.estimated_side")),
         "central_region": {"items": central if _usable(ref_status) else []}, "clusters": _cluster_payload(processing, classification),
         "concentration": {"source": deepcopy(source.get("concentration", {})),
             "aggregate": _classification_model(_at(classification, "classifications.concentration.aggregate_map")),
             "estimated_long": _classification_model(_at(classification, "classifications.concentration.estimated_long")),
             "estimated_short": _classification_model(_at(classification, "classifications.concentration.estimated_short"))},
-        "status": status, "reason": deepcopy(reason), "badges": [
-            _badge("estimated", "Estimated", True, None, "maps.aggregated"),
-            _badge("interpolated", "Interpolated", False, None, "maps.aggregated.provenance.interpolation_enabled")],
-        "provenance": deepcopy(source.get("provenance", {})), "unit": "provider_level"}
+        "status": status, "reason": deepcopy(reason),
+        "provenance": deepcopy(source.get("provenance", {})), "unit": "provider_level",
+        "visual_contract": {"renderer": "stacked_bars_plus_dual_cumulative_curves", "reference_line": {"field": "current_price", "label": "CURRENT PRICE"},
+            "barmode": "stack", "x_axis": "linear_price", "hmi_calculation": False, "bucket_count": len(visual_buckets)}}
 
 
-def _hyperliquid() -> dict[str, Any]:
-    return {"id": "hyperliquid_map", "title": "Hyperliquid Liquidation Map", "status": "unavailable",
-            "reason": "source_not_contractually_available", "proxy": False, "series": [], "badges": []}
+def _exchange_visual(processing: Mapping[str, Any], context: Mapping[str, Any], key: str, *, leverage: bool) -> dict[str, Any]:
+    raw_source = _at(processing, f"maps.by_exchange.{key}", None)
+    if not isinstance(raw_source, Mapping):
+        return {"id": "binance_leverage_map" if leverage else "hyperliquid_map",
+            "chart_id": "binance_leverage_map" if leverage else "hyperliquid_map",
+            "title": f"{key} Liquidation Map", "status": "unavailable", "reason": "exchange_map_not_available",
+            "proxy": False, "current_price": None, "reference_price": None, "axes": {}, "bar_series": [], "buckets": [],
+            "provenance": {}, "unit": "provider_level", "visual_contract": {"hmi_calculation": False, "bucket_count": 0}}
+    source = _mapping(raw_source, f"maps.by_exchange.{key}")
+    reference = _mapping(_at(processing, "maps.reference_price"), "maps.reference_price")
+    status, reason = _view_status(source, f"maps.by_exchange.{key}")
+    raw = source.get("buckets", {}).get("items", []) if _usable(status) else []
+    long_curve = {item["price"]: item["cumulative_share"] for item in source.get("curves", {}).get("estimated_long", [])}
+    short_curve = {item["price"]: item["cumulative_share"] for item in source.get("curves", {}).get("estimated_short", [])}
+    leverage_ids = sorted({str(value).removesuffix(".0") + "x" for item in raw for value in item.get("leverage_breakdown", {})}, key=lambda value: float(value[:-1]))
+    series_ids = leverage_ids if leverage else ["long", "short"]
+    buckets = []
+    for item in raw:
+        if leverage:
+            bars = {str(value).removesuffix(".0") + "x": amount for value, amount in item.get("leverage_breakdown", {}).items()}
+        else:
+            bars = {"long": item["level_total"] if item.get("region") == "estimated_long" else 0,
+                    "short": item["level_total"] if item.get("region") == "estimated_short" else 0}
+        buckets.append({"bucket_index": item["bucket_index"], "price_low": item["lower_price"],
+            "price_center": item["center_price"], "price_high": item["upper_price"], "bars": bars,
+            "cumulative_long": long_curve.get(item["center_price"], 0), "cumulative_short": short_curve.get(item["center_price"], 0)})
+    quote = context["quote_asset"]
+    return {"id": "binance_leverage_map" if leverage else "hyperliquid_map",
+        "chart_id": "binance_leverage_map" if leverage else "hyperliquid_map",
+        "title": f"{key} {context['base_asset']}/{quote} Liquidation Map", "status": status, "reason": reason,
+        "proxy": False, "current_price": reference.get("value"),
+        "reference_price": {"value": reference.get("value"), "unit": quote, "timestamp": reference.get("timestamp"),
+            "status": reference.get("status"), "reason": reference.get("reason"),
+            "provenance": {"source_family": reference.get("source_family"), "source_market": reference.get("source_market"),
+                "source_timeframe": reference.get("source_timeframe"), "price_field": reference.get("price_field")}},
+        "axes": {"x": {"field": "price_center", "unit": quote, "type": "linear"},
+            "bar_axis": {"unit": "provider_level", "side": "left"},
+            "cumulative_axis": {"unit": "normalized_level", "side": "right", "range": [0, 1]}},
+        "bar_series": [{"series_id": item, "label": item} for item in series_ids], "buckets": buckets,
+        "provenance": deepcopy(source.get("provenance", {})), "unit": "provider_level",
+        "visual_contract": {"renderer": "stacked_bars_plus_dual_cumulative_curves", "reference_line": {"field": "current_price", "label": "CURRENT PRICE"},
+            "barmode": "stack", "x_axis": "linear_price", "hmi_calculation": False, "bucket_count": len(buckets)}}
+
+
+def _hyperliquid(processing: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+    return _exchange_visual(processing, context, "Hyperliquid", leverage=False)
 
 
 def _binance(processing: Mapping[str, Any], config: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
@@ -453,23 +509,9 @@ def _binance(processing: Mapping[str, Any], config: Mapping[str, Any], context: 
         return {"id": "binance_leverage_map", "title": title, "leverage_title": leverage_title, "exchange_key": key,
                 "status": "unavailable", "reason": "exchange_map_not_available", "provider_levels": [], "buckets": [],
                 "estimated_long_curve": [], "estimated_short_curve": [], "stacked_buckets": [], "leverage_curves": [], "badges": []}
-    source = _mapping(maps[key], f"maps.by_exchange.{key}")
-    status, reason = _view_status(source, f"maps.by_exchange.{key}")
-    buckets = source.get("buckets", {}).get("items", []) if _usable(status) else []
-    stacked = []
-    for bucket in buckets:
-        breakdown = _mapping(bucket.get("leverage_breakdown", {}), "bucket.leverage_breakdown")
-        levels = [{"leverage": leverage, "level": deepcopy(value)} for leverage, value in
-                  sorted(breakdown.items(), key=lambda item: float(item[0]))]
-        stacked.append({"price": deepcopy(bucket.get("center_price")), "bucket_index": deepcopy(bucket.get("bucket_index")),
-                        "total_level": deepcopy(bucket.get("level_total")), "leverage_levels": levels})
-    return {"id": "binance_leverage_map", "title": title, "leverage_title": leverage_title, "exchange_key": key,
-            "status": status, "reason": deepcopy(reason), "provider_levels": deepcopy(source.get("provider_levels", [])) if _usable(status) else [],
-            "buckets": deepcopy(buckets), "estimated_long_curve": deepcopy(source.get("curves", {}).get("estimated_long", [])) if _usable(status) else [],
-            "estimated_short_curve": deepcopy(source.get("curves", {}).get("estimated_short", [])) if _usable(status) else [],
-            "stacked_buckets": stacked, "leverage_curves": [], "unit": "provider_level",
-            "badges": [_badge("estimated", "Estimated", True, None, f"maps.by_exchange.{key}")],
-            "provenance": deepcopy(source.get("provenance", {}))}
+    visual = _exchange_visual(processing, context, key, leverage=True)
+    visual.update(leverage_title=leverage_title, exchange_key=key)
+    return visual
 
 
 def _confirmations(processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
@@ -482,7 +524,11 @@ def _confirmations(processing: Mapping[str, Any], classification: Mapping[str, A
         def value(name):
             metric = _mapping(metrics.get(name), f"realized.confirmations.{provider}.{name}")
             return deepcopy(metric.get("value")) if _usable(_status(metric.get("status"), f"{name}.status")) else None
-        rows.append({"provider": provider, "classification": model["classification"], "confidence": model["confidence"],
+        endpoint = "aggregate/hour" if provider == "cryptoquant" else "futures_liquidated_volume_{long,short}_sum"
+        rows.append({"provider": provider, "endpoint": endpoint,
+            "confirmation": {"classification": model["classification"], "confidence": model["confidence"],
+                "status": model["status"], "evidence": model["evidence"]},
+            "classification": model["classification"], "confidence": model["confidence"],
             "aligned_point_count": value("aligned_point_count"), "coverage_ratio": value("coverage_ratio"),
             "pearson_correlation": value("pearson_correlation"), "mape": value("median_absolute_percentage_error"),
             "status": model["status"], "reason": model["reason"], "evidence": model["evidence"], "provenance": model["provenance"]})
@@ -595,7 +641,7 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
                     "classification": _classification_model(event15_atom)}
     exchange = _exchange_table(processing, classification)
     aggregate = _aggregate_map(processing, classification, screen_context, generated_at=runtime["generated_at"])
-    hyperliquid, binance = _hyperliquid(), _binance(processing, config, screen_context)
+    hyperliquid, binance = _hyperliquid(processing, screen_context), _binance(processing, config, screen_context)
     confirmations, max_pain = _confirmations(processing, classification), _max_pain(processing, classification)
     interval_window = INTERVALS[selected["interval"]][0]
     if interval_window is None:
@@ -668,8 +714,8 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
         *deepcopy(_at(classification, "quality.errors", [])), *quality["errors"]]))
     event_provenance = _at(processing, "events.provenance", {})
     divergent = any(row["classification"] == "provider_divergent" for row in confirmations["rows"])
-    badges = [_badge("demo", "Demo", runtime["is_demo"], None, "runtime_context.is_demo"),
-        _badge("synthetic", "Synthetic", runtime["data_mode"] == "synthetic", None, "runtime_context.data_mode"),
+    badges = [_badge("demo", "Demo", runtime["is_demo"], None, "context.synthetic_fixture"),
+        _badge("synthetic", "Synthetic", runtime["data_mode"] == "synthetic", None, "context.data_mode"),
         _badge("estimated", "Estimated", True, None, "maps.aggregated"),
         _badge("interpolated", "Interpolated", False, None, "maps.aggregated.provenance.interpolation_enabled"),
         _badge("proxy", "Proxy", False, None, "charts.hyperliquid_map.proxy"),
@@ -696,8 +742,8 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
         _with_view_id({**confirmations, "items": confirmations["rows"]}, view_id="provider_confirmations"), max_pain,
         _with_view_id({"status": quality["status"], "reason": None, "warnings": quality["warnings"],
                        "errors": quality["errors"]}, view_id="screen_quality_summary")]
-    result = {"contract_version": "0.1", "screen_id": "long_short_liquidations", "family": "long_short_liquidations",
-        "stage": "contract", "reference_timestamp": processing["reference_timestamp"],
+    result = {"contract_version": "1.2.0", "screen_id": "long_short_liquidations", "family": "long_short_liquidations",
+        "stage": "screen_contract_final", "reference_timestamp": processing["reference_timestamp"],
         "context": {**screen_context, "exchange_scope": selected["exchange"], "selected_interval": selected["interval"],
                     "available_intervals": list(INTERVALS)},
         "timestamps": {"generated_at": runtime["generated_at"], "updated_at": runtime["updated_at"], "data_as_of": data_as_of,
@@ -706,7 +752,7 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
             "events_coverage_as_of": events.get("window_end"),
             "realized_data_as_of": clean_anchors["total_liquidations_24h"],
             "exchange_distribution_as_of": clean_anchors["exchange_concentration"]},
-        "mode": {"data_mode": runtime["data_mode"], "is_demo": runtime["is_demo"], "cache_status": runtime["cache_status"]},
+        "mode": runtime["data_mode"],
         "header": {"title": "LONG / SHORT LIQUIDATIONS", "symbol": screen_context["symbol"], "market": screen_context["market"],
             "exchange_scope": selected["exchange"], "selected_interval": selected["interval"], "data_as_of": data_as_of,
             "updated_at": runtime["updated_at"], "badges": deepcopy(badges), "status": quality["status"]},
@@ -714,7 +760,14 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
         "charts": {"aggregate_map": aggregate, "hyperliquid_map": hyperliquid, "binance_leverage_map": binance},
         "side_panel": {"id": "liquidation_target_summary", "title": "LIQUIDATION TARGET SUMMARY", "items": side_items},
         "tables": {"exchange_distribution": exchange, "provider_confirmations": confirmations}, "badges": badges,
-        "providers": providers, "source_selection": source_selection, "quality": quality, "warnings": warnings, "errors": errors}
+        "providers": providers, "source_selection": source_selection,
+        "calculation_history": {"source_interval": _at(processing, "realized.provenance.source_interval", "1h"),
+            "records_available": len(_at(processing, "realized.series", [])), "fabricated_records": 0,
+            "warmup_records": 0, "owner": "Processing"},
+        "history_contract": {"source_resolution": "1h", "map_time_semantics": "snapshot",
+            "hmi_calculation": False, "fabricated_records": 0},
+        "quality": quality, "warnings": warnings, "errors": errors}
+    result = align_long_short_liquidations_to_sp_v1_2(result, processing, classification, runtime)
     json.dumps(result, ensure_ascii=False, allow_nan=False)
     return result
 
@@ -733,7 +786,7 @@ class LongShortLiquidationsContractBuilder:
 
 
 def export_long_short_liquidations_contract(contract: Mapping[str, Any], path: str | Path =
-                                             "runtime/contracts/long_short_liquidations_screen.json") -> Path:
+                                             "runtime/contracts/hmi_contract/long_short_liquidations_screen.json") -> Path:
     contract = _mapping(contract, "contract")
     _json_safe(contract, "contract")
     destination = Path(path)

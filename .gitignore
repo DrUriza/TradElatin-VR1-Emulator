@@ -15,5 +15,7 @@ dist/
 .ipynb_checkpoints/
 .DS_Store
 Thumbs.db
+runtime/contracts/processing/
+runtime/state/
 src/processing_signals/input/apis/*/extracted_raw/*
 !src/processing_signals/input/apis/*/extracted_raw/.gitkeep

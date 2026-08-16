@@ -203,7 +203,7 @@ def detect_indicator_crosses(source: Any, indicators: Any) -> dict[str, list[dic
     closed     = [bool(value) for value in source.get("is_closed", [True] * len(timestamps))]
     output: dict[str, list[dict[str, Any]]] = {"stochastic": [], "macd": [], "adx": []}
 
-    def legacy_events(first: str, second: str) -> list[dict[str, Any]]:
+    def pair_cross_events(first: str, second: str) -> list[dict[str, Any]]:
         if first not in indicators or second not in indicators:
             return []
         return detect_numeric_crosses(
@@ -214,7 +214,7 @@ def detect_indicator_crosses(source: Any, indicators: Any) -> dict[str, list[dic
             second_series=second,
         )
 
-    for event in legacy_events("stoch_k_14", "stoch_d_14"):
+    for event in pair_cross_events("stoch_k_14", "stoch_d_14"):
         index   = timestamps.index(event["timestamp"])
         k_value = _finite(indicators["stoch_k_14"].iloc[index])
         if not closed[index] or k_value is None or not (k_value <= 20 or k_value >= 80):
@@ -231,7 +231,7 @@ def detect_indicator_crosses(source: Any, indicators: Any) -> dict[str, list[dic
             }
         )
 
-    for event in legacy_events("macd", "macd_signal"):
+    for event in pair_cross_events("macd", "macd_signal"):
         index = timestamps.index(event["timestamp"])
         if not closed[index]:
             continue
@@ -271,7 +271,7 @@ def detect_indicator_crosses(source: Any, indicators: Any) -> dict[str, list[dic
                         "marker": "diamond",
                     }
                 )
-    for event in legacy_events("plus_di_14", "minus_di_14"):
+    for event in pair_cross_events("plus_di_14", "minus_di_14"):
         index = timestamps.index(event["timestamp"])
         if not closed[index]:
             continue

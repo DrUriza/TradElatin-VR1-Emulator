@@ -29,7 +29,8 @@ from .on_chain_miners_data_raw_extract import (
 
 
 UNITS = {
-    "miner_reserve": "BTC", "sopr": "ratio", "hashrate": "H/s", "difficulty": "provider_native_difficulty", "mpi": "z_score",
+    "miner_reserve": "BTC", "sopr": "ratio", "hashrate": "H/s", "difficulty": "provider_native_difficulty",
+    "miner_net_position_change": "BTC/day", "miner_outflow_total": "BTC/day", "mpi": "z_score",
     "puell_multiple": "ratio", "sth_sopr": "ratio", "lth_sopr": "ratio", "nupl": "ratio",
     "miners_unspent_supply": "BTC", "utxo_age_distribution": "mixed",
     "miner_revenue_total_usd": "USD/day", "miner_block_reward_revenue_usd": "USD/day",
@@ -141,18 +142,28 @@ def normalize_miner_reserve_record(record: Mapping[str, Any]) -> dict[str, Any]:
     return _base_record("miner_reserve", normalize_unix_timestamp(record.get("t")), normalize_optional_finite_number(record.get("v")))
 
 
-def normalize_sopr_record(record: Mapping[str, Any], source_window: str = "day") -> dict[str, Any]:
-    output = _base_record("sopr", parse_cryptoquant_daily_timestamp(record.get("date")), normalize_optional_finite_number(record.get("sopr")), source_window)
-    output.update({field: normalize_optional_finite_number(record.get(field)) for field in ("sopr", "a_sopr", "sth_sopr", "lth_sopr")})
+def normalize_sopr_record(record: Mapping[str, Any], source_window: str = "1h") -> dict[str, Any]:
+    # Glassnode is canonical for SOPR in VR1; auxiliary SOPR variants are not
+    # fabricated when the provider returns the scalar series only.
+    output = _base_record("sopr", normalize_unix_timestamp(record.get("t")), normalize_optional_finite_number(record.get("v")), source_window)
+    output.update({"sopr": output["value"], "a_sopr": None, "sth_sopr": None, "lth_sopr": None})
     return output
 
 
 def normalize_hashrate_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    return _base_record("hashrate", normalize_unix_timestamp(record.get("t")), normalize_optional_finite_number(record.get("v")))
+    return _base_record("hashrate", normalize_unix_timestamp(record.get("t")), normalize_optional_finite_number(record.get("v")), "1h")
 
 
-def normalize_difficulty_record(record: Mapping[str, Any], source_window: str = "day") -> dict[str, Any]:
-    return _base_record("difficulty", parse_cryptoquant_daily_timestamp(record.get("date")), normalize_optional_finite_number(record.get("difficulty")), source_window)
+def normalize_difficulty_record(record: Mapping[str, Any], source_window: str = "1h") -> dict[str, Any]:
+    return _base_record("difficulty", normalize_unix_timestamp(record.get("t")), normalize_optional_finite_number(record.get("v")), source_window)
+
+
+def normalize_miner_net_position_change_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    return _base_record("miner_net_position_change", normalize_unix_timestamp(record.get("t")), normalize_optional_finite_number(record.get("v")), "24h")
+
+
+def normalize_miner_outflow_total_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    return _base_record("miner_outflow_total", normalize_unix_timestamp(record.get("t")), normalize_optional_finite_number(record.get("v")), "24h")
 
 
 def normalize_mpi_record(record: Mapping[str, Any], source_window: str = "day") -> dict[str, Any]:
@@ -220,7 +231,8 @@ def upsert_on_chain_records(existing_records: Sequence[Mapping[str, Any]], incom
 
 NORMALIZERS: dict[str, Callable[..., dict[str, Any]]] = {
     "miner_reserve": normalize_miner_reserve_record, "sopr": normalize_sopr_record, "hashrate": normalize_hashrate_record,
-    "difficulty": normalize_difficulty_record, "mpi": normalize_mpi_record, "puell_multiple": normalize_puell_multiple_record,
+    "difficulty": normalize_difficulty_record, "miner_net_position_change": normalize_miner_net_position_change_record,
+    "miner_outflow_total": normalize_miner_outflow_total_record, "mpi": normalize_mpi_record, "puell_multiple": normalize_puell_multiple_record,
     "sth_sopr": normalize_sth_sopr_record, "lth_sopr": normalize_lth_sopr_record, "nupl": normalize_nupl_record,
     "miners_unspent_supply": lambda record: _normalize_glassnode_extension("miners_unspent_supply", record),
     "miner_revenue_total_usd": lambda record: _normalize_glassnode_extension("miner_revenue_total_usd", record),

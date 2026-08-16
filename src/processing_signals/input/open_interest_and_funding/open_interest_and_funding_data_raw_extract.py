@@ -25,6 +25,7 @@ ENDPOINTS = {
     "cryptoquant_funding_rates": {"provider": "cryptoquant", "endpoint_id": "funding_rates", "path": "/btc/market-data/funding-rates", "request_kind": "confirmation_series", "raw_shape": "status_result_data_funding_rates", "required": False, "canonical_id": "cryptoquant_funding_rates"},
     "glassnode_futures_open_interest_sum": {"provider": "glassnode", "endpoint_id": "futures_open_interest_sum", "path": "/v1/metrics/derivatives/futures_open_interest_sum", "request_kind": "confirmation_series", "raw_shape": "list_t_v_scalar", "required": False, "canonical_id": "glassnode_futures_open_interest_sum"},
     "glassnode_futures_funding_rate_perpetual": {"provider": "glassnode", "endpoint_id": "futures_funding_rate_perpetual", "path": "/v1/metrics/derivatives/futures_funding_rate_perpetual", "request_kind": "confirmation_series", "raw_shape": "list_t_v_scalar", "required": False, "canonical_id": "glassnode_futures_funding_rate_perpetual"},
+    "glassnode_futures_estimated_leverage_ratio": {"provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio", "path": "/v1/metrics/derivatives/futures_estimated_leverage_ratio", "request_kind": "confirmation_series", "raw_shape": "list_t_v_scalar", "required": False, "canonical_id": "glassnode_futures_estimated_leverage_ratio"},
 }
 
 OpenInterestAndFundingFetcher = Callable[..., Mapping[str, Any] | Sequence[Any]]
@@ -70,11 +71,16 @@ def build_cryptoquant_params(*, from_timestamp: int, to_timestamp: int, limit: i
     return {"exchange": "all_exchange", "window": window, "from": _compact_utc(start), "to": _compact_utc(end), "limit": _positive_int(limit, "limit"), "format": "json"}
 
 
-def build_glassnode_params(*, from_timestamp: int, to_timestamp: int) -> dict[str, Any]:
+def build_glassnode_params(*, from_timestamp: int, to_timestamp: int, currency: str | None = None) -> dict[str, Any]:
     start, end = _timestamp(from_timestamp, "from_timestamp"), _timestamp(to_timestamp, "to_timestamp")
     if start > end:
         raise ValueError("from_timestamp must not exceed to_timestamp")
-    return {"a": "BTC", "i": "1h", "s": start, "u": end}
+    params: dict[str, Any] = {"a": "BTC", "i": "1h", "s": start, "u": end}
+    if currency is not None:
+        if currency not in {"USD", "NATIVE"}:
+            raise ValueError("unsupported Glassnode currency")
+        params["c"] = currency
+    return params
 
 
 def _resolve_existing(existing_state: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
@@ -162,10 +168,11 @@ def build_open_interest_and_funding_fetch_plan(*, mode: str, reference_timestamp
             spec = ENDPOINTS[key]
             plan.append(_request(spec, metric_id=key, timeframe="hour", start=start, end=reference,
                                  params=build_cryptoquant_params(from_timestamp=start, to_timestamp=reference, limit=BOOTSTRAP_LIMIT), suffix="hour"))
-        for key in ("glassnode_futures_open_interest_sum", "glassnode_futures_funding_rate_perpetual"):
+        for key in ("glassnode_futures_open_interest_sum", "glassnode_futures_funding_rate_perpetual", "glassnode_futures_estimated_leverage_ratio"):
             spec = ENDPOINTS[key]
+            currency = "USD" if key == "glassnode_futures_open_interest_sum" else None
             plan.append(_request(spec, metric_id=key, timeframe="1h", start=start, end=reference,
-                                 params=build_glassnode_params(from_timestamp=start, to_timestamp=reference), suffix="1h"))
+                                 params=build_glassnode_params(from_timestamp=start, to_timestamp=reference, currency=currency), suffix="1h"))
     return plan
 
 

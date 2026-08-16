@@ -10,7 +10,7 @@ def test_bootstrap_runs_four_real_layers_without_mutation():
     output = run_vertical(fetcher=fetcher)
     assert list(output) == ["input", "processing", "classification", "screen"]
     assert [output[key]["stage"] for key in ("input", "processing", "classification", "screen")] == [
-        "input", "processing", "classification", "contract"]
+        "input", "processing", "classification", "screen_contract_final"]
     assert len(output["screen"]["kpis"]) == 7
     assert [item["id"] for item in output["screen"]["side_panel"]["items"]] == SIDE_IDS
 

@@ -29,7 +29,7 @@ ATR_MODERATE_PERCENT        = 1.50
 ATR_HIGH_PERCENT            = 3.00
 
 TIMEFRAME_ORDER = ("1m", "5m", "15m", "1h", "4h", "1d")
-MARKET_ORDER    = ("general", "spot", "futures")
+MARKET_ORDER    = ("spot", "futures", "general")
 
 PRICE_RETURN_VOLATILITY_THRESHOLDS = {
     "1m": {"low": 0.0010, "high": 0.0030}, "5m": {"low": 0.0020, "high": 0.0060},
@@ -600,19 +600,18 @@ def _direction(label: str | None) -> int:
     return 0
 
 def classify_market_agreement(biases: Mapping[str, Any]) -> dict[str, Any]:
-    directions = {market: _direction(biases.get(market, {}).get("overall", {}).get("label")) for market in MARKET_ORDER}
-    general, spot, futures = directions["general"], directions["spot"], directions["futures"]
-    if general != 0 and general == spot == futures:
+    """Classify direct Spot/Futures agreement without constructing a third market."""
+    directions = {market: _direction(biases.get(market, {}).get("overall", {}).get("label")) for market in ("spot", "futures")}
+    spot, futures = directions["spot"], directions["futures"]
+    if spot == futures and spot != 0:
         state = "confirmed"
-    elif general != 0 and general == spot and futures not in {0, general}:
-        state = "spot_confirmed_futures_divergent"
-    elif general != 0 and general == futures and spot not in {0, general}:
-        state = "futures_confirmed_spot_divergent"
     elif spot != 0 and futures != 0 and spot == -futures:
         state = "divergent"
+    elif spot == futures == 0:
+        state = "neutral"
     else:
         state = "mixed"
-    return {"state": state, "directions": directions}
+    return {"state": state, "directions": directions, "basis": "spot_futures_bias_direction"}
 
 def classify_market_leadership(biases: Mapping[str, Any]) -> dict[str, Any]:
     spot       = _finite(biases.get("spot", {}).get("overall", {}).get("score"))
@@ -656,6 +655,8 @@ def classify_technical_crosses(crosses: Mapping[str, Any]) -> dict[str, Any]:
                                                    "calculation": {"first_series": event.get("first_series"), "second_series": event.get("second_series"),
                                                                    "previous_difference": _finite(event.get("previous_difference")),
                                                                    "current_difference": _finite(event.get("current_difference")),
+                                                                   "first_value": _finite(event.get("first_value")),
+                                                                   "second_value": _finite(event.get("second_value")),
                                                                    "raw_direction": raw_direction}})
     return output
 

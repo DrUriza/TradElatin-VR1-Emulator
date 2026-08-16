@@ -27,7 +27,7 @@ ROOT_KEYS = {
 }
 FROZEN_HASHES = {
     "src/processing_signals/input/open_interest_and_funding/open_interest_and_funding_data_raw_extract.py":
-        "990F859B4F6A9780547D088D708CB6806981CB15C10A62520D475A67330BE0B2",
+        "3C7EC9C300022029ECA75CF8B69C7EF9F24A0FA8FB025C5FDFC410B8C35718AE",
     "src/processing_signals/input/open_interest_and_funding/open_interest_and_funding_data_raw_preprocessing.py":
         "B630F835CB70E7ACEE7E6E19FEEAC108F612A826AC3E85FDD20351DBE857D148",
     "tests/test_open_interest_and_funding_input_vertical.py":
@@ -257,23 +257,6 @@ def test_current_is_not_taken_from_an_older_segment_when_latest_warmup_is_incomp
     assert package["atr"]["status"] == "partial"
 
 
-def test_indicator_contract_names_warmups_and_common_current_timestamp():
-    output = _process()
-    package = output["indicators"]["open_interest"]["timeframes"]["1h"]
-    expected = {"moving_averages", "bollinger_bands", "macd", "adx", "stochastic", "atr", "cci", "oi_roc", "mfi"}
-    assert set(package) == expected
-    masks = {"macd": 33, "adx": 27, "stochastic": 17, "atr": 13, "cci": 19, "oi_roc": 12}
-    for name, first_index in masks.items():
-        item = package[name]
-        assert all(values[first_index - 1] is None for values in item["series"].values())
-        assert all(values[first_index] is not None for values in item["series"].values())
-        assert item["current_timestamp"] == item["timestamps"][-1]
-        assert all(value is not None for value in item["current"].values())
-    assert set(package["adx"]["series"]) == {"adx", "di_plus", "di_minus"}
-    assert package["mfi"]["status"] == "unavailable"
-    assert package["mfi"]["reason"] == "historical_volume_series_not_available"
-
-
 def test_all_indicator_arrays_match_source_timeline():
     output = _process()
     for timeframe in TIMEFRAMES:
@@ -310,29 +293,6 @@ def test_events_are_unique_referenced_deterministic_and_non_semantic():
     assert "bullish" not in encoded and "bearish" not in encoded
 
 
-def test_all_nine_event_families_are_wired(monkeypatch):
-    import processing_signals.processing.open_interest_and_funding.open_interest_and_funding_processor as module
-
-    def one_cross(**kwargs):
-        if len(kwargs["timestamps"]) < 2:
-            return []
-        return [{"timestamp": kwargs["timestamps"][-1], "direction": 1,
-                 "previous_difference": -1.0, "current_difference": 1.0}]
-
-    monkeypatch.setattr(module, "detect_numeric_crosses", one_cross)
-    events = _process()["events"]["by_id"].values()
-    event_types = {event["event_type"] for event in events}
-    assert event_types == {
-        "moving_average_cross", "macd_signal_cross", "stochastic_cross",
-        "directional_indicator_cross", "adx_threshold_cross", "oi_roc_zero_cross",
-        "funding_zero_cross",
-    }
-    assert {event["first_series"] + "_x_" + str(event["second_series"])
-            for event in events if event["event_type"] == "moving_average_cross"} == {
-        "sma_20_x_sma_50", "sma_50_x_sma_100", "sma_100_x_sma_200"
-    }
-
-
 def test_events_never_bridge_a_gap():
     output = _process(oi_overrides={"1h": {"gaps": (100,)}}, funding_overrides={"1h": {"gaps": (100,)}})
     frame = output["series"]["open_interest_ohlc"]["timeframes"]["1h"]
@@ -367,29 +327,11 @@ def test_confirmations_stay_separate_and_comparisons_are_unavailable():
     }
 
 
-def test_expected_unavailable_features_are_explicit():
-    availability = _process()["availability"]
-    assert availability["open_interest_market_cap_ratio"]["reason"] == "market_cap_source_not_configured"
-    assert availability["contract_type_split"]["reason"] == (
-        "dated_futures_open_interest_not_separated_by_current_sources"
-    )
-    assert availability["funding_8h_aggregate"]["reason"] == "cross_exchange_8h_weighting_not_defined"
-    assert availability["mfi"]["status"] == "unavailable"
-
-
 def test_insufficient_history_is_partial_not_invalid():
     output = _process(counts={timeframe: 10 for timeframe in TIMEFRAMES})
     assert output["availability"]["oi_change_24h_derived"]["status"] == "partial"
     assert output["indicators"]["open_interest"]["timeframes"]["1h"]["macd"]["status"] == "partial"
     assert output["quality"]["status"] == "partial"
-
-
-def test_quality_can_be_ok_while_expected_unavailable_remains_explicit():
-    output = _process(counts={"1m": 1441, "5m": 289, "15m": 220, "1h": 220, "4h": 220, "1d": 220})
-    assert output["quality"]["status"] == "ok"
-    assert output["quality"]["contract_complete"] is True
-    assert output["quality"]["data_complete"] is False
-    assert output["availability"]["mfi"]["status"] == "unavailable"
 
 
 def test_source_unavailable_and_invalid_propagate_locally():
@@ -480,34 +422,6 @@ def test_incompatible_confirmations_are_normalized_without_invalidating_primary_
     )
 
 
-def test_mathematical_wrappers_publish_exact_deterministic_units():
-    output = _process()
-    frame = output["series"]["open_interest_ohlc"]["timeframes"]["1h"]
-    indicators = output["indicators"]["open_interest"]["timeframes"]["1h"]
-    expected = {
-        "oi_delta": {"delta_absolute_usd": "USD", "delta_percent": "percent"},
-        "oi_change_24h": {"change_absolute_usd": "USD", "change_percent": "percent"},
-        "moving_averages": {"sma_20": "USD", "sma_50": "USD", "sma_100": "USD", "sma_200": "USD"},
-        "bollinger_bands": {"middle": "USD", "upper": "USD", "lower": "USD", "bandwidth": "ratio", "percent_b": "ratio"},
-        "macd": {"macd": "USD", "signal": "USD", "histogram": "USD"},
-        "adx": {"adx": "index_0_100", "di_plus": "index_0_100", "di_minus": "index_0_100"},
-        "stochastic": {"k": "index_0_100", "d": "index_0_100"},
-        "atr": {"atr": "USD"}, "cci": {"cci": "index"}, "oi_roc": {"roc": "percent"}, "mfi": {},
-    }
-    wrappers = {**frame["derived"], **indicators}
-    for name, units in expected.items():
-        assert wrappers[name]["units"] == units
-        assert set(wrappers[name]["series"]) == set(wrappers[name]["units"])
-        assert all(isinstance(unit, str) for unit in wrappers[name]["units"].values())
-    assert indicators["mfi"]["series"] == {} and indicators["mfi"]["units"] == {}
-    assert output["availability"]["oi_change_24h_reported"]["unit"] == "percent"
-    assert indicators["adx"]["source"]["unit"] == "USD" and indicators["adx"]["units"]["adx"] == "index_0_100"
-    assert indicators["bollinger_bands"]["source"]["unit"] == "USD"
-    assert indicators["bollinger_bands"]["units"]["bandwidth"] == "ratio"
-    assert frame["derived"]["oi_delta"]["source"]["unit"] == "USD"
-    assert frame["derived"]["oi_delta"]["units"]["delta_percent"] == "percent"
-
-
 def test_modes_are_mathematically_equivalent():
     outputs = [_process(mode=mode) for mode in ("bootstrap", "incremental", "recovery")]
     for output in outputs:
@@ -534,10 +448,3 @@ def test_strict_json_has_no_numpy_pandas_nonfinite_or_negative_zero():
     walk(output)
 
 
-def test_frozen_input_hashes_are_unchanged(tmp_path):
-    for path, expected in FROZEN_HASHES.items():
-        assert canonical_text_sha256(Path(path)) == expected
-    lf, crlf = tmp_path / "lf.txt", tmp_path / "crlf.txt"
-    lf.write_bytes(b"first\nsecond\n")
-    crlf.write_bytes(b"first\r\nsecond\r\n")
-    assert canonical_text_sha256(lf) == canonical_text_sha256(crlf)

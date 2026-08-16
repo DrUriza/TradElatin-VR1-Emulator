@@ -139,6 +139,97 @@ def _copy_base_series(source: Mapping[str, Any], *, metric_id: str, unit: str, t
     return apply_source_series_context(payload, source, str(source["metric_id"]))
 
 
+
+
+def _daily_close_source(source: Mapping[str, Any], *, metric_id: str) -> dict[str, Any]:
+    """Collapse intraday provider observations to one canonical UTC close per day."""
+    if source.get("status") in {"invalid", "unavailable"}:
+        return dict(source)
+    records = source.get("records", [])
+    by_day: dict[int, Mapping[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, Mapping) or not isinstance(record.get("timestamp"), int):
+            continue
+        day = int(record["timestamp"]) - int(record["timestamp"]) % SECONDS_PER_DAY
+        previous = by_day.get(day)
+        if previous is None or int(record["timestamp"]) >= int(previous["timestamp"]):
+            by_day[day] = record
+    daily = []
+    for day in sorted(by_day):
+        record = dict(by_day[day])
+        record["timestamp"] = day
+        record["source_timestamp"] = int(by_day[day]["timestamp"])
+        record["source_resolution"] = "1h" if len(records) > len(by_day) else record.get("source_window", "24h")
+        daily.append(record)
+    output = dict(source)
+    output["records"] = daily
+    output["metadata"] = {**dict(source.get("metadata", {})), "daily_close_normalization": True,
+                          "source_records_before_daily_close": len(records), "daily_records": len(daily)}
+    return output
+
+
+def build_daily_ohlc_from_intraday(records: Sequence[Mapping[str, Any]], *, unit: str,
+                                   value_transform: Callable[[float], float] | None = None) -> list[dict[str, Any]]:
+    """Construct legitimate UTC daily OHLC from multiple real provider observations."""
+    buckets: dict[int, list[tuple[int, float]]] = {}
+    for record in records:
+        try:
+            timestamp = int(record["timestamp"])
+            value = _finite(record["value"])
+            if value_transform is not None:
+                value = _finite(value_transform(value))
+        except (KeyError, TypeError, ValueError):
+            continue
+        day = timestamp - timestamp % SECONDS_PER_DAY
+        buckets.setdefault(day, []).append((timestamp, value))
+    candles: list[dict[str, Any]] = []
+    for day in sorted(buckets):
+        observations = sorted(buckets[day])
+        values = [value for _, value in observations]
+        candles.append({"timestamp": day, "open": values[0], "high": max(values), "low": min(values), "close": values[-1],
+                        "is_closed": True, "observation_count": len(observations), "unit": unit,
+                        "ohlc_origin": "processing_derived", "source_resolution": "1h"})
+    return candles
+
+
+def build_sopr_7d_intraday_candles(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Build 7-day rolling SOPR at provider resolution, then aggregate those values to daily OHLC."""
+    ordered = sorted((int(r["timestamp"]), _finite(r.get("sopr", r.get("value")))) for r in records
+                     if isinstance(r, Mapping) and isinstance(r.get("timestamp"), int))
+    if not ordered:
+        return []
+    window_seconds = 7 * SECONDS_PER_DAY
+    smoothed: list[dict[str, Any]] = []
+    left = 0
+    running: list[tuple[int, float]] = []
+    for timestamp, value in ordered:
+        running.append((timestamp, value))
+        while left < len(running) and running[left][0] < timestamp - window_seconds + 3600:
+            left += 1
+        window = running[left:]
+        if window and timestamp - window[0][0] >= window_seconds - 3600:
+            smoothed.append({"timestamp": timestamp, "value": sum(v for _, v in window) / len(window)})
+    return build_daily_ohlc_from_intraday(smoothed, unit="ratio")
+
+
+def _copy_direct_value_series(source: Mapping[str, Any], *, metric_id: str, unit: str, source_metric_id: str) -> dict[str, Any]:
+    if source.get("status") in {"invalid", "unavailable"}:
+        return apply_source_series_context(_blocked_source_series(metric_id=metric_id, unit=unit, source_metric_id=source_metric_id,
+                                                                   source_status=str(source.get("status"))), source, source_metric_id)
+    records = []
+    errors = []
+    for index, record in enumerate(source.get("records", [])):
+        try:
+            records.append({"timestamp": int(record["timestamp"]), "value": _finite(record["value"]), "unit": unit,
+                            "provider": str(record.get("provider", "glassnode")), "source_metric_id": source_metric_id,
+                            "endpoint_id": record.get("endpoint_id")})
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"record[{index}]: {exc}")
+    payload = _series_payload(metric_id=metric_id, unit=unit, source_count=len(source.get("records", [])), records=records,
+                              unavailable=[], errors=errors, force_invalid=bool(errors), source_status=str(source.get("status", "available")))
+    return apply_source_series_context(payload, source, source_metric_id)
+
+
 def _reserve_record(record: Mapping[str, Any]) -> dict[str, Any]:
     return {"timestamp": int(record["timestamp"]), "value": _finite(record["value"]), "unit": "BTC", "source_metric_id": "miner_reserve",
             "provider": str(record.get("provider", "glassnode"))}
@@ -148,7 +239,7 @@ def _sopr_record(record: Mapping[str, Any]) -> dict[str, Any]:
     value = _finite(record.get("sopr", record.get("value")))
     return {"timestamp": int(record["timestamp"]), "value": value, "sopr": value,
             **{field: None if record.get(field) is None else _finite(record[field]) for field in ("a_sopr", "sth_sopr", "lth_sopr")},
-            "unit": "ratio", "source_metric_id": "sopr", "provider": str(record.get("provider", "cryptoquant"))}
+            "unit": "ratio", "source_metric_id": "sopr", "provider": str(record.get("provider", "glassnode"))}
 
 
 def _mpi_record(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -383,6 +474,11 @@ def build_miners_unspent_supply_series(source: Mapping[str, Any]) -> dict[str, A
             payload["status"] = "invalid"
             payload["current"] = {"status": "unavailable", "value": None, "reason": "input_current_not_in_valid_records"}
             payload["errors"] = _stable_unique([*payload["errors"], "input_current_not_in_valid_records"])
+    elif source_current is None:
+        # The normalized Input may omit the duplicated current envelope. Keep the
+        # deterministic latest snapshot already derived from validated records.
+        if not payload["records"]:
+            payload["current"] = {"status": "unavailable", "value": None, "reason": "no_valid_records"}
     else:
         payload["current"] = {"status": "unavailable", "value": None, "reason": "input_current_unavailable"}
         if payload["status"] == "available":
@@ -412,6 +508,9 @@ def build_nupl_series(source: Mapping[str, Any]) -> dict[str, Any]:
             payload["status"] = "invalid"
             payload["current"] = {"status": "unavailable", "value": None, "reason": "invalid_input_current"}
             payload["errors"] = _stable_unique([*payload["errors"], "invalid_nupl_input_current"])
+    elif source_current is None:
+        if not payload["records"]:
+            payload["current"] = {"status": "unavailable", "value": None, "reason": "no_valid_records"}
     else:
         payload["current"] = {"status": "unavailable", "value": None, "reason": "input_current_unavailable"}
         if payload["status"] == "available":
@@ -563,6 +662,28 @@ def build_miner_outflow_total_series(distribution: Mapping[str, Any]) -> dict[st
     return payload
 
 
+
+
+def build_miner_pressure_basis(outflow_series: Mapping[str, Any], sopr_7d: Mapping[str, Any], window: int = 90) -> dict[str, Any]:
+    records = [r for r in outflow_series.get("records", []) if isinstance(r, Mapping)]
+    current_sopr = sopr_7d.get("current", {}) if isinstance(sopr_7d, Mapping) else {}
+    if not records:
+        return {"source_metric_id": "miner_outflow_total_btc", "status": "unavailable",
+                "current": {"status": "unavailable", "value": None, "reason": "miner_outflow_unavailable"},
+                "components": {"reserve_outflow_z_90d": None, "sopr_7d": current_sopr.get("value")}}
+    values = [_finite(r["value"]) for r in records[-window:]]
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values) if values else 0.0
+    std = math.sqrt(variance)
+    z = 0.0 if std == 0 else (values[-1] - mean) / std
+    timestamp = int(records[-1]["timestamp"])
+    return {"source_metric_id": "miner_outflow_total_btc", "status": outflow_series.get("status", "available"),
+            "current": {"status": "available", "timestamp": timestamp, "value": z, "unit": "z_score",
+                        "components": {"reserve_outflow_z_90d": z, "sopr_7d": current_sopr.get("value")}},
+            "components": {"reserve_outflow_z_90d": z, "sopr_7d": current_sopr.get("value")},
+            "window_days": min(window, len(values)), "calculation": "miner_outflow_zscore_with_sopr_context"}
+
+
 def build_reserve_age_context(miners_series: Mapping[str, Any], utxo_source: Mapping[str, Any]) -> dict[str, Any]:
     warnings = [f"input_series_warning:utxo_age_distribution:{message}" for message in utxo_source.get("warnings", [])]
     errors = [f"input_series_error:utxo_age_distribution:{message}" for message in utxo_source.get("errors", [])]
@@ -610,6 +731,13 @@ def build_reserve_age_context(miners_series: Mapping[str, Any], utxo_source: Map
             network_status = "invalid"
             network_current = {"status": "unavailable", "reason": "utxo_input_current_not_in_valid_records"}
             errors.append("utxo_input_current_not_in_valid_records")
+    elif input_current is None:
+        if records:
+            network_current = {"status": "available", **records[-1]}
+        else:
+            network_current = {"status": "unavailable", "reason": "no_valid_records"}
+            if network_status == "available":
+                network_status = "unavailable"
     else:
         network_current = {"status": "unavailable", "reason": "input_current_unavailable"}
         if network_status == "available":
@@ -764,22 +892,27 @@ def build_miner_revenue_breakdown(total_source: Mapping[str, Any], block_source:
 
 def build_on_chain_miners_features(input_series: Mapping[str, Any], input_collections: Mapping[str, Any] | None = None,
                                    *, input_data_as_of: int | None = None, include_screen_extensions: bool = True) -> dict[str, Any]:
-    reserve = _copy_base_series(input_series["miner_reserve"], metric_id="miner_reserve_btc", unit="BTC", transform=_reserve_record)
-    sopr    = _copy_base_series(input_series["sopr"], metric_id="sopr", unit="ratio", transform=_sopr_record)
+    # Core provider series are collected at 1h from Glassnode for legitimate daily OHLC.
+    # Classification features continue to use one canonical UTC close per day.
+    reserve_source = _daily_close_source(input_series["miner_reserve"], metric_id="miner_reserve")
+    sopr_source = _daily_close_source(input_series["sopr"], metric_id="sopr")
+    hashrate_source = _daily_close_source(input_series["hashrate"], metric_id="hashrate")
+    difficulty_source = _daily_close_source(input_series["difficulty"], metric_id="difficulty")
+    reserve = _copy_base_series(reserve_source, metric_id="miner_reserve_btc", unit="BTC", transform=_reserve_record)
+    sopr    = _copy_base_series(sopr_source, metric_id="sopr", unit="ratio", transform=_sopr_record)
     mpi     = _copy_base_series(input_series["mpi"], metric_id="mpi", unit="z_score", transform=_mpi_record)
-    def derived(source_id: str, metric_id: str, unit: str, builder: Callable[[Sequence[Mapping[str, Any]]], dict[str, Any]]) -> dict[str, Any]:
-        source = input_series[source_id]
+    def derived_from(source: Mapping[str, Any], source_id: str, metric_id: str, unit: str, builder: Callable[[Sequence[Mapping[str, Any]]], dict[str, Any]]) -> dict[str, Any]:
         if source["status"] in {"invalid", "unavailable"}:
             payload = _blocked_source_series(metric_id=metric_id, unit=unit, source_metric_id=source_id, source_status=str(source["status"]))
         else:
             payload = builder(source["records"])
         return apply_source_series_context(payload, source, source_id)
 
-    sopr_7d    = derived("sopr", "sopr_7d", "ratio", build_sopr_7d_series)
-    hashrate   = derived("hashrate", "hashrate_eh_s", "EH/s", build_hashrate_eh_s_series)
-    difficulty = derived("difficulty", "difficulty_t", "T", build_difficulty_trillion_series)
-    net_position = derived("miner_reserve", "miner_net_position_change", "BTC/day", build_miner_net_position_change_series)
-    reserve_source = input_series["miner_reserve"]
+    sopr_7d    = derived_from(sopr_source, "sopr", "sopr_7d", "ratio", build_sopr_7d_series)
+    hashrate   = derived_from(hashrate_source, "hashrate", "hashrate_eh_s", "EH/s", build_hashrate_eh_s_series)
+    difficulty = derived_from(difficulty_source, "difficulty", "difficulty_t", "T", build_difficulty_trillion_series)
+    net_position = _copy_direct_value_series(input_series["miner_net_position_change"], metric_id="miner_net_position_change",
+                                             unit="BTC/day", source_metric_id="miner_net_position_change")
     if reserve_source["status"] == "invalid":
         reserve_trend = {"feature_id": "reserve_trend", "status": "invalid", "default_window_days": DEFAULT_RESERVE_TREND_DAYS, "windows": {},
                          "warnings": [], "errors": ["source_series_invalid:miner_reserve"]}
@@ -795,8 +928,18 @@ def build_on_chain_miners_features(input_series: Mapping[str, Any], input_collec
                                                      *(f"input_series_warning:miner_reserve:{message}" for message in reserve_source.get("warnings", []))])
         reserve_trend["errors"] = _stable_unique([*reserve_trend["errors"],
                                                    *(f"input_series_error:miner_reserve:{message}" for message in reserve_source.get("errors", []))])
+    daily_candles = {
+        "miner_reserve": build_daily_ohlc_from_intraday(input_series["miner_reserve"].get("records", []), unit="BTC"),
+        "sopr_7d": build_sopr_7d_intraday_candles(input_series["sopr"].get("records", [])),
+        "hashrate": build_daily_ohlc_from_intraday(input_series["hashrate"].get("records", []), unit="EH/s", value_transform=lambda v: v / HASHES_PER_EXAHASH),
+        "difficulty": build_daily_ohlc_from_intraday(input_series["difficulty"].get("records", []), unit="T", value_transform=lambda v: v / DIFFICULTY_PER_TRILLION),
+    }
     series = {"miner_reserve_btc": reserve, "sopr": sopr, "sopr_7d": sopr_7d, "hashrate_eh_s": hashrate,
               "difficulty_t": difficulty, "miner_net_position_change": net_position, "mpi": mpi}
+    for chart_id, series_id in (("miner_reserve", "miner_reserve_btc"), ("sopr_7d", "sopr_7d"), ("hashrate", "hashrate_eh_s"), ("difficulty", "difficulty_t")):
+        series[series_id]["daily_candles"] = daily_candles[chart_id]
+        series[series_id]["metadata"] = {**dict(series[series_id].get("metadata", {})), "daily_ohlc_source": "glassnode_intraday_1h",
+                                           "daily_ohlc_candles": len(daily_candles[chart_id]), "ohlc_origin": "processing_derived"}
     features = {"reserve_trend": reserve_trend,
                          "miner_pressure_basis": ({"source_metric_id": "mpi", "status": mpi["status"], "current": mpi["current"], "previous": None,
                                                    "change_1d": None, "unit": "z_score"} if mpi["status"] in {"invalid", "unavailable"} else _mpi_basis(mpi)),
@@ -814,7 +957,11 @@ def build_on_chain_miners_features(input_series: Mapping[str, Any], input_collec
         revenue = build_miner_revenue_breakdown(input_series["miner_revenue_total_usd"], input_series["miner_block_reward_revenue_usd"],
                                                 input_series["miner_revenue_from_fees"], input_data_as_of=input_data_as_of)
         nupl = build_nupl_series(input_series["nupl"])
-        series.update({"miners_unspent_supply_btc": miners_unspent, "nupl": nupl, "miner_outflow_total_btc": build_miner_outflow_total_series(outflow),
+        direct_outflow = _copy_direct_value_series(input_series["miner_outflow_total"], metric_id="miner_outflow_total_btc",
+                                                  unit="BTC/day", source_metric_id="miner_outflow_total")
+        features["miner_pressure_basis"] = build_miner_pressure_basis(direct_outflow, sopr_7d)
+        features["mpi_context"] = _mpi_basis(mpi) if mpi.get("status") not in {"invalid", "unavailable"} else {"status": mpi.get("status"), "current": mpi.get("current")}
+        series.update({"miners_unspent_supply_btc": miners_unspent, "nupl": nupl, "miner_outflow_total_btc": direct_outflow,
                        "miner_revenue_total_usd": total_revenue, "miner_block_reward_revenue_usd": block_revenue,
                        "miner_fee_revenue_usd": _derived_revenue_series("miner_fee_revenue_usd", "USD/day", revenue, "fee_revenue_usd"),
                        "miner_fee_share_ratio": _derived_revenue_series("miner_fee_share_ratio", "ratio", revenue, "derived_fee_share_ratio")})

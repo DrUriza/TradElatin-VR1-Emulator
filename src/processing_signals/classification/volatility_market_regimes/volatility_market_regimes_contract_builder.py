@@ -1,40 +1,43 @@
+"""Pure screen-contract builder for the realized-volatility market-regime family.
+
+The builder is intentionally presentation-only: it copies Processing numerics and
+Classification semantics, applies visual windowing, formats display fields, and
+never recalculates indicators or market states.
+"""
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from datetime import datetime
 import json
 import math
-from collections.abc import Mapping, Sequence
-from copy            import deepcopy
-from datetime        import datetime
-from numbers         import Integral, Real
-from typing          import Any
+from numbers import Real
+from typing import Any
+
+from .volatility_market_regimes_sp_v1_2_adapter import (
+    SP_SCHEMA_VERSION, align_volatility_market_regimes_to_sp_v1_2,
+)
+
+FAMILY = "volatility_market_regimes"
+PROCESSING_VERSION = "0.2.0"
+CLASSIFICATION_VERSION = "0.2.0"
+SCREEN_SCHEMA_VERSION = SP_SCHEMA_VERSION
+DISPLAY_RANGE_OPTIONS = ("7d", "30d", "90d", "360d")
+DEFAULT_DISPLAY_RANGE = "30d"
+_RANGE_SECONDS = {"7d": 604_800, "30d": 2_592_000, "90d": 7_776_000, "360d": 31_104_000}
+_VALID_MODES = {"bootstrap", "incremental", "recovery"}
+_VALID_STATUS = {"available", "partial", "unavailable", "invalid"}
+_REGIME_LABELS = {"low_vol": "Low Vol", "normal": "Normal", "high_vol": "High Vol"}
 
 
-DISPLAY_RANGE_OPTIONS      = ("1h", "4h", "1d", "7d", "30d")
-DEFAULT_DISPLAY_RANGE      = "7d"
-MAX_HOURLY_DISPLAY_SECONDS = 30 * 86400
-MAX_DAILY_DISPLAY_DAYS     = 30
-_MODES                     = {"bootstrap", "incremental", "recovery"}
-_AVAILABILITY              = {"available", "partial", "unavailable", "invalid"}
-_RANGE_SECONDS             = {"1h": 3600, "4h": 14400, "1d": 86400, "7d": 604800, "30d": 2592000}
-_REGIME_LABELS             = {"low_vol": "Low Vol", "normal": "Normal", "high_vol": "High Vol"}
-_REGIME_COLORS             = {"low_vol": "regime_low_vol", "normal": "regime_normal", "high_vol": "regime_high_vol"}
-_CONFIDENCE_COLORS         = {"high": "confidence_high", "medium": "confidence_medium", "low": "confidence_low"}
-_POSITIONING_COLORS        = {"short_bias": "positioning_short", "balanced": "positioning_balanced", "long_bias": "positioning_long"}
-_SPREAD_COLORS             = {"realized_below_implied": "spread_negative", "balanced": "spread_balanced", "realized_above_implied": "spread_positive"}
-
-
-def _strict_number(value: Any, path: str, nullable: bool = True) -> float | None:
-    if value is None and nullable:
-        return None
+def _finite(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{path}:finite_number_required")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{path}:finite_number_required")
-    return 0.0 if result == 0 else result
+        return None
+    number = float(value)
+    return 0.0 if number == 0 else number if math.isfinite(number) else None
 
 
-def _iso_timezone(value: Any, path: str) -> str:
+def _iso(value: Any, path: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{path}:timezone_iso8601_required")
     try:
@@ -46,341 +49,539 @@ def _iso_timezone(value: Any, path: str) -> str:
     return value
 
 
+def _json_copy(value: Any, path: str = "root") -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path}:finite_number_required")
+        return 0.0 if value == 0 else value
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError(f"{path}:string_keys_required")
+        return {key: _json_copy(item, f"{path}.{key}") for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_json_copy(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    raise ValueError(f"{path}:json_value_required")
+
+
 def validate_runtime_context(runtime_context: Any) -> None:
     if not isinstance(runtime_context, Mapping):
         raise ValueError("runtime_context:mapping_required")
     data_mode = runtime_context.get("data_mode")
-    is_demo   = runtime_context.get("is_demo")
+    is_demo = runtime_context.get("is_demo")
     if data_mode not in {"synthetic", "live"} or type(is_demo) is not bool:
         raise ValueError("runtime_context:data_mode_or_is_demo_invalid")
     if (data_mode == "synthetic") != is_demo:
         raise ValueError("runtime_context:data_mode_is_demo_mismatch")
-    _iso_timezone(runtime_context.get("generated_at"), "runtime_context.generated_at")
-    _iso_timezone(runtime_context.get("updated_at"), "runtime_context.updated_at")
+    _iso(runtime_context.get("generated_at"), "runtime_context.generated_at")
+    _iso(runtime_context.get("updated_at"), "runtime_context.updated_at")
 
 
-def validate_volatility_market_regimes_builder_inputs(processing: Any, classification: Any, runtime_context: Any, selected_range: str = DEFAULT_DISPLAY_RANGE) -> None:
-    for name, contract, stage in (("processing", processing, "processing"), ("classification", classification, "classification")):
-        if not isinstance(contract, Mapping):
-            raise ValueError(f"{name}:mapping_required")
-        if contract.get("family") != "volatility_market_regimes" or contract.get("stage") != stage or contract.get("version") != "0.1.0":
-            raise ValueError(f"{name}:identity_invalid")
-        if contract.get("mode") not in _MODES or not isinstance(contract.get("context"), Mapping):
-            raise ValueError(f"{name}:mode_or_context_invalid")
+def validate_volatility_market_regimes_builder_inputs(
+    processing: Any,
+    classification: Any,
+    runtime_context: Any,
+    selected_range: str = DEFAULT_DISPLAY_RANGE,
+) -> None:
     if selected_range not in DISPLAY_RANGE_OPTIONS:
         raise ValueError("selected_range:invalid")
     validate_runtime_context(runtime_context)
-    for field in ("mode",):
-        if processing.get(field) != classification.get(field):
-            raise ValueError(f"builder_contract_mismatch:{field}")
+    for name, contract, stage, version in (
+        ("processing", processing, "processing", PROCESSING_VERSION),
+        ("classification", classification, "classification", CLASSIFICATION_VERSION),
+    ):
+        if not isinstance(contract, Mapping):
+            raise ValueError(f"{name}:mapping_required")
+        if contract.get("family") != FAMILY or contract.get("stage") != stage or contract.get("version") != version:
+            raise ValueError(f"{name}:identity_invalid")
+        if contract.get("mode") not in _VALID_MODES or not isinstance(contract.get("context"), Mapping):
+            raise ValueError(f"{name}:mode_or_context_invalid")
+    if processing.get("mode") != classification.get("mode"):
+        raise ValueError("builder_contract_mismatch:mode")
     for field in ("reference_timestamp", "input_execution_timestamp", "asset", "symbol", "exchange", "base_interval"):
         if processing["context"].get(field) != classification["context"].get(field):
             raise ValueError(f"builder_contract_mismatch:{field}")
-    p_features = processing.get("features")
-    c_classes  = classification.get("classifications")
-    if not isinstance(p_features, Mapping) or not all(isinstance(p_features.get(name), Mapping) for name in ("positioning", "volatility_comparison", "spread_metrics", "daily_regime_basis")):
-        raise ValueError("processing:required_features_missing")
-    if not isinstance(c_classes, Mapping) or not all(isinstance(c_classes.get(name), Mapping) for name in ("daily_regimes", "positioning", "spread_context")):
-        raise ValueError("classification:required_classifications_missing")
-    summaries = classification.get("summaries")
-    if not isinstance(summaries, Mapping) or not isinstance(summaries.get("regime_distribution"), Mapping) or not isinstance(summaries.get("regime_statistics"), Sequence):
-        raise ValueError("classification:required_summaries_missing")
-    if not isinstance(classification.get("interpreted_events"), Mapping) or not isinstance(processing.get("quality"), Mapping) or not isinstance(classification.get("quality"), Mapping):
-        raise ValueError("builder:quality_or_events_missing")
-
-
-def _history_metadata(all_records: Sequence[Mapping[str, Any]], returned: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    return {
-        "records_available": len(all_records), "records_returned": len(returned), "history_truncated": len(returned) < len(all_records),
-        "first_available_timestamp": all_records[0]["timestamp"] if all_records else None,
-        "last_available_timestamp": all_records[-1]["timestamp"] if all_records else None,
-        "first_returned_timestamp": returned[0]["timestamp"] if returned else None,
-        "last_returned_timestamp": returned[-1]["timestamp"] if returned else None,
-    }
-
-
-def _hourly_tail(records: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    ordered = sorted((deepcopy(dict(record)) for record in records), key=lambda record: record["timestamp"])
-    if not ordered:
-        return ordered, []
-    start = ordered[-1]["timestamp"] - MAX_HOURLY_DISPLAY_SECONDS
-    return ordered, [record for record in ordered if record["timestamp"] >= start]
-
-
-def _daily_tail(records: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    ordered = sorted((deepcopy(dict(record)) for record in records), key=lambda record: record["timestamp"])
-    return ordered, ordered[-MAX_DAILY_DISPLAY_DAYS:]
-
-
-def build_volatility_market_regimes_screen_context(processing: Mapping[str, Any], classification: Mapping[str, Any], runtime_context: Mapping[str, Any], selected_range: str) -> dict[str, Any]:
-    context    = processing["context"]
-    candidates = [
-        processing["features"]["positioning"].get("last_available_timestamp"),
-        processing["features"]["volatility_comparison"].get("last_available_timestamp"),
-        (classification["classifications"]["daily_regimes"].get("current") or {}).get("timestamp"),
-    ]
-    data_as_of = max((value for value in candidates if isinstance(value, Integral) and not isinstance(value, bool)), default=None)
-    windows    = {name: {"start_timestamp": data_as_of - seconds if data_as_of is not None else None, "end_timestamp": data_as_of} for name, seconds in _RANGE_SECONDS.items()}
-    return {
-        "symbol": context.get("symbol"), "asset": context.get("asset"), "exchange": context.get("exchange"), "base_interval": context.get("base_interval"),
-        "default_display_range": DEFAULT_DISPLAY_RANGE, "selected_display_range": selected_range, "available_display_ranges": list(DISPLAY_RANGE_OPTIONS),
-        "data_mode": runtime_context["data_mode"], "is_demo": runtime_context["is_demo"], "generated_at": runtime_context["generated_at"], "updated_at": runtime_context["updated_at"],
-        "reference_timestamp": context.get("reference_timestamp"), "input_execution_timestamp": context.get("input_execution_timestamp"), "data_as_of": data_as_of,
-        "units": {"volatility": "percent", "spread": "volatility_points", "positioning_ratio": "ratio", "positioning_percent": "percent",
-                  "confidence": "decimal", "empirical_share": "decimal", "persistence": "days"},
-        "history_policy": {"calculation": "full_available_history", "presentation": "tail_window", "max_hourly_display_seconds": 2592000, "max_daily_display_days": 30},
-        "range_windows": windows,
-    }
-
-
-def build_volatility_market_regimes_badges(runtime_context: Mapping[str, Any]) -> list[dict[str, str]]:
-    return [{"badge_id": "demo", "text": "DEMO", "status": "active"}] if runtime_context["data_mode"] == "synthetic" else []
-
-
-def build_volatility_market_regimes_selectors(selected_range: str) -> dict[str, Any]:
-    return {"display_range": {"selector_id": "volatility_market_regimes_display_range", "selected": selected_range,
-                              "options": list(DISPLAY_RANGE_OPTIONS), "behavior": "timestamp_window_filter"}}
-
-
-def _empty_kpi(metric_id: str, label: str, unit: str, invalid: bool = False) -> dict[str, Any]:
-    return {"metric_id": metric_id, "label": label, "value": None, "display_value": "--", "unit": unit,
-            "status": "invalid" if invalid else "unavailable", "reason": "classification_invalid" if invalid else "metric_unavailable",
-            "color_token": "state_invalid" if invalid else "state_unavailable"}
-
-
-def build_current_regime_kpi(daily: Mapping[str, Any]) -> dict[str, Any]:
-    current = daily.get("current")
-    if not current:
-        return _empty_kpi("current_regime", "Current Regime", "state", daily.get("status") == "invalid")
-    regime = current.get("regime")
-    return {"metric_id": "current_regime", "label": "Current Regime", "value": regime, "display_value": _REGIME_LABELS.get(regime, "--"), "unit": "state",
-            "status": current.get("status", daily.get("status")), "reason": current.get("reason"), "color_token": _REGIME_COLORS.get(regime, "state_unavailable")}
-
-
-def build_confidence_kpi(daily: Mapping[str, Any]) -> dict[str, Any]:
-    current = daily.get("current")
-    if not current or current.get("confidence_score") is None:
-        return _empty_kpi("confidence", "Confidence", "decimal", daily.get("status") == "invalid")
-    score = _strict_number(current["confidence_score"], "confidence_score", False)
-    return {"metric_id": "confidence", "label": "Confidence", "value": score, "display_value": f"{score:.0%}", "unit": "decimal",
-            "status": current.get("status", daily.get("status")), "reason": current.get("reason"),
-            "color_token": _CONFIDENCE_COLORS.get(current.get("confidence_state"), "state_unavailable")}
-
-
-def build_spread_7d_kpi(spread: Mapping[str, Any]) -> dict[str, Any]:
-    value = _strict_number(spread.get("value"), "spread.value")
-    if value is None:
-        item = _empty_kpi("spread_7d", "Spread (7D)", "volatility_points", spread.get("status") == "invalid")
-        item["reason"] = spread.get("reason") or item["reason"]
-    else:
-        display = f"{value:+.1f} vol pts" if value > 0 else f"{value:.1f} vol pts"
-        item    = {"metric_id": "spread_7d", "label": "Spread (7D)", "value": value, "display_value": display, "unit": "volatility_points",
-                "status": spread.get("status"), "reason": spread.get("reason"), "color_token": _SPREAD_COLORS.get(spread.get("spread_state"), "state_unavailable")}
-    item["metadata"] = {field: deepcopy(spread.get(field)) for field in ("basis", "records_used", "coverage", "window_start_timestamp", "window_end_timestamp")}
-    return item
-
-
-def build_persistence_kpi(daily: Mapping[str, Any]) -> dict[str, Any]:
-    value = daily.get("current_persistence_days")
-    if value is None or not daily.get("current"):
-        return _empty_kpi("persistence", "Persistence", "days", daily.get("status") == "invalid")
-    return {"metric_id": "persistence", "label": "Persistence", "value": int(value), "display_value": f"{value} day" if value == 1 else f"{value} days", "unit": "days",
-            "status": daily["current"].get("status", daily.get("status")), "reason": daily["current"].get("reason"),
-            "color_token": _REGIME_COLORS.get(daily["current"].get("regime"), "state_unavailable")}
-
-
-def build_volatility_market_regimes_kpis(classification: Mapping[str, Any]) -> dict[str, Any]:
-    daily  = classification["classifications"]["daily_regimes"]
-    spread = classification["classifications"]["spread_context"]
-    return {"items": [build_current_regime_kpi(daily), build_confidence_kpi(daily), build_spread_7d_kpi(spread), build_persistence_kpi(daily)]}
-
-
-def build_positioning_ratio_chart(processing_feature: Mapping[str, Any], classification_feature: Mapping[str, Any]) -> dict[str, Any]:
-    all_records, returned = _hourly_tail(processing_feature.get("records", []))
-    semantic = {record["timestamp"]: record for record in classification_feature.get("records", []) if isinstance(record, Mapping)}
-    missing  = False
-    records  = []
-    for raw in returned:
-        classified = semantic.get(raw["timestamp"])
-        missing    |= classified is None
-        state       = classified.get("positioning_state") if classified else None
-        records.append({"timestamp": raw["timestamp"], "long_short_ratio": deepcopy(raw.get("long_short_ratio")), "long_percent": deepcopy(raw.get("long_percent")),
-                        "short_percent": deepcopy(raw.get("short_percent")), "net_long_percentage_points": deepcopy(raw.get("net_long_percentage_points")),
-                        "positioning_state": state, "crowding_state": classified.get("crowding_state") if classified else None,
-                        "color_token": _POSITIONING_COLORS.get(state)})
-    status   = processing_feature.get("status")
-    reason   = processing_feature.get("reason")
-    warnings = []
-    if missing and status == "available":
-        status, reason = "partial", "positioning_classification_missing"
-        warnings.append("positioning_classification_missing")
-    return {"chart_id": "long_short_positioning_ratio", "title": "Long / Short Positioning Ratio", "chart_type": "line", "status": status, "reason": reason,
-            "unit": "ratio", "reference_lines": [{"value": 1.0, "label": "Balanced"}], "source": deepcopy(processing_feature.get("source")),
-            "selector_behavior": "timestamp_window_filter", "records": records, "warnings": warnings, **_history_metadata(all_records, records)}
-
-
-def build_volatility_comparison_chart(feature: Mapping[str, Any]) -> dict[str, Any]:
-    all_records, returned = _hourly_tail(feature.get("records", []))
-    fields  = ("timestamp", "realized_volatility_percent", "implied_open_percent", "implied_high_percent", "implied_low_percent", "implied_close_percent", "spread_volatility_points", "pair_status")
-    records = [{field: deepcopy(record.get(field)) for field in fields} for record in returned]
-    return {"chart_id": "realized_implied_volatility", "title": "Realized vs Implied Volatility", "chart_type": "multi_line",
-            "status": feature.get("status"), "reason": feature.get("reason"),
-            "series": [{"series_id": "realized_volatility", "label": "Realized Vol", "unit": "percent", "source": {"provider": "glassnode", "endpoint_id": "realized_volatility"}},
-                       {"series_id": "implied_volatility", "label": "Implied Vol", "unit": "percent", "source": {"provider": "deribit", "endpoint_id": "volatility_index", "basis": "close"}}],
-            "selector_behavior": "timestamp_window_filter", "records": records, "current": deepcopy(feature.get("current")), **_history_metadata(all_records, records)}
-
-
-def build_visible_regime_events(interpreted_events: Mapping[str, Any], start_timestamp: int | None, end_timestamp: int | None) -> dict[str, Any]:
-    source_by_id = interpreted_events.get("by_id")
-    source_ids   = interpreted_events.get("regime_transition_ids")
-    if not isinstance(source_by_id, Mapping) or not isinstance(source_ids, Sequence) or isinstance(source_ids, (str, bytes)):
-        raise ValueError("events:structure_invalid")
-    if len(source_ids) != len(set(source_ids)):
-        raise ValueError("events:duplicate_event_id")
-    selected = []
-    by_id    = {}
-    previous = None
-    for event_id in source_ids:
-        event = source_by_id.get(event_id)
-        if not isinstance(event, Mapping) or event.get("event_id") != event_id:
-            raise ValueError("events:broken_reference")
-        timestamp = event.get("timestamp")
-        if previous is not None and timestamp < previous:
-            raise ValueError("events:not_chronological")
-        previous = timestamp
-        if start_timestamp is not None and end_timestamp is not None and start_timestamp <= timestamp <= end_timestamp:
-            selected.append(event_id)
-            by_id[event_id] = deepcopy(dict(event))
-    return {"by_id": by_id, "regime_transition_ids": selected}
-
-
-def build_regime_timeline_chart(feature: Mapping[str, Any], events: Mapping[str, Any]) -> dict[str, Any]:
-    all_records, returned = _daily_tail(feature.get("records", []))
-    by_timestamp = {}
-    for event_id in events["regime_transition_ids"]:
-        by_timestamp.setdefault(events["by_id"][event_id]["timestamp"], []).append(event_id)
-    records = []
-    for raw in returned:
-        regime = raw.get("regime")
-        records.append({"timestamp": raw["timestamp"], "data_as_of": deepcopy(raw.get("data_as_of")), "regime": regime,
-                        "regime_label": _REGIME_LABELS.get(regime, "--"), "confidence_score": deepcopy(raw.get("confidence_score")),
-                        "confidence_state": raw.get("confidence_state"), "persistence_days": raw.get("persistence_days"),
-                        "agreement_state": raw.get("agreement_state"), "status": raw.get("status"), "reason": raw.get("reason"),
-                        "color_token": _REGIME_COLORS.get(regime, "state_invalid" if raw.get("status") == "invalid" else "state_unavailable"),
-                        "event_ids": list(by_timestamp.get(raw["timestamp"], []))})
-    return {"chart_id": "regime_timeline", "title": "Regime Timeline", "chart_type": "regime_timeline", "status": feature.get("status"), "reason": feature.get("reason"),
-            "unit": "state", "selector_behavior": "timestamp_window_filter", "records": records, **_history_metadata(all_records, records)}
-
-
-def build_regime_distribution_chart(distribution: Mapping[str, Any]) -> dict[str, Any]:
-    order = ("low_vol", "normal", "high_vol")
-    items = []
-    for regime in order:
-        share = _strict_number(distribution.get("shares", {}).get(regime), f"distribution.{regime}.share")
-        items.append({"regime": regime, "label": _REGIME_LABELS[regime], "count": distribution.get("counts", {}).get(regime, 0), "share": share,
-                      "display_share": f"{share:.1%}" if share is not None else "--", "color_token": _REGIME_COLORS[regime]})
-    return {"chart_id": "regime_distribution", "title": "Regime Distribution", "chart_type": "donut", "status": distribution.get("status"), "reason": distribution.get("reason"),
-            "basis": distribution.get("basis"), "window": "full_history", "classified_days": distribution.get("classified_days", 0),
-            "selector_behavior": "fixed_full_history_summary", "items": items}
-
-
-def build_volatility_market_regimes_charts(processing: Mapping[str, Any], classification: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    daily_records = classification["classifications"]["daily_regimes"].get("records", [])
-    _, visible_daily = _daily_tail(daily_records)
-    start  = visible_daily[0]["timestamp"] if visible_daily else None
-    end    = visible_daily[-1]["timestamp"] if visible_daily else None
-    events = build_visible_regime_events(classification["interpreted_events"], start, end)
-    charts = {
-        "positioning_ratio": build_positioning_ratio_chart(processing["features"]["positioning"], classification["classifications"]["positioning"]),
-        "volatility_comparison": build_volatility_comparison_chart(processing["features"]["volatility_comparison"]),
-        "regime_timeline": build_regime_timeline_chart(classification["classifications"]["daily_regimes"], events),
-        "regime_distribution": build_regime_distribution_chart(classification["summaries"]["regime_distribution"]["full_history"]),
-    }
-    return charts, events
-
-
-def build_market_regime_table(statistics: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    indexed = {row.get("regime"): row for row in statistics}
-    rows    = []
-    for regime in ("low_vol", "normal", "high_vol"):
-        source = indexed.get(regime, {})
-        share  = _strict_number(source.get("empirical_share"), f"statistics.{regime}.share")
-        rows.append({"row_id": f"regime:{regime}", "regime": regime, "label": _REGIME_LABELS[regime], "color_token": _REGIME_COLORS[regime],
-                     "classified_days": source.get("classified_days", 0), "empirical_share": share, "display_share": f"{share:.1%}" if share is not None else "--",
-                     "episode_count": source.get("episode_count", 0), "average_episode_days": deepcopy(source.get("average_episode_days")),
-                     "maximum_episode_days": source.get("maximum_episode_days"), "current_episode_days": source.get("current_episode_days", 0), "is_current": bool(source.get("is_current"))})
-    status = "available" if all(indexed.get(regime) for regime in ("low_vol", "normal", "high_vol")) else "partial"
-    return {"table_id": "market_regime_table", "title": "Market Regime Table", "status": status, "reason": None if status == "available" else "regime_statistics_incomplete",
-            "share_basis": "empirical_classified_day_share", "columns": ["regime", "empirical_share", "classified_days", "episode_count", "average_episode_days", "maximum_episode_days", "current_episode_days"], "rows": rows}
-
-
-def _combine_status(*statuses: str) -> str:
-    for status in ("invalid", "unavailable", "partial", "available"):
-        if status in statuses:
-            return status
-    return "invalid"
-
-
-def build_source_status_widget(processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
-    availability = processing.get("source_availability", {})
-    mapping      = (("coinglass", "CoinGlass", "coinglass.top_position_ratio"), ("glassnode", "Glassnode", "glassnode.realized_volatility"), ("deribit", "Deribit", "deribit.volatility_index"))
-    items        = []
-    for provider_id, label, key in mapping:
-        source = availability.get(key, {})
-        status = source.get("status", "unavailable")
-        items.append({"provider_id": provider_id, "label": label, "status": status, "reason": source.get("reason") or ("source_unavailable" if status != "available" else None),
-                      "data_as_of": source.get("source_data_as_of")})
-    internal_status = _combine_status(processing["quality"].get("status") if processing["quality"].get("status") != "ok" else "available",
-                                      classification["quality"].get("status") if classification["quality"].get("status") != "ok" else "available")
-    items.append({"provider_id": "internal", "label": "Internal", "status": internal_status, "reason": None if internal_status == "available" else "internal_quality_degraded",
-                  "data_as_of": classification["classifications"]["daily_regimes"].get("source_data_as_of")})
-    status = _combine_status(*(item["status"] for item in items))
-    return {"widget_id": "source_status", "status": status, "reason": None if status == "available" else "one_or_more_sources_degraded", "items": items}
-
-
-def evaluate_volatility_market_regimes_screen_quality(screen_parts: Mapping[str, Any], errors: Sequence[str] = (), warnings: Sequence[str] = ()) -> dict[str, Any]:
-    availability = {}
-    for item in screen_parts["kpis"].get("items", []):
-        availability[f"kpis.{item['metric_id']}"] = item.get("status")
-    for name, chart in screen_parts["charts"].items():
-        availability[f"charts.{name}"] = chart.get("status")
-    availability["tables.market_regime_table"] = screen_parts["tables"]["market_regime_table"].get("status")
-    availability["widgets.source_status"]       = screen_parts["widgets"]["source_status"].get("status")
-    statuses          = list(availability.values())
-    contract_complete = not errors
-    data_complete     = contract_complete and all(status == "available" for status in statuses)
-    status            = "invalid" if errors or "invalid" in statuses else "ok" if data_complete else "partial"
-    return {"status": status, "contract_complete": contract_complete, "data_complete": data_complete, "availability": availability,
-            "missing_fields": [], "warnings": sorted(set(warnings)), "errors": list(errors)}
+    for key in ("positioning", "realized_volatility", "daily_regime_basis"):
+        if key not in processing.get("features", {}):
+            raise ValueError(f"processing.features.{key}:required")
+    for key in ("daily_regimes", "positioning"):
+        if key not in classification.get("classifications", {}):
+            raise ValueError(f"classification.classifications.{key}:required")
+    _json_copy(processing, "processing")
+    _json_copy(classification, "classification")
+    _json_copy(runtime_context, "runtime_context")
 
 
 def _invalid_screen(error: str) -> dict[str, Any]:
-    return {"family": "volatility_market_regimes", "screen": "volatility_market_regimes", "schema_version": "0.1.0", "context": {}, "badges": [],
-            "selectors": {}, "kpis": {"items": []}, "charts": {}, "tables": {}, "widgets": {}, "events": {"by_id": {}, "regime_transition_ids": []},
-            "quality": {"status": "invalid", "contract_complete": False, "data_complete": False, "availability": {}, "missing_fields": [], "warnings": [], "errors": [error]}}
+    return {
+        "family": FAMILY,
+        "screen": FAMILY,
+        "schema_version": SCREEN_SCHEMA_VERSION,
+        "context": {},
+        "badges": [],
+        "selectors": {},
+        "kpis": {"items": []},
+        "charts": {},
+        "tables": {},
+        "widgets": {},
+        "events": {"by_id": {}, "regime_transition_ids": []},
+        "technical_analysis": {},
+        "quality": {
+            "status": "invalid",
+            "contract_complete": False,
+            "data_complete": False,
+            "availability": {},
+            "missing_fields": [],
+            "warnings": [],
+            "errors": [error],
+        },
+    }
+
+
+def build_volatility_market_regimes_badges(runtime_context: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [{"badge_id": "demo", "text": "DEMO", "status": "active"}] if runtime_context.get("is_demo") else []
+
+
+def build_volatility_market_regimes_selectors(selected_range: str) -> dict[str, Any]:
+    return {
+        "display_range": {
+            "selector_id": "volatility_display_range",
+            "selected": selected_range,
+            "default": DEFAULT_DISPLAY_RANGE,
+            "options": list(DISPLAY_RANGE_OPTIONS),
+        }
+    }
+
+
+def _window(anchor: int, selected_range: str) -> tuple[int, int]:
+    return anchor - _RANGE_SECONDS[selected_range], anchor
+
+
+def _filter_records(records: Sequence[Mapping[str, Any]], start: int, end: int) -> list[dict[str, Any]]:
+    output = []
+    for record in records:
+        timestamp = record.get("timestamp")
+        if type(timestamp) is int and start <= timestamp <= end:
+            output.append(deepcopy(dict(record)))
+    return output
+
+
+def _metric(metric_id: str, label: str, value: Any, *, unit: str, status: str, reason: str | None = None,
+            display_value: str | None = None, classification: Any = None) -> dict[str, Any]:
+    usable = status in {"available", "partial"} and value is not None
+    return {
+        "metric_id": metric_id,
+        "label": label,
+        "value": deepcopy(value) if usable else None,
+        "display_value": display_value if usable and display_value is not None else (str(value) if usable else "--"),
+        "unit": unit,
+        "status": status if status in _VALID_STATUS else "invalid",
+        "reason": None if usable else (reason or "source_not_available"),
+        "classification": deepcopy(classification),
+    }
+
+
+def build_volatility_market_regimes_kpis(processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
+    daily = classification["classifications"]["daily_regimes"]
+    regime = daily.get("current") or {}
+    positioning = classification["classifications"]["positioning"]
+    position = positioning.get("current") or {}
+    realized_feature = processing["features"]["realized_volatility"]
+    realized = realized_feature.get("current") or ((realized_feature.get("records") or [{}])[-1])
+
+    regime_value = regime.get("regime")
+    confidence = _finite(regime.get("confidence_score"))
+    realized_value = _finite(realized.get("realized_volatility_percent"))
+    ratio = _finite(position.get("long_short_ratio"))
+    persistence = regime.get("persistence_days") if type(regime.get("persistence_days")) is int else None
+
+    items = [
+        _metric("current_regime", "CURRENT REGIME", regime_value, unit="semantic_state", status=daily.get("status", "unavailable"),
+                reason=daily.get("reason"), display_value=_REGIME_LABELS.get(regime_value, str(regime_value)), classification=regime_value),
+        _metric("confidence", "REGIME CONFIDENCE", confidence, unit="decimal", status="available" if confidence is not None else "unavailable",
+                display_value=f"{confidence * 100:.0f}%" if confidence is not None else None, classification=regime.get("confidence_state")),
+        _metric("realized_volatility", "REALIZED VOLATILITY", realized_value, unit="percent",
+                status=realized_feature.get("status", "unavailable"), reason=realized_feature.get("reason"),
+                display_value=f"{realized_value:.2f}%" if realized_value is not None else None),
+        _metric("positioning_ratio", "LONG / SHORT RATIO", ratio, unit="ratio", status=positioning.get("status", "unavailable"),
+                reason=positioning.get("reason"), display_value=f"{ratio:.3f}" if ratio is not None else None,
+                classification=position.get("positioning_state")),
+        _metric("persistence", "REGIME PERSISTENCE", persistence, unit="days", status="available" if persistence is not None else "unavailable",
+                display_value=(f"{persistence} day" if persistence == 1 else f"{persistence} days") if persistence is not None else None),
+    ]
+    return {"items": items}
+
+
+def build_realized_volatility_chart(feature: Mapping[str, Any], start: int, end: int,
+                                    technical: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    records = _filter_records(feature.get("records", []), start, end)
+    return {
+        "chart_id": "realized_volatility", "title": "Realized Volatility",
+        "chart_type": "line",
+        "status": feature.get("status", "unavailable"),
+        "reason": feature.get("reason"),
+        "unit": "percent",
+        "series": ["realized_volatility_percent"],
+        "records": records,
+        "current": deepcopy(feature.get("current")),
+        "records_available": len(feature.get("records", [])),
+        "records_returned": len(records),
+        "history_truncated": len(records) < len(feature.get("records", [])),
+        "source": deepcopy(feature.get("source", {})),
+        "candles": deepcopy((technical or {}).get("candles", [])),
+        "technical_analysis_allowed": True,
+    }
+
+
+def build_positioning_ratio_chart(feature: Mapping[str, Any], classification: Mapping[str, Any], start: int | None = None,
+                                  end: int | None = None) -> dict[str, Any]:
+    numeric = {row.get("timestamp"): row for row in feature.get("records", []) if type(row.get("timestamp")) is int}
+    semantic = {row.get("timestamp"): row for row in classification.get("records", []) if type(row.get("timestamp")) is int}
+    timestamps = sorted(numeric)
+    if start is not None and end is not None:
+        timestamps = [timestamp for timestamp in timestamps if start <= timestamp <= end]
+    records = []
+    missing_semantics = 0
+    for timestamp in timestamps:
+        raw = numeric[timestamp]
+        atom = semantic.get(timestamp)
+        if atom is None:
+            missing_semantics += 1
+        records.append({
+            "timestamp": timestamp,
+            "long_percent": deepcopy(raw.get("long_percent")),
+            "short_percent": deepcopy(raw.get("short_percent")),
+            "long_short_ratio": deepcopy(raw.get("long_short_ratio")),
+            "net_long_percentage_points": deepcopy(raw.get("net_long_percentage_points")),
+            "positioning_state": deepcopy(atom.get("positioning_state")) if atom else None,
+            "crowding_state": deepcopy(atom.get("crowding_state")) if atom else None,
+            "color_token": "positioning_long" if (atom or {}).get("positioning_state") == "long_bias" else
+                "positioning_short" if (atom or {}).get("positioning_state") == "short_bias" else "positioning_balanced",
+        })
+    source_status = feature.get("status", "unavailable")
+    status = "partial" if source_status == "available" and missing_semantics else source_status
+    return {
+        "chart_id": "long_short_positioning_ratio",
+        "title": "Long / Short Positioning Ratio",
+        "chart_type": "line",
+        "status": status,
+        "reason": "classification_alignment_incomplete" if status == "partial" else feature.get("reason"),
+        "unit": "ratio",
+        "series": ["long_short_ratio", "long_percent", "short_percent"],
+        "records": records,
+        "current": deepcopy(classification.get("current")),
+        "reference_lines": [{"value": 1.0, "label": "Balanced"}],
+        "selector_behavior": "timestamp_window_filter", "warnings": [],
+        "records_available": len(feature.get("records", [])),
+        "records_returned": len(records),
+        "history_truncated": len(records) < len(feature.get("records", [])),
+        "first_available_timestamp": feature.get("first_available_timestamp"),
+        "last_available_timestamp": feature.get("last_available_timestamp"),
+        "first_returned_timestamp": records[0]["timestamp"] if records else None,
+        "last_returned_timestamp": records[-1]["timestamp"] if records else None,
+        "source": deepcopy(feature.get("source", {})),
+    }
+
+
+def build_visible_regime_events(source: Mapping[str, Any], start: int, end: int) -> dict[str, Any]:
+    ids = source.get("regime_transition_ids", [])
+    has_technical = "technical_cross_ids" in source
+    technical_ids = source.get("technical_cross_ids", [])
+    by_id = source.get("by_id", {})
+    if (not isinstance(ids, list) or not isinstance(technical_ids, list) or len(ids) != len(set(ids))
+            or len(technical_ids) != len(set(technical_ids)) or not isinstance(by_id, Mapping)):
+        raise ValueError("events:invalid_registry")
+    visible_ids = []
+    visible = {}
+    visible_technical_ids = []
+    for event_id in [*ids, *technical_ids]:
+        event = by_id.get(event_id)
+        if not isinstance(event, Mapping) or event.get("event_id") != event_id:
+            raise ValueError("events:invalid_reference")
+        timestamp = event.get("timestamp")
+        if type(timestamp) is int and start <= timestamp <= end:
+            visible_ids.append(event_id)
+            visible[event_id] = deepcopy(dict(event))
+            if event_id in technical_ids:
+                visible_technical_ids.append(event_id)
+    output = {"by_id": visible, "regime_transition_ids": [item for item in visible_ids if item in ids]}
+    if has_technical:
+        output.update(technical_cross_ids=visible_technical_ids,
+            technical_cross_policy={"implementation_owner": "Classification", "recalculate_in_hmi": False})
+    return output
+
+
+def build_regime_timeline_chart(classification: Mapping[str, Any], events: Mapping[str, Any], start: int, end: int) -> dict[str, Any]:
+    records = _filter_records(classification.get("records", []), start, end)
+    event_by_timestamp: dict[int, list[str]] = {}
+    for event_id in events.get("regime_transition_ids", []):
+        event = events["by_id"][event_id]
+        event_by_timestamp.setdefault(event["timestamp"], []).append(event_id)
+    for record in records:
+        record["event_ids"] = list(event_by_timestamp.get(record["timestamp"], []))
+    return {
+        "chart_id": "regime_timeline",
+        "chart_type": "categorical_timeline",
+        "status": classification.get("status", "unavailable"),
+        "reason": classification.get("reason"),
+        "records": records,
+        "current": deepcopy(classification.get("current")),
+        "records_available": len(classification.get("records", [])),
+        "records_returned": len(records),
+        "history_truncated": len(records) < len(classification.get("records", [])),
+    }
+
+
+def build_regime_distribution_chart(summaries: Mapping[str, Any], selected_range: str) -> dict[str, Any]:
+    full_history = deepcopy(summaries.get("full_history", {}))
+    trailing_30d = deepcopy(summaries.get("trailing_30d", {}))
+    selected_basis = "trailing_30d" if selected_range == "30d" else "full_history"
+    selected = trailing_30d if selected_basis == "trailing_30d" else full_history
+    counts, shares = selected.get("counts", {}), selected.get("shares", {})
+    labels = {"low_vol": "Low Vol", "normal": "Normal", "high_vol": "High Vol"}
+    items = [{"regime": state, "label": labels[state], "count": counts.get(state), "share": shares.get(state),
+        "display_share": "--" if shares.get(state) is None else f"{shares[state] * 100:.1f}%",
+        "color_token": f"regime_{state}"} for state in ("low_vol", "normal", "high_vol")]
+    return {
+        "chart_id": "regime_distribution",
+        "title": "Regime Distribution", "chart_type": "donut",
+        "status": selected.get("status", "unavailable"),
+        "reason": selected.get("reason"),
+        "basis": selected.get("basis"), "window": selected.get("window"),
+        "classified_days": selected.get("classified_days"), "items": items,
+        "selected_basis": selected_basis, "selected": selected,
+        "full_history": full_history, "trailing_30d": trailing_30d,
+        "selector_behavior": "fixed_full_history_summary" if selected_basis == "full_history" else "fixed_30d_summary",
+    }
+
+
+def build_market_regime_table(statistics: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    order = ("low_vol", "normal", "high_vol")
+    by_state = {row.get("regime"): row for row in statistics if isinstance(row, Mapping)}
+    labels = {"low_vol": "Low Vol", "normal": "Normal", "high_vol": "High Vol"}
+    rows = []
+    for state in order:
+        if state not in by_state:
+            continue
+        row = deepcopy(dict(by_state[state]))
+        row.update(row_id=f"regime:{state}", label=labels[state], color_token=f"regime_{state}",
+            display_share="--" if row.get("empirical_share") is None else f"{row['empirical_share'] * 100:.1f}%")
+        rows.append(row)
+    return {
+        "table_id": "market_regime_table",
+        "title": "Market Regime Table", "reason": None,
+        "status": "available" if len(rows) == len(order) else "partial",
+        "share_basis": "empirical_classified_day_share",
+        "columns": ["regime", "classified_days", "empirical_share", "episode_count", "average_episode_days", "maximum_episode_days", "current_episode_days"],
+        "rows": rows,
+    }
+
+
+def build_technical_analysis(feature: Mapping[str, Any], events: Mapping[str, Any]) -> dict[str, Any]:
+    packages = feature.get("indicators", {}) if isinstance(feature.get("indicators"), Mapping) else {}
+    indicator_ids = ("macd", "rsi", "tsi", "stochastic", "williams_r", "cci", "adx", "atr",
+        "wasserstein_distance", "bollinger_band_width")
+    indicators = {}
+    for indicator_id in indicator_ids:
+        source = packages.get(indicator_id, {}) if isinstance(packages.get(indicator_id), Mapping) else {}
+        timestamps = deepcopy(source.get("timestamps", []))
+        indicators[indicator_id] = {"status": "available" if timestamps else "unavailable",
+            "unit": "percent" if indicator_id in {"rsi", "stochastic", "williams_r"} else "value",
+            "parameters": deepcopy(source.get("parameters", {})), "timestamps": timestamps,
+            "series": deepcopy(source.get("series", {})), "current": deepcopy(source.get("current", {})),
+            "thresholds": deepcopy(source.get("thresholds", [])), "recalculate_in_hmi": False,
+            "summary": {"indicator_id": indicator_id, "status": "available" if timestamps else "unavailable"},
+            "calculation_metadata": deepcopy(source.get("calculation", {})),
+            "warmup_records": source.get("warmup_records"), "calculation_history_records": len(timestamps)}
+        current_values = [value for value in indicators[indicator_id]["current"].values() if value is not None]
+        current_value = current_values[-1] if current_values else None
+        indicators[indicator_id]["summary"].update(label=indicator_id.upper(), section="technical_analysis",
+            value=current_value, display_value="--" if current_value is None else f"{current_value:.4f}",
+            signal="neutral", signal_color="neutral", strength=0, secondary={})
+    indicators["rsi"].update(thresholds=[{"role": "oversold", "value": 30.0}, {"role": "overbought", "value": 70.0}],
+        scale={"min": 0.0, "max": 100.0, "unit": "percent"}, threshold_basis="oscillator_domain")
+    indicators["stochastic"].update(thresholds=[{"role": "oversold", "value": 20.0}, {"role": "overbought", "value": 80.0}],
+        scale={"min": 0.0, "max": 100.0, "unit": "percent"}, threshold_basis="oscillator_domain",
+        cross_gate={"bullish": "k_crosses_above_d_at_or_below_20", "bearish": "k_crosses_below_d_at_or_above_80"})
+    indicators["tsi"].update(thresholds=[{"role": "oversold", "value": -25.0}, {"role": "neutral", "value": 0.0},
+        {"role": "overbought", "value": 25.0}], scale={"min": -100.0, "max": 100.0, "unit": "index"},
+        threshold_basis="oscillator_domain")
+    indicators["williams_r"]["thresholds"] = [{"role": "overbought", "value": -20.0}, {"role": "oversold", "value": -80.0}]
+    moving = packages.get("moving_averages", {})
+    bollinger = packages.get("bollinger_bands", {})
+    regression = feature.get("regression_channel", {}) if isinstance(feature.get("regression_channel"), Mapping) else {}
+    return {"analysis_id": "realized_volatility_technical_analysis", "source_chart_id": "realized_volatility",
+        "source_path": "charts.realized_volatility.candles", "source_market": "realized_volatility", "source_timeframe": "1d",
+        "recalculate_in_hmi": False, "selector_contract": {
+            "trend": ["ema_9", "ema_21", "ema_50", "sma_20", "sma_50", "sma_100", "sma_200", "wma_20", "wma_50"],
+            "bands": ["bollinger_bands"], "derived_analysis": ["adx", "bollinger_band_width"],
+            "momentum": ["macd", "rsi", "tsi", "stochastic", "williams_r", "cci"],
+            "volatility": ["atr", "wasserstein_distance"], "excluded": ["volume", "mfi"]},
+        "timestamps": [row["timestamp"] for row in feature.get("candles", [])],
+        "overlays": {"moving_averages": {"series": deepcopy(moving.get("series", {})), "recalculate_in_hmi": False},
+            "bollinger_bands": {"series": deepcopy(bollinger.get("series", {})), "recalculate_in_hmi": False},
+            "regression_channel": {"series": deepcopy(regression.get("series", {})),
+                "parameters": deepcopy(regression.get("parameters", {})), "recalculate_in_hmi": False}},
+        "indicators": indicators,
+        "events": [deepcopy(events["by_id"][event_id]) for event_id in events.get("technical_cross_ids", [])],
+        "oscillator_display_contract": {"basis": "fixed_indicator_domain", "recalculate_in_hmi": False,
+            "rsi": {"min": 0.0, "max": 100.0}, "stochastic": {"min": 0.0, "max": 100.0},
+            "tsi": {"min": -100.0, "max": 100.0}},
+        "history": {"calculation_records": feature.get("calculation_history_records", 0),
+            "minimum_warmup_records": feature.get("minimum_warmup_records", 200),
+            "all_visible_moving_averages_warm": feature.get("calculation_history_records", 0) >= feature.get("minimum_warmup_records", 200),
+            "technical_indicators_precomputed": True, "hmi_recalculation": False}}
+
+
+def build_source_status_widget(processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
+    features = processing.get("features", {})
+    rows = [
+        {
+            "provider_id": "coinglass",
+            "role": "positioning",
+            "status": features.get("positioning", {}).get("status", "unavailable"),
+            "source": deepcopy(features.get("positioning", {}).get("source", {})),
+        },
+        {
+            "provider_id": "glassnode",
+            "role": "realized_volatility",
+            "status": features.get("realized_volatility", {}).get("status", "unavailable"),
+            "source": deepcopy(features.get("realized_volatility", {}).get("source", {})),
+        },
+        {
+            "provider_id": "glassnode_dvol",
+            "role": "implied_volatility",
+            "status": features.get("dvol", {}).get("status", "unavailable"),
+            "source": deepcopy(features.get("dvol", {}).get("source", {})),
+        },
+        {
+            "provider_id": "internal",
+            "role": "regime_classification",
+            "status": classification.get("classifications", {}).get("daily_regimes", {}).get("status", "unavailable"),
+            "source": {"basis": "processing.daily_regime_basis"},
+        },
+    ]
+    return {"widget_id": "source_status", "status": "available", "items": rows}
+
+
+def _quality(processing: Mapping[str, Any], classification: Mapping[str, Any], parts: Mapping[str, Any]) -> dict[str, Any]:
+    required = [
+        *parts["kpis"]["items"],
+        parts["charts"]["realized_volatility"],
+        parts["charts"]["positioning_ratio"],
+        parts["charts"]["regime_timeline"],
+        parts["tables"]["market_regime_table"],
+    ]
+    statuses = [item.get("status", "invalid") for item in required]
+    errors = [*processing.get("quality", {}).get("errors", []), *classification.get("quality", {}).get("errors", [])]
+    warnings = [*processing.get("quality", {}).get("warnings", []), *classification.get("quality", {}).get("warnings", [])]
+    if errors or "invalid" in statuses:
+        status = "invalid"
+    elif any(value != "available" for value in statuses) or warnings:
+        status = "partial"
+    else:
+        status = "ok"
+    availability = {
+        "kpis_available": sum(item.get("status") == "available" for item in parts["kpis"]["items"]),
+        "kpis_total": len(parts["kpis"]["items"]),
+        "charts_available": sum(item.get("status") == "available" for item in parts["charts"].values()),
+        "charts_total": len(parts["charts"]),
+        "tables_available": sum(item.get("status") == "available" for item in parts["tables"].values()),
+        "tables_total": len(parts["tables"]),
+    }
+    return {
+        "status": status,
+        "contract_complete": status != "invalid",
+        "data_complete": all(value == "available" for value in statuses),
+        "availability": availability,
+        "missing_fields": [],
+        "warnings": [str(value) for value in warnings],
+        "errors": [str(value) for value in errors],
+    }
 
 
 class VolatilityMarketRegimesContractBuilder:
-    def build(self, processing_contract: Any, classification_contract: Any, *, runtime_context: Any, selected_range: str = DEFAULT_DISPLAY_RANGE) -> dict[str, Any]:
+    def build(
+        self,
+        processing_contract: Mapping[str, Any],
+        classification_contract: Mapping[str, Any],
+        *,
+        runtime_context: Mapping[str, Any],
+        selected_range: str = DEFAULT_DISPLAY_RANGE,
+    ) -> dict[str, Any]:
+        before = deepcopy((processing_contract, classification_contract, runtime_context))
         try:
             validate_volatility_market_regimes_builder_inputs(processing_contract, classification_contract, runtime_context, selected_range)
-            context = build_volatility_market_regimes_screen_context(processing_contract, classification_contract, runtime_context, selected_range)
-            kpis    = build_volatility_market_regimes_kpis(classification_contract)
-            charts, events = build_volatility_market_regimes_charts(processing_contract, classification_contract)
-            parts = {"kpis": kpis, "charts": charts, "tables": {"market_regime_table": build_market_regime_table(classification_contract["summaries"]["regime_statistics"])},
-                     "widgets": {"source_status": build_source_status_widget(processing_contract, classification_contract)}}
-            warnings = [warning for chart in charts.values() for warning in chart.get("warnings", [])]
-            quality  = evaluate_volatility_market_regimes_screen_quality(parts, warnings=warnings)
-            screen   = {"family": "volatility_market_regimes", "screen": "volatility_market_regimes", "schema_version": "0.1.0", "context": context,
-                      "badges": build_volatility_market_regimes_badges(runtime_context), "selectors": build_volatility_market_regimes_selectors(selected_range),
-                      **parts, "events": events, "quality": quality}
-            json.dumps(screen, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=False)
+            anchor = int(processing_contract["context"]["reference_timestamp"])
+            start, end = _window(anchor, selected_range)
+            events = build_visible_regime_events(classification_contract.get("interpreted_events", {}), start, end)
+            kpis = build_volatility_market_regimes_kpis(processing_contract, classification_contract)
+            charts = {
+                "realized_volatility": build_realized_volatility_chart(processing_contract["features"]["realized_volatility"], start, end,
+                    processing_contract["features"].get("technical_analysis")),
+                "positioning_ratio": build_positioning_ratio_chart(
+                    processing_contract["features"]["positioning"], classification_contract["classifications"]["positioning"], start, end
+                ),
+                "regime_timeline": build_regime_timeline_chart(classification_contract["classifications"]["daily_regimes"], events, start, end),
+                "regime_distribution": build_regime_distribution_chart(classification_contract["summaries"]["regime_distribution"], selected_range),
+            }
+            tables = {"market_regime_table": build_market_regime_table(classification_contract["summaries"]["regime_statistics"])}
+            widgets = {"source_status": build_source_status_widget(processing_contract, classification_contract)}
+            parts = {"kpis": kpis, "charts": charts, "tables": tables, "widgets": widgets}
+            context = {
+                "asset": processing_contract["context"]["asset"],
+                "symbol": processing_contract["context"]["symbol"],
+                "exchange": processing_contract["context"]["exchange"],
+                "base_interval": processing_contract["context"]["base_interval"],
+                "data_mode": runtime_context["data_mode"],
+                "is_demo": runtime_context["is_demo"],
+                "generated_at": runtime_context["generated_at"],
+                "updated_at": runtime_context["updated_at"],
+                "data_as_of": anchor,
+                "default_display_range": DEFAULT_DISPLAY_RANGE,
+                "selected_display_range": selected_range,
+                "range_window": {"start_timestamp": start, "end_timestamp": end},
+                "history_policy": {"calculation": "upstream_full_history", "presentation": "selected_range_only"},
+            }
+            screen = {
+                "family": FAMILY,
+                "screen": FAMILY,
+                "schema_version": SCREEN_SCHEMA_VERSION,
+                "context": context,
+                "badges": build_volatility_market_regimes_badges(runtime_context),
+                "selectors": build_volatility_market_regimes_selectors(selected_range),
+                **parts,
+                "events": events,
+                "technical_analysis": build_technical_analysis(processing_contract["features"].get("technical_analysis", {}), events),
+                "quality": {},
+            }
+            screen["quality"] = _quality(processing_contract, classification_contract, parts)
+            screen = align_volatility_market_regimes_to_sp_v1_2(
+                screen, processing_contract, classification_contract,
+                runtime_context=runtime_context, selected_range=selected_range,
+            )
+            screen = _json_copy(screen, "screen_contract")
+            json.dumps(screen, ensure_ascii=False, allow_nan=False, sort_keys=False)
+            if (processing_contract, classification_contract, runtime_context) != before:
+                raise RuntimeError("Contract Builder mutated upstream state")
             return screen
+        except RuntimeError:
+            raise
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             return _invalid_screen(str(exc))
 
 
 def build_volatility_market_regimes_screen(
-    processing_contract: Any, classification_contract: Any, *, runtime_context: Any, selected_range: str = DEFAULT_DISPLAY_RANGE,
+    processing_contract: Any,
+    classification_contract: Any,
+    *,
+    runtime_context: Any,
+    selected_range: str = DEFAULT_DISPLAY_RANGE,
 ) -> dict[str, Any]:
-    return VolatilityMarketRegimesContractBuilder().build(processing_contract, classification_contract, runtime_context=runtime_context, selected_range=selected_range)
+    return VolatilityMarketRegimesContractBuilder().build(
+        processing_contract,
+        classification_contract,
+        runtime_context=runtime_context,
+        selected_range=selected_range,
+    )

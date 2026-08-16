@@ -39,14 +39,24 @@ def test_cb01_root_and_public_api():
     )
     assert output["schema"] == {
         "id": "trad_elatin.etf_exchange_flows.screen.v1",
-        "version": "1.0.0",
+        "version": "1.3.0",
     }
-    assert output["screen"] == {
-        "id": "etf_exchange_flows",
-        "route": "/etf-exchange-flows",
-        "title": "ETF & Exchange Flows",
-        "family": "etf_exchange_flows",
-    }
+    screen = output["screen"]
+    assert screen["id"] == "etf_exchange_flows"
+    assert screen["route"] == "/etf-exchange-flows"
+    assert screen["title"] == "ETF & Exchange Flows"
+    assert screen["family"] == "etf_exchange_flows"
+    assert isinstance(screen.get("layout_contract"), dict)
+    assert screen["layout_contract"]["top_kpis"] == [
+        "etf_net_flow",
+        "total_aum",
+        "cumulative_etf_net_flow",
+        "exchange_inflow",
+        "exchange_outflow",
+        "exchange_balance",
+        "gbtc_premium",
+        "exchange_flow_pressure",
+    ]
     assert output["stage"] == "screen_contract" and output["version"] == "0.1"
     assert run_etf_exchange_flows_contract_builder(
         processing_contract=processing, classification_contract=classification
@@ -55,12 +65,14 @@ def test_cb01_root_and_public_api():
 
 @pytest.mark.parametrize(
     ("range_id", "seconds", "interval"),
-    (("1d", 86_400, "hour"), ("7d", 604_800, "hour"),
+    (("1d", 86_400, "day"), ("7d", 604_800, "day"),
      ("30d", 2_592_000, "day"), ("90d", 7_776_000, "day")),
 )
 def test_cb02_cb05_ranges_and_netflow_interval(range_id, seconds, interval):
     output = build(selected_range=range_id)
     assert output["range_selector"]["selected"] == range_id
+    assert output["range_selector"]["selector_type"] == "RANGE"
+    assert output["range_selector"]["source_resolution"] == "1D"
     assert output["provenance"]["parameters"]["range_seconds"] == seconds
     assert output["provenance"]["parameters"]["exchange_netflow_source_interval"] == interval
     assert output["charts"]["exchange_net_flow"]["source_path"].endswith(interval)
@@ -79,6 +91,7 @@ def test_cb06_kpis_use_exact_processing_sources():
         "exchange_balance": processing["features"]["exchange_balances"]["cryptoquant_reserve"]["value"],
         "gbtc_premium": processing["features"]["premium_discount"]["gbtc_latest"]["value"],
         "exchange_flow_pressure": processing["features"]["pressure"]["flow_24h"]["value"],
+        "cumulative_etf_net_flow": processing["series"]["etf_cumulative_flow"][-1]["cumulative_flow_usd"],
     }
     assert {name: item["value"] for name, item in output["kpis"].items()} == expected
 
@@ -126,10 +139,13 @@ def test_cb10_exact_open_closed_range_filter():
     output = build_etf_exchange_flows_contract(
         processing_contract=processing, classification_contract=classification, selected_range="1d"
     )
-    assert [point["value"] for point in output["charts"]["etf_flow_daily"]["points"]] == [2.0, 3.0]
+    chart = output["charts"]["etf_flow_daily"]
+    assert [point["value"] for point in chart["points"]] == [1.0, 2.0, 3.0]
+    assert chart["calculation_history"]["calendar_policy"] == "weekdays_only_holidays_not_explicitly_modeled"
+    assert chart["calculation_history"]["recalculate_in_hmi"] is False
 
 
-def test_cb11_cumulative_is_filtered_without_rebasing():
+def test_cb11_cumulative_is_kpi_without_legacy_chart_or_rebasing():
     processing, classification = contracts()
     processing["series"]["etf_cumulative_flow"] = [
         {"timestamp": NOW - 10, "cumulative_flow_usd": 500.0, "provider": "coinglass", "endpoint_id": "a"},
@@ -138,17 +154,25 @@ def test_cb11_cumulative_is_filtered_without_rebasing():
     output = build_etf_exchange_flows_contract(
         processing_contract=processing, classification_contract=classification, selected_range="1d"
     )
-    assert [point["value"] for point in output["charts"]["etf_cumulative_net_flow"]["points"]] == [500.0, 450.0]
+    assert output["kpis"]["cumulative_etf_net_flow"] == {
+        "kpi_id": "cumulative_etf_net_flow", "title": "CUMULATIVE ETF NET FLOW",
+        "status": "available", "reason": None, "value": 450.0, "unit": "USD",
+        "format_hint": "currency_compact", "data_as_of": NOW, "provider": "coinglass",
+        "endpoint_id": "a", "source_path": "series.etf_cumulative_flow", "warnings": [],
+    }
+    assert "etf_cumulative_net_flow" not in output["charts"]
+    assert "charts.etf_cumulative_net_flow" not in output["quality"]["required"]
+    assert "charts.etf_cumulative_net_flow" not in output["quality"]["available"]
+    assert "kpis.cumulative_etf_net_flow" in output["quality"]["required"]
     assert output["provenance"]["parameters"]["cumulative_series_rebased"] is False
 
 
-def test_cb12_exchange_balance_preserves_entities_and_providers():
+def test_cb12_exchange_balance_is_processing_built_aggregate_ohlc():
     output = build(selected_range="1d")
-    point = output["charts"]["exchange_balance"]["points"][0]
-    assert {key: point[key] for key in ("exchange_name", "symbol", "provider", "endpoint_id")} == {
-        "exchange_name": "A", "symbol": "BTC", "provider": "coinglass",
-        "endpoint_id": "exchange_balance_chart",
-    }
+    chart = output["charts"]["exchange_balance"]
+    assert set(chart["candles"][0]) == {"timestamp", "open", "high", "low", "close", "is_closed"}
+    assert chart["ohlc_contract"]["profile"] == "state"
+    assert chart["ohlc_contract"]["construction_stage"] == "processing"
 
 
 def test_cb13_glassnode_overlay_is_explicitly_unavailable():
@@ -231,7 +255,9 @@ def test_cb25_global_data_as_of_is_causal_minimum():
     output = build_etf_exchange_flows_contract(
         processing_contract=processing, classification_contract=classification
     )
-    assert output["quality"]["data_as_of"] == NOW - 100
+    assert output["quality"]["data_as_of"] == min(
+        NOW - 100, output["charts"]["exchange_balance"]["data_as_of"]
+    )
 
 
 def test_cb26_provenance_is_compact_and_complete():
@@ -244,6 +270,15 @@ def test_cb26_provenance_is_compact_and_complete():
 
 def test_cb27_strict_json():
     json.dumps(build(), ensure_ascii=False, allow_nan=False)
+
+
+def test_cb27b_technical_analysis_runtime_contract_shape():
+    technical = build()["technical_analysis"]
+    assert set(technical["selector_contract"]) == {"trend", "bands", "derived_analysis", "momentum", "volatility", "excluded"}
+    assert set(technical["indicators"]) == {"macd", "rsi", "tsi", "adx", "stochastic", "williams_r",
+                                            "cci", "atr", "wasserstein_distance", "bollinger_band_width"}
+    assert technical["recalculate_in_hmi"] is False
+    assert technical["overlays"]["regression_channel"]["recalculate_in_hmi"] is False
 
 
 def test_cb28_deep_immutability_and_independent_outputs():

@@ -48,6 +48,7 @@ TIMEFRAME_SECONDS = {
 }
 
 TIMEFRAME_ORDER = tuple(TIMEFRAME_SECONDS)
+CALCULATION_MARKETS = ("spot", "futures", "general")
 
 RESAMPLING_RULES = {
     "5m": {"source_timeframe": "1m", "expected_source_records": 5},
@@ -60,7 +61,7 @@ OHLC_FIELDS = ("open", "high", "low", "close")
 
 PRICE_INDICATOR_CONFIG = {
     "ema_periods": (9, 21, 50),
-    "sma_periods": (20, 50),
+    "sma_periods": (20, 50, 100, 200),
     "wma_periods": (20, 50),
     "bollinger": {"period": 20, "standard_deviations": 2.0},
     "rsi_period": 14,
@@ -193,14 +194,7 @@ def evaluate_indicator_quality(
 
 
 def _source_metadata(market_type: str, timeframe: str) -> dict[str, Any]:
-    source = {
-        "market_type": market_type,
-        "timeframe": timeframe,
-        "is_synthetic_source": market_type == "general",
-    }
-    if market_type == "general":
-        source["construction"] = "spot_futures_arithmetic_mean"
-    return source
+    return {"market_type": market_type, "timeframe": timeframe, "is_synthetic_source": False}
 
 
 def build_single_series_indicator(
@@ -386,8 +380,55 @@ def calculate_prices_indicator_package(
         market_type=market_type, timeframe=timeframe, module=INDICATOR_MODULES["mfi"], function="mfi",
         extra_metadata=arrays["volume_metadata"],
     )
+    package["regression_channel"] = build_regression_channel_indicator(
+        records=records, market_type=market_type, timeframe=timeframe, window=100, deviation_multiplier=2.0
+    )
     return package
 
+
+
+def build_regression_channel_indicator(*, records: list[dict[str, Any]], market_type: str, timeframe: str, window: int = 100, deviation_multiplier: float = 2.0) -> dict[str, Any]:
+    ordered = _validated_records(records)
+    timestamps = [int(row["timestamp"]) for row in ordered]
+    closes = [float(row["close"]) for row in ordered]
+    middle: list[float | None] = [None] * len(ordered)
+    upper: list[float | None] = [None] * len(ordered)
+    lower: list[float | None] = [None] * len(ordered)
+    n = int(window)
+    sx = n * (n - 1) / 2.0
+    sx2 = (n - 1) * n * (2 * n - 1) / 6.0
+    denominator = n * sx2 - sx * sx
+    if n > 1 and denominator != 0:
+        for end in range(n - 1, len(closes)):
+            ys = closes[end - n + 1:end + 1]
+            sy = sum(ys)
+            sxy = sum(index * value for index, value in enumerate(ys))
+            slope = (n * sxy - sx * sy) / denominator
+            intercept = (sy - slope * sx) / n
+            fitted = [intercept + slope * index for index in range(n)]
+            residual_std = math.sqrt(sum((value - fit) ** 2 for value, fit in zip(ys, fitted, strict=True)) / n)
+            center = fitted[-1]
+            width = float(deviation_multiplier) * residual_std
+            middle[end] = center
+            upper[end] = center + width
+            lower[end] = center - width
+    current_index = max((idx for idx, value in enumerate(middle) if value is not None), default=None)
+    current = {
+        "middle": middle[current_index] if current_index is not None else None,
+        "upper": upper[current_index] if current_index is not None else None,
+        "lower": lower[current_index] if current_index is not None else None,
+    }
+    return {
+        "indicator_id": "regression_channel",
+        "parameters": {"window": n, "deviation_multiplier": float(deviation_multiplier), "field": "close", "fit": "rolling_ordinary_least_squares", "width_basis": "population_standard_deviation_of_residuals"},
+        "timestamps": timestamps,
+        "series": {"middle": middle, "upper": upper, "lower": lower},
+        "current": current,
+        "warmup_records": n,
+        "source": _source_metadata(market_type, timeframe),
+        "quality": evaluate_indicator_quality({"middle": middle, "upper": upper, "lower": lower}, required_records=n, available_records=len(timestamps)),
+        "calculation": {"module": "processing.prices_ohlcv.prices_ohlcv_processor", "function": "build_regression_channel_indicator", "parameters": {"window": n, "deviation_multiplier": float(deviation_multiplier)}, "records": len(timestamps)},
+    }
 
 def calculate_market_indicators(*, market: Mapping[str, Any], market_type: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
     timeframes = market.get("timeframes", {})
@@ -399,12 +440,12 @@ def calculate_market_indicators(*, market: Mapping[str, Any], market_type: str, 
 
 
 def calculate_all_prices_indicators(*, markets: Mapping[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {market_type: calculate_market_indicators(market=markets.get(market_type, {}), market_type=market_type, config=config) for market_type in ("general", "spot", "futures")}
+    return {market_type: calculate_market_indicators(market=markets.get(market_type, {}), market_type=market_type, config=config) for market_type in CALCULATION_MARKETS}
 
 
 def calculate_prices_crosses(indicators: Mapping[str, Any]) -> dict[str, Any]:
     output: dict[str, Any] = {}
-    for market_type in ("general", "spot", "futures"):
+    for market_type in CALCULATION_MARKETS:
         output[market_type] = {}
         for timeframe in TIMEFRAME_ORDER:
             package    = indicators.get(market_type, {}).get(timeframe, {})
@@ -412,10 +453,34 @@ def calculate_prices_crosses(indicators: Mapping[str, Any]) -> dict[str, Any]:
             combined: dict[str, Sequence[Any]] = {}
             for indicator_id in ("moving_averages", "macd", "stochastic", "adx", "tsi"):
                 combined.update(package.get(indicator_id, {}).get("series", {}))
-            pairs = [("ema_9", "ema_21"), ("ema_21", "ema_50"), ("sma_20", "sma_50"), ("macd", "signal"), ("k", "d"), ("di_plus", "di_minus")]
+            regression_middle = package.get("regression_channel", {}).get("series", {}).get("middle")
+            bollinger_middle = package.get("bollinger_bands", {}).get("series", {}).get("middle")
+            if regression_middle is not None:
+                combined["regression_middle"] = regression_middle
+            if bollinger_middle is not None:
+                combined["bollinger_middle"] = bollinger_middle
+            pairs = [
+                ("ema_9", "ema_21"), ("ema_9", "ema_50"), ("ema_21", "ema_50"),
+                ("sma_20", "sma_50"), ("sma_20", "sma_100"), ("sma_20", "sma_200"),
+                ("sma_50", "sma_100"), ("sma_50", "sma_200"), ("sma_100", "sma_200"),
+                ("wma_20", "wma_50"),
+                ("regression_middle", "bollinger_middle"),
+                ("macd", "signal"), ("k", "d"), ("di_plus", "di_minus"),
+            ]
             if "signal" in package.get("tsi", {}).get("series", {}):
                 pairs.append(("tsi", "signal"))
-            output[market_type][timeframe] = detect_cross_pairs(timestamps=timestamps, series=combined, pairs=pairs)
+            cross_events = detect_cross_pairs(timestamps=timestamps, series=combined, pairs=pairs)
+            index_by_timestamp = {int(timestamp): index for index, timestamp in enumerate(timestamps)}
+            for event in cross_events:
+                index = index_by_timestamp.get(int(event["timestamp"]))
+                first_name = str(event.get("first_series"))
+                second_name = str(event.get("second_series"))
+                if index is not None:
+                    first_series_values = combined.get(first_name, [])
+                    second_series_values = combined.get(second_name, [])
+                    event["first_value"] = _finite_or_none(first_series_values[index]) if index < len(first_series_values) else None
+                    event["second_value"] = _finite_or_none(second_series_values[index]) if index < len(second_series_values) else None
+            output[market_type][timeframe] = cross_events
     return output
 
 
@@ -427,7 +492,7 @@ def calculate_prices_patterns(markets: Mapping[str, Any]) -> dict[str, Any]:
             )
             for timeframe in TIMEFRAME_ORDER
         }
-        for market in ("general", "spot", "futures")
+        for market in CALCULATION_MARKETS
     }
 
 
@@ -506,7 +571,7 @@ def calculate_all_prices_statistics(*, markets: Mapping[str, Any], config: Mappi
             )
             for timeframe in TIMEFRAME_ORDER
         }
-        for market in ("general", "spot", "futures")
+        for market in CALCULATION_MARKETS
     }
 
 
@@ -561,7 +626,7 @@ def calculate_all_prices_bias_components(*, markets: Mapping[str, Any], indicato
             },
             "metadata": {"timeframe_groups": deepcopy(grouping), "overall_calculated": False},
         }
-        for market in ("general", "spot", "futures")
+        for market in CALCULATION_MARKETS
     }
 
 
@@ -734,7 +799,7 @@ def update_prices_timeframes(
     markets          = input_contract.get("markets", {})
     existing_markets = (existing_processing or {}).get("markets", {})
     mode             = str(input_contract.get("mode", "bootstrap"))
-    return {
+    output = {
         market_name: update_market_timeframes(
             markets.get(market_name, {}),
             mode=mode,
@@ -743,146 +808,35 @@ def update_prices_timeframes(
         )
         for market_name in ("spot", "futures")
     }
-
-
-def build_general_ohlcv_record(
-    *,
-    spot_record: Mapping[str, Any],
-    futures_record: Mapping[str, Any],
-) -> dict[str, Any]:
-    if int(spot_record["timestamp"]) != int(futures_record["timestamp"]):
-        raise ValueError("Spot and Futures timestamps must match")
-    spot_volume    = float(spot_record.get("volume_usd", 0.0) or 0.0)
-    futures_volume = float(futures_record.get("volume_usd", 0.0) or 0.0)
-    record         = {
-        "timestamp": int(spot_record["timestamp"]),
-        **{
-            field: (float(spot_record[field]) + float(futures_record[field])) / 2.0
-            for field in OHLC_FIELDS
-        },
-        "spot_volume_usd": spot_volume,
-        "futures_volume_usd": futures_volume,
-        "combined_volume_usd": spot_volume + futures_volume,
-        "market_type": "general",
-        "is_synthetic": True,
-        "construction": "spot_futures_arithmetic_mean",
-    }
-    if "is_closed" in spot_record or "is_closed" in futures_record:
-        record["is_closed"] = bool(spot_record.get("is_closed")) and bool(futures_record.get("is_closed"))
-        record["is_partial"] = not record["is_closed"]
-    return record
-
-
-def rebuild_general_timeframe(
-    spot_records: Sequence[Mapping[str, Any]],
-    futures_records: Sequence[Mapping[str, Any]],
-    *,
-    existing_records: Sequence[Mapping[str, Any]] = (),
-    affected_timestamps: Sequence[int] | None = None,
-) -> dict[str, Any]:
-    spot       = {int(row["timestamp"]): dict(row) for row in _validated_records(spot_records)}
-    futures    = {int(row["timestamp"]): dict(row) for row in _validated_records(futures_records)}
-    candidates = set(spot) | set(futures) if affected_timestamps is None else set(map(int, affected_timestamps))
-    existing   = {int(row["timestamp"]): dict(row) for row in existing_records}
-    unavailable: list[dict[str, Any]] = []
-    rebuilt: list[dict[str, Any]] = []
-
-    for timestamp in sorted(candidates):
-        if timestamp in spot and timestamp in futures:
-            record = build_general_ohlcv_record(
-                spot_record=spot[timestamp],
-                futures_record=futures[timestamp],
-            )
-            existing[timestamp] = record
-            rebuilt.append(record)
-        else:
-            existing.pop(timestamp, None)
-            unavailable.append(
-                {
-                    "timestamp": timestamp,
-                    "general_status": "unavailable",
-                    "reason": "missing_spot_candle" if timestamp not in spot else "missing_futures_candle",
-                }
-            )
-    return {
-        "records": [existing[timestamp] for timestamp in sorted(existing)],
-        "incoming_records": rebuilt,
-        "unavailable_records": unavailable,
-    }
-
-
-def rebuild_all_general_timeframes(
-    markets: Mapping[str, Any],
-    *,
-    mode: str,
-    existing_general: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    spot_timeframes     = markets["spot"]["timeframes"]
-    futures_timeframes  = markets["futures"]["timeframes"]
-    existing_timeframes = (existing_general or {}).get("timeframes", {})
-    result: dict[str, dict[str, Any]] = {}
-    for timeframe in TIMEFRAME_ORDER:
-        spot_payload    = spot_timeframes[timeframe]
-        futures_payload = futures_timeframes[timeframe]
-        affected        = None
-        if mode != "bootstrap":
-            affected = sorted(
-                {
-                    int(row["timestamp"])
-                    for row in [
-                        *spot_payload.get("incoming_records", []),
-                        *futures_payload.get("incoming_records", []),
-                    ]
-                }
-            )
-        result[timeframe] = rebuild_general_timeframe(
-            spot_payload["records"],
-            futures_payload["records"],
-            existing_records=existing_timeframes.get(timeframe, {}).get("records", []),
-            affected_timestamps=affected,
-        )
-    return {
-        "source": "spot_futures_arithmetic_mean",
-        "timeframes": result,
-    }
+    # Prices-only HMI rule: the contractual ``general`` market is the
+    # canonical Spot price.  Futures remains available internally for basis
+    # and confirmation, but it never contributes numerically to ``general``.
+    output["general"] = deepcopy(output["spot"])
+    output["general"]["market_type"] = "general"
+    output["general"]["canonical_source_market"] = "spot"
+    return output
 
 
 def calculate_spot_futures_comparison(markets: Mapping[str, Any]) -> dict[str, Any]:
     by_timeframe: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
     for timeframe in TIMEFRAME_ORDER:
-        spot = {
-            int(row["timestamp"]): row
-            for row in markets["spot"]["timeframes"][timeframe]["records"]
-        }
-        futures = {
-            int(row["timestamp"]): row
-            for row in markets["futures"]["timeframes"][timeframe]["records"]
-        }
-        general = {
-            int(row["timestamp"]): row
-            for row in markets["general"]["timeframes"][timeframe]["records"]
-        }
+        spot = {int(row["timestamp"]): row for row in markets["spot"]["timeframes"][timeframe]["records"]}
+        futures = {int(row["timestamp"]): row for row in markets["futures"]["timeframes"][timeframe]["records"]}
         series: list[dict[str, float | int]] = []
-        for timestamp in sorted(set(spot) & set(futures) & set(general)):
-            spot_close    = float(spot[timestamp]["close"])
+        for timestamp in sorted(set(spot) & set(futures)):
+            spot_close = float(spot[timestamp]["close"])
             futures_close = float(futures[timestamp]["close"])
-            general_close = float(general[timestamp]["close"])
-            if spot_close == 0 or general_close == 0:
-                warnings.append(f"{timeframe}/{timestamp}: zero denominator")
+            if spot_close == 0:
+                warnings.append(f"{timeframe}/{timestamp}: zero spot denominator")
                 continue
-            series.append(
-                {
-                    "timestamp": timestamp,
-                    "spot_price": spot_close,
-                    "futures_price": futures_close,
-                    "general_price": general_close,
-                    "basis_usd": futures_close - spot_close,
-                    "basis_percent": ((futures_close / spot_close) - 1.0) * 100.0,
-                    "spot_general_deviation_percent": ((spot_close / general_close) - 1.0) * 100.0,
-                    "futures_general_deviation_percent": ((futures_close / general_close) - 1.0) * 100.0,
-                }
-            )
+            series.append({
+                "timestamp": timestamp,
+                "spot_price": spot_close,
+                "futures_price": futures_close,
+                "basis_usd": futures_close - spot_close,
+                "basis_percent": ((futures_close / spot_close) - 1.0) * 100.0,
+            })
         by_timeframe[timeframe] = {
             "series": series,
             "current": deepcopy(series[-1]) if series else {},
@@ -891,30 +845,17 @@ def calculate_spot_futures_comparison(markets: Mapping[str, Any]) -> dict[str, A
 
 
 def evaluate_prices_processing_quality(markets: Mapping[str, Any]) -> dict[str, Any]:
-    missing_general: list[dict[str, Any]] = []
     warnings: list[str] = []
     errors: list[str] = []
-    for market_name in ("spot", "futures", "general"):
+    for market_name in ("spot", "futures"):
         for timeframe in TIMEFRAME_ORDER:
             payload = markets.get(market_name, {}).get("timeframes", {}).get(timeframe)
             if payload is None:
                 errors.append(f"missing {market_name}/{timeframe}")
             elif not payload.get("records"):
                 warnings.append(f"empty {market_name}/{timeframe}")
-    for timeframe in TIMEFRAME_ORDER:
-        for item in markets.get("general", {}).get("timeframes", {}).get(timeframe, {}).get(
-            "unavailable_records", []
-        ):
-            issue = {"timeframe": timeframe, **dict(item)}
-            missing_general.append(issue)
-            warnings.append(f"general/{timeframe}/{item['timestamp']}: {item['reason']}")
     status = "invalid" if errors else ("partial" if warnings else "ok")
-    return {
-        "status": status,
-        "missing_general_records": missing_general,
-        "warnings": warnings,
-        "errors": errors,
-    }
+    return {"status": status, "warnings": warnings, "errors": errors}
 
 
 class PricesOhlcvProcessor:
@@ -929,6 +870,7 @@ class PricesOhlcvProcessor:
         *,
         existing_processing: Mapping[str, Any] | None = None,
         now_timestamp: int | None = None,
+        dirty_timeframes: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         if input_contract.get("family") != "prices_ohlcv":
             raise ValueError("Prices processor requires family=prices_ohlcv")
@@ -938,18 +880,45 @@ class PricesOhlcvProcessor:
             existing_processing=existing_processing,
             now_timestamp=now_timestamp,
         )
-        markets["general"] = rebuild_all_general_timeframes(
-            markets,
-            mode=mode,
-            existing_general=(existing_processing or {}).get("markets", {}).get("general")
-            or input_contract.get("markets", {}).get("general", {}),
-        )
         comparison              = calculate_spot_futures_comparison(markets)
-        indicators              = calculate_all_prices_indicators(markets=markets)
-        technical_crosses       = calculate_prices_crosses(indicators)
-        candlestick_patterns    = calculate_prices_patterns(markets)
-        statistical_performance = calculate_all_prices_statistics(markets=markets)
-        bias_components         = calculate_all_prices_bias_components(markets=markets, indicators=indicators)
+        dirty = set(dirty_timeframes or ())
+        previous_features = (existing_processing or {}).get("features", {})
+        windowed = mode == "incremental" and bool(dirty) and bool(previous_features)
+        if windowed:
+            indicators = deepcopy(previous_features.get("indicators", {}))
+            technical_crosses = deepcopy(previous_features.get("technical_crosses", {}))
+            candlestick_patterns = deepcopy(previous_features.get("candlestick_patterns", {}))
+            statistical_performance = deepcopy(previous_features.get("statistical_performance", {}).get("markets", {}))
+            bias_components = deepcopy(previous_features.get("bias_components", {}))
+            for market_name in CALCULATION_MARKETS:
+                indicators.setdefault(market_name, {})
+                technical_crosses.setdefault(market_name, {})
+                candlestick_patterns.setdefault(market_name, {})
+                statistical_performance.setdefault(market_name, {})
+                bias_components.setdefault(market_name, {})
+                for timeframe in dirty:
+                    records = deepcopy(markets.get(market_name, {}).get("timeframes", {}).get(timeframe, {}).get("records", []))
+                    indicators[market_name][timeframe] = calculate_prices_indicator_package(
+                        records=records, market_type=market_name, timeframe=timeframe,
+                    )
+                    candlestick_patterns[market_name][timeframe] = detect_candlestick_patterns(records=records)
+                    statistical_performance[market_name][timeframe] = calculate_prices_statistical_package(
+                        records=records, market_type=market_name, timeframe=timeframe,
+                    )
+                    bias_components[market_name][timeframe] = build_indicator_bias_components(
+                        indicator_package=indicators[market_name][timeframe],
+                        close=(records[-1]["close"] if records else None),
+                    )
+            recalculated_crosses = calculate_prices_crosses(indicators)
+            for market_name in CALCULATION_MARKETS:
+                for timeframe in dirty:
+                    technical_crosses[market_name][timeframe] = recalculated_crosses[market_name][timeframe]
+        else:
+            indicators              = calculate_all_prices_indicators(markets=markets)
+            technical_crosses       = calculate_prices_crosses(indicators)
+            candlestick_patterns    = calculate_prices_patterns(markets)
+            statistical_performance = calculate_all_prices_statistics(markets=markets)
+            bias_components         = calculate_all_prices_bias_components(markets=markets, indicators=indicators)
         quality                 = evaluate_prices_processing_quality(markets)
         quality["warnings"].extend(comparison["warnings"])
         if quality["status"] == "ok" and comparison["warnings"]:
@@ -959,6 +928,8 @@ class PricesOhlcvProcessor:
             "stage": "processing",
             "mode": mode,
             "markets": markets,
+            "confirmations": deepcopy(input_contract.get("confirmations", {})),
+            "provider_features": deepcopy(input_contract.get("provider_features", {})),
             "features": self.feature_builder.build(
                 markets=markets, comparison=comparison, indicators=indicators,
                 technical_crosses=technical_crosses,
@@ -967,6 +938,16 @@ class PricesOhlcvProcessor:
                 bias_components=bias_components,
             ),
             "quality": quality,
+            "incremental_execution": {
+                "mode": "INCREMENTAL_WINDOWED" if windowed else "FULL",
+                "dirty_timeframes": sorted(dirty),
+                "indicator_records_recomputed": (
+                    sum(len(markets[market]["timeframes"][timeframe]["records"])
+                        for market in CALCULATION_MARKETS for timeframe in dirty)
+                    if windowed else sum(len(markets[market]["timeframes"][timeframe]["records"])
+                                         for market in CALCULATION_MARKETS for timeframe in TIMEFRAME_ORDER)
+                ),
+            },
         }
 
 
@@ -975,10 +956,12 @@ def run_prices_ohlcv_processing(
     *,
     existing_processing: Mapping[str, Any] | None = None,
     now_timestamp: int | None = None,
+    dirty_timeframes: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Single public facade for Processing Prices."""
     return PricesOhlcvProcessor().run(
         input_contract,
         existing_processing=existing_processing,
         now_timestamp=now_timestamp,
+        dirty_timeframes=dirty_timeframes,
     )

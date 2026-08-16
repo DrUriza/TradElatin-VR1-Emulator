@@ -62,10 +62,10 @@ def test_contract_smoke(case):
     if case == 1:
         assert _build()["context"]["symbol"] == "BTCUSDT"
     elif case == 2:
-        assert _build()["mode"] == {"data_mode": "synthetic", "is_demo": True, "cache_status": "disabled"}
+        assert _build()["mode"] == "synthetic"
     elif case == 3:
         runtime = {**RUNTIME, "data_mode": "live", "is_demo": False}
-        assert _build(runtime=runtime)["mode"]["is_demo"] is False
+        assert _build(runtime=runtime)["mode"] == "live"
     elif case in {4, 5, 6}:
         runtime = deepcopy(RUNTIME)
         if case == 4:
@@ -160,9 +160,9 @@ def test_contract_smoke(case):
     elif case in {49, 50, 51, 52, 53, 54, 55, 56}:
         chart = _build()["charts"]["aggregate_map"]
         assertions = {49: chart["status"] == "available", 50: chart["unit"] == "provider_level",
-            51: set(chart["buckets"]) == {"status", "reason", "items"}, 52: chart["reference_price"]["value"] == 100,
-            53: bool(chart["estimated_long_curve"]), 54: bool(chart["estimated_short_curve"]),
-            55: chart["curve_metadata"] == {"source_order": "processing", "render_order": "source"},
+            51: isinstance(chart["buckets"], list), 52: chart["reference_price"]["value"] == 100,
+            53: isinstance(chart["bar_series"], list), 54: chart["chart_id"] == "aggregate_liquidation_map",
+            55: chart["visual_contract"]["hmi_calculation"] is False,
             56: isinstance(chart["central_region"]["items"], list)}
         assert assertions[case]
     elif case in {57, 58, 59}:
@@ -190,11 +190,11 @@ def test_contract_smoke(case):
         elif case == 65:
             assert chart["status"] == "unavailable"
         elif case == 66:
-            assert chart["stacked_buckets"]
+            assert chart["buckets"]
         elif case == 67:
-            assert all(item["leverage_levels"] == sorted(item["leverage_levels"], key=lambda x: float(x["leverage"])) for item in chart["stacked_buckets"])
+            assert [item["series_id"] for item in chart["bar_series"]] == ["10x", "25x", "50x", "100x"]
         else:
-            assert chart["leverage_curves"] == []
+            assert chart["visual_contract"]["hmi_calculation"] is False
     elif case == 69:
         assert "provider_price" in _build()["side_panel"]["items"][14]
     elif 70 <= case <= 73:

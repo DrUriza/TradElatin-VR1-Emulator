@@ -106,7 +106,7 @@ def test_enrichment_adds_exactly_four_requests():
 
 def test_cryptoquant_daily_params():
     request = plan()[1]
-    assert request["params"] == {"window": "day", "from": "20260319", "to": "20260727", "limit": 140, "format": "json"}
+    assert request["params"] == {"window": "day", "from": "20250801", "to": "20260727", "limit": 370, "format": "json"}
 
 
 def test_glassnode_params_are_seconds():
@@ -173,7 +173,7 @@ def test_coinglass_history_is_filtered_to_requested_range():
     payloads = responses()
     payloads["puell_multiple"]["data"].insert(0, {"timestamp": (NOW - 200 * DAY) * 1000, "price": 1, "puell_multiple": 1})
     records = output(fetcher=FakeFetcher(payloads), include_enrichment=True)["series"]["puell_multiple"]["records"]
-    assert [record["timestamp"] for record in records] == [NOW]
+    assert [record["timestamp"] for record in records] == [NOW - 200 * DAY, NOW]
 
 
 def test_null_is_unavailable_not_zero():

@@ -4,5 +4,8 @@ from processing_signals.main.main_pipeline import VERTICAL_FAMILY_HANDLERS, run_
 
 
 def test_main_registration_and_default():
-    assert "prices_ohlcv" in VERTICAL_FAMILY_HANDLERS and "liquidity_microstructure" in VERTICAL_FAMILY_HANDLERS
-    assert inspect.signature(run_main_pipeline).parameters["enabled_families"].default == ("prices_ohlcv", "liquidity_microstructure")
+    assert tuple(VERTICAL_FAMILY_HANDLERS) == (
+        "prices_ohlcv", "cvd_volume_orderflow", "open_interest_and_funding", "etf_exchange_flows",
+        "on_chain_miners", "volatility_market_regimes", "long_short_liquidations", "liquidity_microstructure",
+    )
+    assert inspect.signature(run_main_pipeline).parameters["enabled_families"].default == tuple(VERTICAL_FAMILY_HANDLERS)

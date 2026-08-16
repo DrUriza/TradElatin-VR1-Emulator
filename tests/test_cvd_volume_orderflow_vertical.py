@@ -26,9 +26,9 @@ def input_contract(helpers):
 def test_public_api_and_exact_screen(input_contract, helpers):
     output = build_cvd_volume_orderflow_screen(input_contract, display_point_limit=1, clock=lambda: helpers["REFERENCE"])
     assert tuple(output) == vertical.SCREEN_ROOT
-    assert output["schema"] == {"id": "trad_elatin.cvd_volume_orderflow.screen.v1", "version": "1.0.0"}
+    assert output["schema"] == {"id": "trad_elatin.cvd_volume_orderflow.screen.v1", "version": "1.5.0"}
     assert output["screen"]["route"] == "/cvd-orderflow"
-    assert output["context"]["markets"] == ["general", "spot", "futures"]
+    assert output["context"]["markets"] == ["spot", "futures"]
     json.dumps(output, ensure_ascii=False, allow_nan=False)
 
 

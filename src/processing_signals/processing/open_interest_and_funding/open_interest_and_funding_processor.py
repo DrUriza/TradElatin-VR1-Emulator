@@ -11,10 +11,13 @@ import numpy as np
 import pandas as pd
 
 from processing_signals.processing.math.indicators.momentum.cci import cci
+from processing_signals.processing.math.indicators.momentum.rsi import rsi
 from processing_signals.processing.math.indicators.momentum.stochastic import stochastic
+from processing_signals.processing.math.indicators.momentum.tsi import tsi
+from processing_signals.processing.math.indicators.momentum.williams_r import williams_r
 from processing_signals.processing.math.indicators.trend.adx import adx
 from processing_signals.processing.math.indicators.trend.macd import macd
-from processing_signals.processing.math.indicators.trend.moving_averages import sma
+from processing_signals.processing.math.indicators.trend.moving_averages import ema, sma, wma
 from processing_signals.processing.math.indicators.volatility.atr import atr
 from processing_signals.processing.math.indicators.volatility.bollinger_bands import bollinger_bands
 from processing_signals.processing.math.technical_cross_signals import detect_numeric_crosses
@@ -220,19 +223,65 @@ def _oi_roc(records: Sequence[Mapping[str, Any]], bounds: Sequence[tuple[int, in
     return {"roc": values}
 
 
+def _regression_channel_series(records: Sequence[Mapping[str, Any]], bounds: Sequence[tuple[int, int]], window: int = 100, deviation_multiplier: float = 2.0) -> dict[str, list[float | None]]:
+    middle = [None] * len(records)
+    upper = [None] * len(records)
+    lower = [None] * len(records)
+    n = int(window)
+    sx = n * (n - 1) / 2.0
+    sx2 = (n - 1) * n * (2 * n - 1) / 6.0
+    denominator = n * sx2 - sx * sx
+    if n <= 1 or denominator == 0:
+        return {"middle": middle, "upper": upper, "lower": lower}
+    for start, end in bounds:
+        closes = [float(records[index]["close"]) for index in range(start, end)]
+        if len(closes) < n:
+            continue
+        for local_end in range(n - 1, len(closes)):
+            ys = closes[local_end - n + 1:local_end + 1]
+            sy = sum(ys)
+            sxy = sum(index * value for index, value in enumerate(ys))
+            slope = (n * sxy - sx * sy) / denominator
+            intercept = (sy - slope * sx) / n
+            fitted = [intercept + slope * index for index in range(n)]
+            residual_std = math.sqrt(sum((value - fit) ** 2 for value, fit in zip(ys, fitted, strict=True)) / n)
+            center = fitted[-1]
+            width = float(deviation_multiplier) * residual_std
+            target = start + local_end
+            middle[target] = center
+            upper[target] = center + width
+            lower[target] = center - width
+    return {"middle": middle, "upper": upper, "lower": lower}
+
+
 def _indicator_packages(records: Sequence[Mapping[str, Any]], bounds: Sequence[tuple[int, int]], gaps: Sequence[Mapping[str, Any]],
                         timeframe: str, source_status: str) -> dict[str, Any]:
     timestamps, source = [row["timestamp"] for row in records], _source("open_interest_ohlc", timeframe)
-    ma_names = ("sma_20", "sma_50", "sma_100", "sma_200")
-    ma = _segment_calculation(records, bounds, ma_names,
-        lambda frame: {name: sma(frame["close"], int(name.split("_")[1])) for name in ma_names}, 1)
+    ma_names = ("ema_9", "ema_21", "ema_50", "sma_20", "sma_50", "sma_100", "sma_200", "wma_20", "wma_50")
+    def ma_calc(frame: pd.DataFrame) -> dict[str, pd.Series]:
+        close = frame["close"]
+        return {
+            "ema_9": ema(close, 9), "ema_21": ema(close, 21), "ema_50": ema(close, 50),
+            "sma_20": sma(close, 20), "sma_50": sma(close, 50), "sma_100": sma(close, 100), "sma_200": sma(close, 200),
+            "wma_20": wma(close, 20), "wma_50": wma(close, 50),
+        }
+    ma = _segment_calculation(records, bounds, ma_names, ma_calc, 1)
+    warmups = {"ema_9": 9, "ema_21": 21, "ema_50": 50, "sma_20": 20, "sma_50": 50, "sma_100": 100, "sma_200": 200, "wma_20": 20, "wma_50": 50}
     for start, end in bounds:
-        for name in ma_names:
-            period = int(name.split("_")[1])
+        for name, period in warmups.items():
             for index in range(start, min(end, start + period - 1)):
                 ma[name][index] = None
-    moving = _wrapper(timestamps=timestamps, series=ma, units={name: "USD" for name in ma_names}, source=source, parameters={"periods": [20, 50, 100, 200]}, warmup=200,
-        calculation="simple_moving_average_on_open_interest_close", source_status=source_status, bounds=bounds, gaps=gaps)
+    moving = _wrapper(timestamps=timestamps, series=ma, units={name: "USD" for name in ma_names}, source=source,
+        parameters={"ema_periods": [9, 21, 50], "sma_periods": [20, 50, 100, 200], "wma_periods": [20, 50]}, warmup=200,
+        calculation="ema_sma_wma_on_open_interest_close", source_status=source_status, bounds=bounds, gaps=gaps)
+
+    regression_values = _regression_channel_series(records, bounds, window=100, deviation_multiplier=2.0)
+    regression = _wrapper(timestamps=timestamps, series=regression_values,
+        units={"middle": "USD", "upper": "USD", "lower": "USD"}, source=source,
+        parameters={"window": 100, "deviation_multiplier": 2.0, "field": "close", "fit": "rolling_ordinary_least_squares", "width_basis": "population_standard_deviation_of_residuals"},
+        warmup=100, calculation="rolling_ols_regression_channel_on_open_interest_close",
+        source_status=source_status, bounds=bounds, gaps=gaps)
+
     bb_values = _segment_calculation(records, bounds, ("middle", "upper", "lower", "bandwidth", "percent_b"),
         lambda frame: _renamed_bollinger(bollinger_bands(frame["close"], 20, 2.0)), 20)
     bb = _wrapper(timestamps=timestamps, series=bb_values, units={"middle": "USD", "upper": "USD", "lower": "USD", "bandwidth": "ratio", "percent_b": "ratio"}, source=source, parameters={"period": 20, "standard_deviations": 2.0}, warmup=20,
@@ -258,10 +307,51 @@ def _indicator_packages(records: Sequence[Mapping[str, Any]], bounds: Sequence[t
         calculation="commodity_channel_index_on_open_interest_ohlc", source_status=source_status, bounds=bounds, gaps=gaps)
     roc_package = _wrapper(timestamps=timestamps, series=_oi_roc(records, bounds), units={"roc": "percent"}, source=source, parameters={"period": 12}, warmup=13,
         calculation="100*(close[t]/close[t-12]-1)", source_status=source_status, bounds=bounds, gaps=gaps)
+    rsi_package = _wrapper(timestamps=timestamps, series=_segment_calculation(records, bounds, ("rsi",),
+        lambda frame: {"rsi": rsi(frame["close"], 14)}, 14), units={"rsi": "index_0_100"}, source=source,
+        parameters={"period": 14}, warmup=14, calculation="wilder_rsi_on_open_interest_close",
+        source_status=source_status, bounds=bounds, gaps=gaps)
+    tsi_values = _segment_calculation(records, bounds, ("tsi",), lambda frame: {"tsi": tsi(frame["close"], 25, 13)}, 38)
+    tsi_signal = [None] * len(records)
+    for start, end in bounds:
+        segment = pd.Series(tsi_values["tsi"][start:end], dtype="float64")
+        values = ema(segment, 13).tolist()
+        for offset, value in enumerate(values):
+            tsi_signal[start + offset] = None if pd.isna(value) else float(value)
+    tsi_package = _wrapper(timestamps=timestamps, series={"tsi": tsi_values["tsi"], "signal": tsi_signal},
+        units={"tsi": "index_-100_100", "signal": "index_-100_100"}, source=source,
+        parameters={"slow_period": 25, "fast_period": 13, "signal_period": 13}, warmup=51,
+        calculation="double_ema_true_strength_index_with_signal_on_open_interest_close", source_status=source_status, bounds=bounds, gaps=gaps)
+    williams_package = _wrapper(timestamps=timestamps, series=_segment_calculation(records, bounds, ("williams_r",),
+        lambda frame: {"williams_r": williams_r(frame["high"], frame["low"], frame["close"], 14)}, 14),
+        units={"williams_r": "index_-100_0"}, source=source, parameters={"period": 14}, warmup=14,
+        calculation="williams_percent_r_on_open_interest_ohlc", source_status=source_status, bounds=bounds, gaps=gaps)
+    width_package = _wrapper(timestamps=timestamps, series={"bandwidth": list(bb_values["bandwidth"])},
+        units={"bandwidth": "ratio"}, source=source, parameters={"period": 20, "standard_deviations": 2.0}, warmup=20,
+        calculation="(bollinger_upper-bollinger_lower)/bollinger_middle", source_status=source_status, bounds=bounds, gaps=gaps)
+    wasserstein_values = _segment_calculation(records, bounds, ("distance",), _wasserstein, 60)
+    wasserstein_package = _wrapper(timestamps=timestamps, series=wasserstein_values, units={"distance": "ratio"}, source=source,
+        parameters={"recent_window_returns": 20, "reference_window_returns": 40}, warmup=61,
+        calculation="first_wasserstein_distance_between_recent_and_reference_open_interest_returns",
+        source_status=source_status, bounds=bounds, gaps=gaps)
     mfi_package = _wrapper(timestamps=[], series={}, units={}, source=source, parameters={"period": 14}, warmup=None, calculation=None,
         source_status=source_status, bounds=[], gaps=[], forced_status="unavailable", forced_reason="historical_volume_series_not_available")
-    return {"moving_averages": moving, "bollinger_bands": bb, "macd": macd_package, "adx": adx_package,
-        "stochastic": stochastic_package, "atr": atr_package, "cci": cci_package, "oi_roc": roc_package, "mfi": mfi_package}
+    return {"moving_averages": moving, "bollinger_bands": bb, "regression_channel": regression,
+        "bollinger_band_width": width_package, "macd": macd_package, "rsi": rsi_package, "tsi": tsi_package,
+        "adx": adx_package, "stochastic": stochastic_package, "williams_r": williams_package, "atr": atr_package,
+        "cci": cci_package, "wasserstein_distance": wasserstein_package, "oi_roc": roc_package, "mfi": mfi_package}
+
+def _wasserstein(frame: pd.DataFrame) -> dict[str, pd.Series]:
+    returns = pd.to_numeric(frame["close"], errors="coerce").pct_change()
+    values = pd.Series(index=frame.index, dtype="float64")
+    for index in range(60, len(frame)):
+        reference = np.sort(returns.iloc[index - 60:index - 20].dropna().to_numpy())
+        recent = np.sort(returns.iloc[index - 20:index].dropna().to_numpy())
+        if len(reference) and len(recent):
+            quantiles = np.linspace(0.0, 1.0, max(len(reference), len(recent)))
+            values.iloc[index] = float(np.mean(np.abs(
+                np.quantile(reference, quantiles) - np.quantile(recent, quantiles))))
+    return {"distance": values}
 
 
 def _renamed_bollinger(frame: pd.DataFrame) -> dict[str, pd.Series]:
@@ -323,10 +413,15 @@ def _events_for_timeframe(timeframe: str, oi_frame: Mapping[str, Any], funding_f
     bounds = [(item["segment_start_index"], item["segment_end_index"] + 1) for item in oi_frame["coverage"]["segments"]]
     timestamps = [row["timestamp"] for row in oi_frame["records"]]
     timestamp_indices = {timestamp: index for index, timestamp in enumerate(timestamps)}
+    ma_pairs = [
+        ("ema_9", "ema_21"), ("ema_9", "ema_50"), ("ema_21", "ema_50"),
+        ("sma_20", "sma_50"), ("sma_20", "sma_100"), ("sma_20", "sma_200"),
+        ("sma_50", "sma_100"), ("sma_50", "sma_200"), ("sma_100", "sma_200"),
+        ("wma_20", "wma_50"),
+    ]
     specifications = [
-        ("moving_average_cross", "sma_20_x_sma_50", indicators["moving_averages"], "sma_20", "sma_50", None),
-        ("moving_average_cross", "sma_50_x_sma_100", indicators["moving_averages"], "sma_50", "sma_100", None),
-        ("moving_average_cross", "sma_100_x_sma_200", indicators["moving_averages"], "sma_100", "sma_200", None),
+        *(("moving_average_cross", f"{first}_x_{second}", indicators["moving_averages"], first, second, None) for first, second in ma_pairs),
+        ("channel_cross", "regression_middle_x_bollinger_middle", indicators["regression_channel"], "middle", "middle", None),
         ("macd_signal_cross", "macd_x_signal", indicators["macd"], "macd", "signal", None),
         ("stochastic_cross", "k_x_d", indicators["stochastic"], "k", "d", None),
         ("directional_indicator_cross", "di_plus_x_di_minus", indicators["adx"], "di_plus", "di_minus", None),
@@ -334,7 +429,11 @@ def _events_for_timeframe(timeframe: str, oi_frame: Mapping[str, Any], funding_f
         ("oi_roc_zero_cross", "oi_roc_12_x_0", indicators["oi_roc"], "roc", None, 0.0),
     ]
     for event_type, pair, package, first, second, threshold in specifications:
-        first_values, second_values = package["series"].get(first, []), package["series"].get(second, []) if second else [threshold] * len(timestamps)
+        first_values = package["series"].get(first, [])
+        if event_type == "channel_cross":
+            second_values = indicators["bollinger_bands"]["series"].get("middle", [])
+        else:
+            second_values = package["series"].get(second, []) if second else [threshold] * len(timestamps)
         for start, end in bounds:
             crosses = detect_numeric_crosses(timestamps=timestamps[start:end], first_values=first_values[start:end], second_values=second_values[start:end],
                 first_series=first, second_series=second or str(int(threshold or 0)))
@@ -348,8 +447,12 @@ def _events_for_timeframe(timeframe: str, oi_frame: Mapping[str, Any], funding_f
                     adx_value = package["series"]["adx"][index]
                     values.update(di_plus=package["series"]["di_plus"][index], di_minus=package["series"]["di_minus"][index],
                         adx_value=adx_value, adx_above_25=adx_value is not None and adx_value >= 25)
+                event_first = "regression_middle" if event_type == "channel_cross" else first
+                event_second = "bollinger_middle" if event_type == "channel_cross" else second
+                if event_type == "channel_cross":
+                    values = {"regression_middle": first_values[index], "bollinger_middle": second_values[index]}
                 item = _event(timeframe=timeframe, event_type=event_type, pair=pair, source_metric="open_interest_ohlc", cross=cross,
-                    first_series=first, second_series=second, threshold=threshold, values=values, parameters=package["parameters"])
+                    first_series=event_first, second_series=event_second, threshold=threshold, values=values, parameters=package["parameters"])
                 output[item["event_id"]] = item
     funding_timestamps = [row["timestamp"] for row in funding_frame["records"]]
     funding_timestamp_indices = {timestamp: index for index, timestamp in enumerate(funding_timestamps)}
@@ -428,11 +531,13 @@ def _confirmations(input_confirmations: Any) -> dict[str, Any]:
     source = input_confirmations if isinstance(input_confirmations, Mapping) else {}
     open_interest = source.get("open_interest") if isinstance(source.get("open_interest"), Mapping) else {}
     funding_rate = source.get("funding_rate") if isinstance(source.get("funding_rate"), Mapping) else {}
+    leverage = source.get("estimated_leverage_ratio") if isinstance(source.get("estimated_leverage_ratio"), Mapping) else {}
     metadata = {
         ("open_interest", "cryptoquant"): {"provider": "cryptoquant", "endpoint_id": "open_interest", "unit": "USD", "provider_window": "hour"},
         ("open_interest", "glassnode"): {"provider": "glassnode", "endpoint_id": "futures_open_interest_sum", "unit": "USD", "provider_interval": "1h"},
         ("funding_rate", "cryptoquant"): {"provider": "cryptoquant", "endpoint_id": "funding_rates", "unit": "percent", "provider_window": "hour"},
         ("funding_rate", "glassnode"): {"provider": "glassnode", "endpoint_id": "futures_funding_rate_perpetual", "unit": "percent", "provider_interval": "1h"},
+        ("estimated_leverage_ratio", "glassnode"): {"provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio", "unit": "ratio", "provider_interval": "1h"},
     }
 
     def normalized(metric: str, provider: str, payload: Any) -> dict[str, Any]:
@@ -455,6 +560,7 @@ def _confirmations(input_confirmations: Any) -> dict[str, Any]:
 
     return {"open_interest": {provider: normalized("open_interest", provider, open_interest.get(provider)) for provider in ("cryptoquant", "glassnode")},
         "funding_rate": {provider: normalized("funding_rate", provider, funding_rate.get(provider)) for provider in ("cryptoquant", "glassnode")},
+        "estimated_leverage_ratio": {"glassnode": normalized("estimated_leverage_ratio", "glassnode", leverage.get("glassnode"))},
         "comparisons": {"open_interest": {"status": "unavailable", "reason": "provider_scope_not_proven_comparable"},
                         "funding_rate": {"status": "unavailable", "reason": "provider_scope_not_proven_comparable"}}}
 
@@ -474,13 +580,13 @@ def _availability(series: Mapping[str, Any], indicators: Mapping[str, Any], snap
         "oi_delta": _aggregate({tf: frame["derived"]["oi_delta"] for tf, frame in oi_frames.items()}),
         "oi_change_24h_derived": _aggregate({tf: frame["derived"]["oi_change_24h"] for tf, frame in oi_frames.items()}),
         "oi_change_24h_reported": copy.deepcopy(snapshot_metrics["reported_24h_percent"])}
-    for key in ("moving_averages", "bollinger_bands", "macd", "adx", "stochastic", "atr", "cci", "oi_roc", "mfi"):
+    for key in ("moving_averages", "bollinger_bands", "regression_channel", "bollinger_band_width", "macd", "rsi", "tsi", "adx",
+                "stochastic", "williams_r", "atr", "cci", "wasserstein_distance", "oi_roc", "mfi"):
         availability[key] = _aggregate({tf: frame[key] for tf, frame in indicator_frames.items()})
-    availability.update({"open_interest_market_cap_ratio": {"status": "unavailable", "reason": "market_cap_source_not_configured"},
-        "contract_type_split": {"status": "unavailable", "reason": "dated_futures_open_interest_not_separated_by_current_sources"},
+    availability.update({"contract_type_split": {"status": "unavailable", "reason": "dated_futures_open_interest_not_separated_by_current_sources"},
         "funding_8h_aggregate": {"status": "unavailable", "reason": "cross_exchange_8h_weighting_not_defined"},
         "confirmations": {metric: {provider: payload.get("status", "unavailable") for provider, payload in confirmations[metric].items()}
-                          for metric in ("open_interest", "funding_rate")}})
+                          for metric in ("open_interest", "funding_rate", "estimated_leverage_ratio")}})
     return availability
 
 
@@ -488,18 +594,27 @@ def _quality(series: Mapping[str, Any], indicators: Mapping[str, Any], snapshots
     source_statuses = {f"{metric}.{timeframe}": frame["status"] for metric, metric_payload in series.items()
         for timeframe, frame in metric_payload["timeframes"].items()}
     calculation_statuses = {f"{name}.{timeframe}": package[name]["status"] for timeframe, package in indicators["open_interest"]["timeframes"].items()
-        for name in ("moving_averages", "bollinger_bands", "macd", "adx", "stochastic", "atr", "cci", "oi_roc")}
+        for name in ("moving_averages", "bollinger_bands", "regression_channel", "bollinger_band_width", "macd", "rsi", "tsi", "adx",
+                     "stochastic", "williams_r", "atr", "cci", "wasserstein_distance", "oi_roc")}
     calculation_statuses.update({f"oi_delta.{timeframe}": frame["derived"]["oi_delta"]["status"] for timeframe, frame in series["open_interest_ohlc"]["timeframes"].items()})
-    calculation_statuses.update({f"oi_change_24h.{timeframe}": frame["derived"]["oi_change_24h"]["status"] for timeframe, frame in series["open_interest_ohlc"]["timeframes"].items()})
+    oi_change_statuses = {f"oi_change_24h.{timeframe}": frame["derived"]["oi_change_24h"]["status"]
+        for timeframe, frame in series["open_interest_ohlc"]["timeframes"].items()}
+    calculation_statuses.update(oi_change_statuses)
+    optional_calculations = set()
+    for timeframe, frame in series["open_interest_ohlc"]["timeframes"].items():
+        records = frame.get("records", [])
+        if len(records) < 2 or records[-1]["timestamp"] - records[0]["timestamp"] < 86_400:
+            optional_calculations.add(f"oi_change_24h.{timeframe}")
     gaps_present = any(frame["coverage"]["gaps"] for metric in series.values() for frame in metric["timeframes"].values())
-    required_statuses = list(source_statuses.values()) + list(calculation_statuses.values())
+    required_calculation_statuses = [value for key, value in calculation_statuses.items() if key not in optional_calculations]
+    required_statuses = list(source_statuses.values()) + required_calculation_statuses
     if any(status == "invalid" for status in source_statuses.values()):
         status = "invalid"
     elif any(item != "available" for item in required_statuses) or gaps_present or any(snapshots[name]["status"] != "available" for name in ("open_interest_by_exchange", "funding_rate_by_exchange")):
         status = "partial"
     else:
         status = "ok"
-    optional_invalid = [f"{metric}.{provider}" for metric in ("open_interest", "funding_rate") for provider, payload in confirmations[metric].items()
+    optional_invalid = [f"{metric}.{provider}" for metric in ("open_interest", "funding_rate", "estimated_leverage_ratio") for provider, payload in confirmations[metric].items()
         if not isinstance(payload, Mapping) or payload.get("status") == "invalid"]
     snapshot_warnings = [f"snapshot_{name}_invalid_records" for name in
         ("open_interest_by_exchange", "funding_rate_by_exchange", "options_open_interest")
@@ -509,6 +624,7 @@ def _quality(series: Mapping[str, Any], indicators: Mapping[str, Any], snapshots
     return {"status": status, "contract_complete": True,
         "data_complete": all(item == "available" for item in required_statuses) and not optional_invalid and not snapshot_warnings and all(value.get("status") != "unavailable" for value in availability.values() if isinstance(value, Mapping)),
         "source_statuses": source_statuses, "calculation_statuses": calculation_statuses,
+        "optional_calculations": sorted(optional_calculations),
         "records_processed": {metric: {timeframe: frame["coverage"]["records"] for timeframe, frame in payload["timeframes"].items()} for metric, payload in series.items()},
         "gaps_present": gaps_present, "warnings": snapshot_warnings + [f"optional_confirmation_invalid:{item}" for item in optional_invalid], "errors": []}
 

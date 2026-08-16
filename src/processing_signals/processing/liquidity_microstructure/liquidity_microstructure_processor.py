@@ -65,7 +65,11 @@ def _validate_dataset(dataset: Any, *, events: bool = False, kind: str) -> None:
             if not isinstance(row.get("event_id"), str) or not row["event_id"] or row.get("side") not in {"buy", "sell"}:
                 raise ValueError("invalid_trade_event")
             _number(row.get("price"), "price", positive=True)
-            _number(row.get("volume_usd"), "volume_usd", nonnegative=True)
+            if "volume_usd" in row:
+                _number(row.get("volume_usd"), "volume_usd", nonnegative=True)
+            else:
+                _number(row.get("quantity_base"), "quantity_base", nonnegative=True)
+                _number(row.get("notional_quote"), "notional_quote", nonnegative=True)
         elif kind == "orderbook":
             if row.get("market_type") not in MARKETS or row.get("timeframe") not in TIMEFRAMES:
                 raise ValueError("invalid_orderbook_dimensions")
@@ -105,6 +109,8 @@ def validate_liquidity_microstructure_input(input_contract: Mapping[str, Any]) -
         _validate_dataset(provider["orderbook"][market], kind="orderbook")
         _validate_dataset(provider["order_depth"][market], kind="order_depth")
         _validate_dataset(provider["large_trades"][market], events=True, kind="trades")
+        if "whale_orders" in provider:
+            _validate_dataset(provider["whale_orders"][market], events=True, kind="trades")
     _validate_dataset(provider["whale_activity"], kind="whale")
     _validate_dataset(provider["market_history"], kind="market")
     json.dumps(input_contract, ensure_ascii=False, allow_nan=False)
@@ -119,7 +125,7 @@ def _orderbooks(dataset: Mapping[str, Any], market: str, impact_quantity: float)
     path = f"providers.coinglass.orderbook.{market}"
     timeframes = {}
     for timeframe in TIMEFRAMES:
-        source = [record for record in dataset["records"] if record.get("timeframe") == timeframe]
+        source = [record for record in dataset["records"] if record.get("timeframe") == timeframe][-100:]
         history = []
         for record in source:
             base = {key: record.get(key) for key in ("timestamp", "market_type", "exchange", "symbol", "timeframe")}
@@ -158,6 +164,8 @@ def _depth(dataset: Mapping[str, Any], market: str) -> dict[str, Any]:
     timeframes = {}
     for timeframe in TIMEFRAMES:
         source = [record for record in dataset["records"] if record["timeframe"] == timeframe]
+        if timeframe == "1h":
+            source = source[-100 * len(DEPTH_RANGES_PERCENT):]
         direct = [_direct_depth(record, dataset, path) for record in source]
         by_key = {(record["timestamp"], record["range_percent"]): record for record in source}
         derived = []
@@ -274,6 +282,8 @@ def _refresh_aggregate_statuses(markets: dict[str, Any], whale: dict[str, Any]) 
 
 def _trades(dataset: Mapping[str, Any], market: str, reference: int) -> dict[str, Any]:
     observed = [enrich_trade_event(event) for event in dataset["events"]]
+    for event in observed:
+        event["age_seconds"] = max(0, reference - int(event["timestamp"]))
     large = [event for event in observed if event["meets_configured_threshold"]]
     windows = {name: aggregate_trade_window(large, window_end=reference, window_seconds=seconds)
                for name, seconds in LARGE_TRADE_WINDOWS_SECONDS.items()}
@@ -287,10 +297,27 @@ def _trades(dataset: Mapping[str, Any], market: str, reference: int) -> dict[str
                                       "threshold_flag_filter_and_window_aggregation", "usd_and_base", LARGE_TRADE_WINDOWS_SECONDS)}
 
 
+
+def _whale_orders(dataset: Mapping[str, Any], market: str, reference: int) -> dict[str, Any]:
+    events = []
+    for raw in dataset.get("events", []):
+        row = deepcopy(dict(raw))
+        row["age_seconds"] = max(0, reference - int(row["timestamp"]))
+        events.append(row)
+    events.sort(key=lambda row: (row["timestamp"], row["notional_quote"]), reverse=True)
+    status = dataset.get("status", "unavailable")
+    return {
+        "status": status, "reason": dataset.get("reason"), "events": events,
+        "current_active": [row for row in events if row.get("order_state") == "active"],
+        "provenance": _provenance(f"providers.coinglass.whale_orders.{market}", dataset,
+                                  max((row["timestamp"] for row in events), default=None),
+                                  "provider_large_limit_orders", "usd_and_base", {}),
+    }
+
 def _whale(dataset: Mapping[str, Any], lookback: int) -> dict[str, Any]:
     timeframes = {}
     for timeframe in TIMEFRAMES:
-        records = [deepcopy(record) for record in dataset["records"] if record["timeframe"] == timeframe]
+        records = [deepcopy(record) for record in dataset["records"] if record["timeframe"] == timeframe][-100:]
         values = [float(record["whale_index_value"]) for record in records]
         current, previous = (records[-1] if records else None), (records[-2] if len(records) > 1 else None)
         mean, std, zscore = rolling_mean(values, lookback), rolling_std(values, lookback), rolling_z_score(values, lookback)
@@ -303,6 +330,84 @@ def _whale(dataset: Mapping[str, Any], lookback: int) -> dict[str, Any]:
                                                 "rolling_mean_20": mean, "rolling_std_20": std, "rolling_z_score_20": zscore}}
     status = "available" if all(value["status"] == "available" for value in timeframes.values()) else "partial"
     return {"status": status, "reason": None if status == "available" else "one_or_more_timeframes_unavailable", "timeframes": timeframes}
+
+
+def _historical_market_join(prices_input: Mapping[str, Any], provider: Mapping[str, Any]) -> dict[str, Any]:
+    """Join normalized 1h inputs without filling a missing regular source."""
+    try:
+        price_source = prices_input["confirmations"]["glassnode"]["price_ohlc"]
+        cap_source = prices_input["provider_features"]["market_cap"]
+    except (KeyError, TypeError):
+        return {"status": "unavailable", "reason": "normalized_glassnode_context_unavailable", "records": [],
+                "source_data_as_of": None, "provenance": {"providers": ["glassnode", "coinglass"]}}
+
+    prices = {row["timestamp"]: row for row in price_source.get("records", [])}
+    caps = {row["timestamp"]: row for row in cap_source.get("records", [])}
+    books = {market: {row["timestamp"]: row for row in provider["orderbook"][market].get("records", [])
+                      if row.get("timeframe") == "1h" and row.get("bid_levels") and row.get("ask_levels")}
+             for market in MARKETS}
+    depths = {
+        market: {row["timestamp"]: row for row in provider["order_depth"][market].get("records", [])
+                 if row.get("timeframe") == "1h" and row.get("range_percent") == REFERENCE_DEPTH_RANGE_PERCENT}
+        for market in MARKETS
+    }
+    whales = {row["timestamp"]: row for row in provider["whale_activity"].get("records", []) if row.get("timeframe") == "1h"}
+    required_sets = [set(prices), set(caps), set(whales)]
+    required_sets.extend(set(books[market]) for market in MARKETS)
+    required_sets.extend(set(depths[market]) for market in MARKETS)
+    timestamps = sorted(set.intersection(*required_sets)) if all(required_sets) else []
+
+    trade_bins: dict[int, dict[str, float | int]] = {}
+    for market in MARKETS:
+        for event in provider["large_trades"][market].get("events", []):
+            bucket = int(event["timestamp"]) // 3600 * 3600
+            totals = trade_bins.setdefault(bucket, {"buy": 0.0, "sell": 0.0, "count": 0})
+            totals[str(event["side"])] += float(event.get("volume_usd", 0.0))
+            totals["count"] += 1
+
+    records = []
+    for timestamp in timestamps:
+        spot_book = books["spot"][timestamp]
+        bid_prices = [float(level["price"]) for level in spot_book["bid_levels"] if float(level["quantity"]) > 0]
+        ask_prices = [float(level["price"]) for level in spot_book["ask_levels"] if float(level["quantity"]) > 0]
+        if not bid_prices or not ask_prices:
+            continue
+        best_bid, best_ask = max(bid_prices), min(ask_prices)
+        if best_bid >= best_ask:
+            continue
+        mid_price = (best_bid + best_ask) / 2
+        spread = best_ask - best_bid
+        spot_depth = depths["spot"][timestamp]
+        trades = trade_bins.get(timestamp, {"buy": 0.0, "sell": 0.0, "count": 0})
+        buy, sell = float(trades["buy"]), float(trades["sell"])
+        records.append({
+            "timestamp": timestamp, "price": float(prices[timestamp]["close"]),
+            "market_cap": float(caps[timestamp]["value"]),
+            "best_bid": best_bid, "best_ask": best_ask, "mid_price": mid_price, "spread": spread,
+            "spread_bps": 10_000 * spread / mid_price,
+            "bid_depth": float(spot_depth["bids_usd"]), "ask_depth": float(spot_depth["asks_usd"]),
+            "depth_range_percent": REFERENCE_DEPTH_RANGE_PERCENT,
+            "whale_index_value": float(whales[timestamp]["whale_index_value"]),
+            "large_trade_buy_notional": buy, "large_trade_sell_notional": sell,
+            "large_trade_delta": clean_zero(buy - sell), "large_trade_count": int(trades["count"]),
+            "status": "available",
+        })
+    as_of_candidates = [max(values) for values in (prices, caps, whales, *books.values(), *depths.values()) if values]
+    effective_as_of = min(as_of_candidates) if as_of_candidates else None
+    records = [row for row in records if effective_as_of is not None and row["timestamp"] <= effective_as_of]
+    return {
+        "status": "available" if records else "unavailable",
+        "reason": None if records else "no_common_hourly_buckets", "records": records,
+        "source_data_as_of": effective_as_of,
+        "provenance": {"providers": ["glassnode", "coinglass"], "timezone": "UTC",
+                       "bucket_seconds": 3600, "bucket_semantics": "closed_hourly",
+                       "staleness_tolerance_seconds": 3600, "forward_fill": False,
+                       "reference_depth_range_percent": REFERENCE_DEPTH_RANGE_PERCENT,
+                       "canonical_market": "spot", "effective_as_of_rule": "minimum_source_data_as_of",
+                       "source_coverage": {"price": len(prices), "market_cap": len(caps),
+                                           "orderbook_spot": len(books["spot"]), "orderbook_perpetual": len(books["perpetual"]),
+                                           "depth_spot": len(depths["spot"]), "depth_perpetual": len(depths["perpetual"]),
+                                           "whale_index": len(whales)}}}
 
 
 def _market_history(dataset: Mapping[str, Any], reference: int) -> dict[str, Any]:
@@ -320,10 +425,13 @@ def _market_history(dataset: Mapping[str, Any], reference: int) -> dict[str, Any
                                 "reason": None if historical else "insufficient_market_history",
                                 "source_timestamp": historical["timestamp"] if historical else None,
                                 "change_percent": clean_zero(100 * (current["price"] / historical["price"] - 1)) if historical else None}
+    provenance = _provenance("providers.coinglass.market_history", dataset, current["timestamp"] if current else None,
+                             "historical_observation_at_or_before", "percent", {"windows_days": MARKET_HISTORY_WINDOWS_DAYS})
+    if isinstance(dataset.get("provenance"), Mapping):
+        provenance["historical_join"] = deepcopy(dict(dataset["provenance"]))
     return {"status": "available" if current else "unavailable", "reason": None if current else dataset.get("reason"),
             "records": enriched, "current": current, "changes": changes,
-            "provenance": _provenance("providers.coinglass.market_history", dataset, current["timestamp"] if current else None,
-                                      "historical_observation_at_or_before", "percent", {"windows_days": MARKET_HISTORY_WINDOWS_DAYS})}
+            "provenance": provenance}
 
 
 def _comparison(markets: Mapping[str, Any]) -> dict[str, Any]:
@@ -359,8 +467,9 @@ def _comparison(markets: Mapping[str, Any]) -> dict[str, Any]:
 def _source_selection(provider: Mapping[str, Any]) -> dict[str, Any]:
     result = {}
     for market in MARKETS:
-        for name, role in (("orderbook", "canonical"), ("order_depth", "canonical"), ("large_trades", "canonical")):
-            dataset = provider[name][market]
+        for name, role in (("orderbook", "canonical"), ("order_depth", "canonical"),
+                           ("large_trades", "executed_footprint"), ("whale_orders", "large_limit_orders")):
+            dataset = provider.get(name, {}).get(market, _empty_events_dataset())
             result[f"{name}_{market}"] = {"provider": "coinglass", "dataset_path": f"providers.coinglass.{name}.{market}",
                                            "source_status": dataset["status"], "selected": True, "role": role, "fallback_applied": False}
     for name, role in (("whale_activity", "proprietary_indicator"), ("market_history", "context")):
@@ -380,7 +489,13 @@ def _invalid_output(input_contract: Mapping[str, Any], execution_timestamp: int,
                         "missing_features": [], "partial_features": [], "unavailable_features": [], "invalid_features": [], "warnings": [], "errors": []}}
 
 
+
+def _empty_events_dataset(reason: str = "provider_dataset_not_available") -> dict[str, Any]:
+    return {"status": "unavailable", "reason": reason, "events": [], "records": [],
+            "source_data_as_of": None, "provenance": {"provider": "coinglass"}, "warnings": [], "errors": []}
+
 def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, existing_processing: Mapping[str, Any] | None = None,
+                                     prices_input_context: Mapping[str, Any] | None = None,
                                      now_timestamp: int | None = None, config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     input_copy, config_copy = deepcopy(input_contract), deepcopy(dict(config or {}))
     validate_liquidity_microstructure_input(input_copy)
@@ -396,10 +511,15 @@ def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, exist
     if input_copy["quality"]["status"] == "invalid":
         return _invalid_output(input_copy, execution, configuration)
     provider, reference = input_copy["providers"]["coinglass"], input_copy["reference_timestamp"]
+    whale_provider = provider.get("whale_orders", {})
     markets = {market: {"orderbook": _orderbooks(provider["orderbook"][market], market, impact_quantity),
                         "order_depth": _depth(provider["order_depth"][market], market),
-                        "large_trades": _trades(provider["large_trades"][market], market, reference)} for market in MARKETS}
-    whale, history = _whale(provider["whale_activity"], lookback), _market_history(provider["market_history"], reference)
+                        "large_trades": _trades(provider["large_trades"][market], market, reference),
+                        "whale_orders": _whale_orders(whale_provider.get(market, _empty_events_dataset()), market, reference)} for market in MARKETS}
+    whale = _whale(provider["whale_activity"], lookback)
+    market_dataset = (_historical_market_join(prices_input_context, provider)
+                      if isinstance(prices_input_context, Mapping) else provider["market_history"])
+    history = _market_history(market_dataset, reference)
     previous = deepcopy(existing_processing) if existing_processing is not None else None
     compatible_previous = (isinstance(previous, Mapping) and previous.get("family") == "liquidity_microstructure" and
                            previous.get("configuration") == configuration and previous.get("context") == input_copy["context"])
@@ -411,9 +531,15 @@ def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, exist
     if compatible_previous:
         whale, history = _preserve_granular(provider=provider, markets=markets, whale=whale, history=history, previous=previous)
         _refresh_aggregate_statuses(markets, whale)
+        if isinstance(prices_input_context, Mapping):
+            history = _market_history(_historical_market_join(prices_input_context, provider), reference)
     comparison = _comparison(markets)
-    required = {f"markets.{market}.{feature}": markets[market][feature]["status"] for market in MARKETS for feature in ("orderbook", "order_depth", "large_trades")}
-    required.update({"whale_activity": whale["status"], "market_history": history["status"]})
+    required = {f"markets.{market}.{feature}": markets[market][feature]["status"] for market in MARKETS
+                for feature in ("orderbook", "order_depth")}
+    required.update({"whale_activity": whale["status"]})
+    optional = {"market_history": history["status"],
+                **{f"markets.{market}.large_trades": markets[market]["large_trades"]["status"] for market in MARKETS},
+                **{f"markets.{market}.whale_orders": markets[market]["whale_orders"]["status"] for market in MARKETS}}
     invalid = [name for name, status in required.items() if status == "invalid"]
     partial = [name for name, status in required.items() if status == "partial"]
     unavailable = [name for name, status in required.items() if status == "unavailable"]
@@ -426,8 +552,9 @@ def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, exist
               "features": build_liquidity_microstructure_features(markets=markets, whale_activity=whale,
                                                                    market_history=history, comparison=comparison),
               "quality": {"status": quality_status, "required_features": list(required),
-                          "optional_features": ["markets.spot.orderbook.market_impact", "markets.perpetual.orderbook.market_impact",
+                          "optional_features": ["market_history", "markets.spot.orderbook.market_impact", "markets.perpetual.orderbook.market_impact",
                                                 "comparison.spot_perpetual", "whale_activity.rolling_statistics"],
+                          "optional_feature_statuses": optional,
                           "missing_features": [], "partial_features": partial, "unavailable_features": unavailable,
                           "invalid_features": invalid, "warnings": [], "errors": []}}
     json.dumps(output, ensure_ascii=False, allow_nan=False)

@@ -15,7 +15,7 @@ from processing_signals.main.volatility_market_regimes import (
     serialize_volatility_market_regimes_screen,
     write_volatility_market_regimes_screen_atomic,
 )
-from tests.test_volatility_market_regimes_input_vertical import NOW, fetcher
+from test_volatility_market_regimes_input_vertical import NOW, fetcher
 
 
 RUNTIME = {"data_mode": "synthetic", "is_demo": True, "generated_at": "2027-01-15T08:00:00Z", "updated_at": "2027-01-15T08:01:00Z"}
@@ -38,8 +38,8 @@ def test_bootstrap_root_stages_runtime_and_no_raw():
     output = _run(selected_range="4h")
     assert list(output) == ["input", "processing", "classification", "screen"]
     assert [output[name]["mode"] for name in ("input", "processing", "classification")] == ["bootstrap"] * 3
-    assert output["input"]["stage"] == "input_preprocessed"
-    assert output["screen"]["schema_version"] == "0.1.0"
+    assert output["input"]["stage"] == "input"
+    assert output["screen"]["schema_version"] == "0.2.0"
     assert output["screen"]["context"]["selected_display_range"] == "4h"
     assert output["screen"]["badges"][0]["badge_id"] == "demo"
     assert "raw" not in output
@@ -78,10 +78,9 @@ def test_recovery_requests_are_derived_merged_and_ordered():
     previous = _run()["input"]
     previous["providers"]["coinglass"]["top_position_ratio"]["gap_ranges"] = [
         {"after_timestamp": 10, "before_timestamp": 20}, {"after_timestamp": 20, "before_timestamp": 30}]
-    previous["providers"]["deribit"]["volatility_index"]["gap_ranges"] = [{"after_timestamp": 5, "before_timestamp": 8}]
     assert derive_volatility_market_regimes_recovery_requests(previous) == [
         {"provider": "coinglass", "endpoint_id": "top_position_long_short_ratio", "start_timestamp": 10, "end_timestamp": 30},
-        {"provider": "deribit", "endpoint_id": "volatility_index", "start_timestamp": 5, "end_timestamp": 8}]
+]
 
 
 def test_output_is_deterministic_immutable_and_strict_json():

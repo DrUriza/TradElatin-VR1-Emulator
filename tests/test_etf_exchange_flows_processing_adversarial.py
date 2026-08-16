@@ -25,7 +25,13 @@ def test_core_contract_invariants(case_id):
     assert result["features"]["etf"]["net_flow_usd_latest"]["value"] == -120
     assert result["features"]["etf"]["net_flow_btc_latest"]["value"] == -2
     assert result["features"]["pressure"]["flow_24h"]["timestamp"] == NOW
-    assert not any(token in serialized for token in ('"signal"', '"classification"', '"confidence"', '"display_value"', '"color"'))
+    # SP 1.3 precomputes technical-analysis signal *lines* (MACD/TSI) in
+    # Processing.  Those are numeric series, not classification/presentation
+    # signals, so only classification/presentation tokens remain forbidden here.
+    assert not any(token in serialized for token in ('"classification"', '"confidence"', '"display_value"', '"color"'))
+    ta = result.get("technical_analysis", {}).get("indicators", {})
+    assert "signal" in ta.get("macd", {}).get("series", {})
+    assert "signal" in ta.get("tsi", {}).get("series", {})
 
 
 def test_etf_p03_root_validation():

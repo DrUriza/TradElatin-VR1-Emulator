@@ -13,32 +13,34 @@ GLASSNODE_PROVIDER       = "glassnode"
 CRYPTOQUANT_PROVIDER     = "cryptoquant"
 COINGLASS_PROVIDER       = "coinglass"
 VALID_MODES              = {"bootstrap", "incremental", "recovery"}
-CORE_METRIC_IDS          = ("miner_reserve", "sopr", "hashrate", "difficulty", "mpi")
-SCREEN_EXTENSION_METRIC_IDS = ("miner_entities", "miner_outflow_by_pool", "miners_unspent_supply", "utxo_age_distribution",
+CORE_METRIC_IDS          = ("miner_reserve", "sopr", "hashrate", "difficulty", "miner_net_position_change", "mpi")
+SCREEN_EXTENSION_METRIC_IDS = ("miner_entities", "miner_outflow_by_pool", "miner_outflow_total", "miners_unspent_supply", "utxo_age_distribution",
                                "miner_revenue_total_usd", "miner_block_reward_revenue_usd", "miner_revenue_from_fees", "nupl")
-TIME_SERIES_EXTENSION_IDS   = ("miners_unspent_supply", "utxo_age_distribution", "miner_revenue_total_usd",
+TIME_SERIES_EXTENSION_IDS   = ("miner_outflow_total", "miners_unspent_supply", "utxo_age_distribution", "miner_revenue_total_usd",
                                "miner_block_reward_revenue_usd", "miner_revenue_from_fees", "nupl")
 COLLECTION_EXTENSION_IDS    = ("miner_entities", "miner_outflow_by_pool")
 UTXO_AGE_BANDS = ("0d_1d", "1d_1w", "1w_1m", "1m_3m", "3m_6m", "6m_12m", "12m_18m", "18m_2y", "2y_3y", "3y_5y", "5y_7y", "7y_10y", "10y_inf")
 DEFAULT_INCLUDE_SCREEN_EXTENSIONS = True
 ENRICHMENT_METRIC_IDS    = ("puell_multiple", "sth_sopr", "lth_sopr")
-BOOTSTRAP_HISTORY_DAYS   = 130
-BOOTSTRAP_LIMIT          = 140
+BOOTSTRAP_HISTORY_DAYS   = 730
+BOOTSTRAP_LIMIT          = 740
 INCREMENTAL_OVERLAP_DAYS = 7
 INCREMENTAL_LIMIT        = 14
 SECONDS_PER_DAY          = 86_400
-RECOVERY_WARMUP_DAYS     = {"miner_reserve": 31, "sopr": 7, "hashrate": 2, "difficulty": 2, "mpi": 2,
+RECOVERY_WARMUP_DAYS     = {"miner_reserve": 31, "sopr": 7, "hashrate": 2, "difficulty": 2, "miner_net_position_change": 2, "mpi": 2,
                             **{metric_id: 2 for metric_id in (*TIME_SERIES_EXTENSION_IDS, "miner_outflow_by_pool")}}
 
 ENDPOINTS = {
     "miner_reserve": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "balance_miners_sum", "path": "/v1/metrics/distribution/balance_miners_sum",
-                      "source_field": "v", "raw_shape": "glassnode_list_t_v_scalar", "required": True},
-    "sopr": {"provider": CRYPTOQUANT_PROVIDER, "endpoint_id": "sopr", "path": "/btc/market-indicator/sopr", "source_field": "sopr",
-             "raw_shape": "cryptoquant_status_result_data", "required": True},
+                      "source_field": "v", "raw_shape": "glassnode_list_t_v_scalar", "required": True, "interval": "1h"},
+    "sopr": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "sopr", "path": "/v1/metrics/indicators/sopr", "source_field": "v",
+             "raw_shape": "glassnode_list_t_v_scalar", "required": True, "interval": "1h"},
     "hashrate": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "hash_rate_mean", "path": "/v1/metrics/mining/hash_rate_mean", "source_field": "v",
-                 "raw_shape": "glassnode_list_t_v_scalar", "required": True},
-    "difficulty": {"provider": CRYPTOQUANT_PROVIDER, "endpoint_id": "difficulty", "path": "/btc/network-data/difficulty", "source_field": "difficulty",
-                   "raw_shape": "cryptoquant_status_result_data", "required": True},
+                 "raw_shape": "glassnode_list_t_v_scalar", "required": True, "interval": "1h"},
+    "difficulty": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "difficulty_latest", "path": "/v1/metrics/mining/difficulty_latest", "source_field": "v",
+                   "raw_shape": "glassnode_list_t_v_scalar", "required": True, "interval": "1h"},
+    "miner_net_position_change": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "balance_miners_change", "path": "/v1/metrics/distribution/balance_miners_change",
+                                  "source_field": "v", "raw_shape": "glassnode_list_t_v_scalar", "required": True, "interval": "24h"},
     "mpi": {"provider": CRYPTOQUANT_PROVIDER, "endpoint_id": "mpi", "path": "/btc/flow-indicator/mpi", "source_field": "mpi",
             "raw_shape": "cryptoquant_status_result_data", "required": True},
     "puell_multiple": {"provider": COINGLASS_PROVIDER, "endpoint_id": "puell_multiple", "path": "/api/index/puell-multiple", "source_field": "puell_multiple",
@@ -51,6 +53,8 @@ ENDPOINTS = {
                        "raw_shape": "cryptoquant_status_result_data", "required": True, "request_kind": "entity_catalog"},
     "miner_outflow_by_pool": {"provider": CRYPTOQUANT_PROVIDER, "endpoint_id": "miner_outflow", "path": "/btc/miner-flows/outflow",
                               "raw_shape": "cryptoquant_status_result_data", "required": True, "request_kind": "dynamic_fanout"},
+    "miner_outflow_total": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "transfers_volume_from_miners_sum", "path": "/v1/metrics/transactions/transfers_volume_from_miners_sum",
+                            "source_field": "v", "raw_shape": "glassnode_list_t_v_scalar", "required": True, "interval": "24h"},
     "miners_unspent_supply": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "miners_unspent_supply", "path": "/v1/metrics/mining/miners_unspent_supply",
                               "source_field": "v", "raw_shape": "glassnode_list_t_v_scalar", "required": True},
     "utxo_age_distribution": {"provider": CRYPTOQUANT_PROVIDER, "endpoint_id": "utxo_age_distribution", "path": "/btc/network-indicator/utxo-age-distribution",
@@ -109,8 +113,8 @@ def build_cryptoquant_daily_params(*, from_timestamp: int, to_timestamp: int, li
         raise ValueError("limit must be positive")
     return {"window": "day", "from": start, "to": end, "limit": int(limit), "format": "json"}
 
-def build_glassnode_daily_params(*, asset: str, from_timestamp: int, to_timestamp: int, native_currency: bool = False) -> dict[str, Any]:
-    params = {"a": str(asset).upper(), "i": "24h", "s": _valid_timestamp(from_timestamp, "from_timestamp"), "u": _valid_timestamp(to_timestamp, "to_timestamp")}
+def build_glassnode_daily_params(*, asset: str, from_timestamp: int, to_timestamp: int, native_currency: bool = False, interval: str = "24h") -> dict[str, Any]:
+    params = {"a": str(asset).upper(), "i": str(interval), "s": _valid_timestamp(from_timestamp, "from_timestamp"), "u": _valid_timestamp(to_timestamp, "to_timestamp")}
     if native_currency:
         params["c"] = "NATIVE"
     return params
@@ -162,7 +166,8 @@ def _build_request(metric_id: str, start: int, end: int, limit: int, asset: str 
         params = build_cryptoquant_daily_params(from_timestamp=start, to_timestamp=end, limit=limit)
     elif endpoint["provider"] == GLASSNODE_PROVIDER:
         params = build_glassnode_daily_params(asset=asset, from_timestamp=start, to_timestamp=end,
-                                              native_currency=metric_id in {"miner_reserve", "miners_unspent_supply"})
+                                              native_currency=metric_id in {"miner_reserve", "miners_unspent_supply"},
+                                              interval=str(endpoint.get("interval", "24h")))
         if metric_id in {"miner_revenue_total_usd", "miner_block_reward_revenue_usd"}:
             params["c"] = "USD"
     else:
@@ -217,12 +222,15 @@ def build_on_chain_miners_fetch_plan(*, mode: str, reference_timestamp: int, exi
     for metric_id in metric_ids:
         last = (_existing_pool_last_timestamp(existing_contract) if metric_id == "miner_outflow_by_pool" else _last_existing_timestamp(existing_contract, metric_id)) if mode == "incremental" else None
         if last is None:
-            start = reference_day - BOOTSTRAP_HISTORY_DAYS * SECONDS_PER_DAY
-            limit = BOOTSTRAP_LIMIT
+            extra_warmup_days = 6 if metric_id == "sopr" else 0
+            start = reference_day - (BOOTSTRAP_HISTORY_DAYS + extra_warmup_days) * SECONDS_PER_DAY
+            limit = BOOTSTRAP_LIMIT + extra_warmup_days
         else:
             start = max(0, _utc_day(last) - INCREMENTAL_OVERLAP_DAYS * SECONDS_PER_DAY)
             limit = INCREMENTAL_LIMIT
-        requests.append(_build_request(metric_id, start, reference_day, limit))
+        endpoint = ENDPOINTS[metric_id]
+        request_end = reference_timestamp if endpoint.get("provider") == GLASSNODE_PROVIDER and str(endpoint.get("interval", "24h")) != "24h" else reference_day
+        requests.append(_build_request(metric_id, start, request_end, limit))
     return requests
 
 def _safe_error_message(exc: Exception) -> str:
@@ -331,7 +339,8 @@ class OnChainMinersRawExtractor:
                 raw[request["metric_id"]] = payload
                 if request["metric_id"] == "miner_entities":
                     entity_payload = payload
-        return {"family": ON_CHAIN_MINERS_FAMILY, "stage": "raw_input", "mode": mode,
+        return {"schema": {"id": "trad_elatin.on_chain_miners.extracted_raw.v1", "version": "1.0.0"},
+                "family": ON_CHAIN_MINERS_FAMILY, "stage": "extracted_raw", "mode": mode,
                 "context": {"asset": self.asset, "data_mode": self.data_mode, "is_demo": self.is_demo, "reference_timestamp": reference_timestamp,
                             "execution_timestamp": execution_timestamp, "requested_at": _iso_utc(execution_timestamp),
                             "include_enrichment": bool(include_enrichment), "include_screen_extensions": bool(include_screen_extensions)}, "raw": raw}

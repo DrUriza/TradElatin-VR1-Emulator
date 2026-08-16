@@ -13,7 +13,8 @@ from processing_signals.processing.processing_pipeline                          
 
 def run_prices_vertical(*, fetcher: PricesFetcher, input_arguments: Mapping[str, Any] | None = None,
                         previous_state: Mapping[str, Any] | None = None, now_timestamp: int | None = None,
-                        runtime_metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                        runtime_metadata: Mapping[str, Any] | None = None,
+                        cvd_processing_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
     arguments = {"fetcher": fetcher, **dict(input_arguments or {})}
     if previous_state and "existing_contract" not in arguments:
         arguments["existing_contract"] = previous_state.get("input")
@@ -36,7 +37,9 @@ def run_prices_vertical(*, fetcher: PricesFetcher, input_arguments: Mapping[str,
                      **dict(runtime_metadata or {})}
     processing_output["metadata"]     = metadata
     classification_output["metadata"] = deepcopy(metadata)
-    screen_contract = build_prices_screen_contract(processing_output, classification_output)
+    screen_contract = build_prices_screen_contract(
+        processing_output, classification_output, cvd_processing_context=cvd_processing_context,
+    )
     return {"input": input_output, "processing": processing_output, "classification": classification_output, "screen": screen_contract}
 
 

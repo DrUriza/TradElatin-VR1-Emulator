@@ -18,6 +18,13 @@ RECOVERY_ALLOWED_FIELDS = {
 }
 BOOTSTRAP_LIMITS = {"cryptoquant_hour": 48, "cryptoquant_day": 120}
 INCREMENTAL_LIMITS = {"cryptoquant_hour": 48, "cryptoquant_day": 8}
+ETF_HISTORICAL_BOOTSTRAP_LIMITS = {
+    ("exchange_netflow", "day"): 730,
+    ("exchange_reserve", "day"): 730,
+    # One extra day allows Processing to discard partial boundary days while
+    # retaining 730 complete UTC candles.
+    ("exchange_reserve", "hour"): 17_544,
+}
 ProviderFetcher = Callable[..., Mapping[str, Any] | Sequence[Any]]
 
 ENDPOINT_SPECS = {
@@ -172,8 +179,11 @@ def build_etf_exchange_flows_fetch_plan(*, mode: str, exchange_scope: str | None
     plan = [_request("coinglass", endpoint, build_coinglass_params(endpoint, symbol=symbol)) for endpoint in ENDPOINT_SPECS["coinglass"]]
     for endpoint in ENDPOINT_SPECS["cryptoquant"]:
         for window in ("day", "hour"):
+            limit = limits[f"cryptoquant_{window}"]
+            if mode == "bootstrap":
+                limit = max(limit, ETF_HISTORICAL_BOOTSTRAP_LIMITS.get((endpoint, window), limit))
             plan.append(_request("cryptoquant", endpoint, build_cryptoquant_params(exchange_scope=exchange_scope,
-                window=window, limit=_positive_int(limits[f"cryptoquant_{window}"], "limit")), window))
+                window=window, limit=_positive_int(limit, "limit")), window))
     if include_secondary:
         for endpoint in ENDPOINT_SPECS["glassnode"]:
             for interval in (("24h",) if endpoint == "us_spot_etf_flows_net" else ("1h", "24h")):
@@ -222,8 +232,21 @@ def extract_etf_exchange_flows_raw(*, fetcher: ProviderFetcher, mode: str, excha
             raw[request["provider"]][request["endpoint_id"]] = entry
         else:
             target[str(request["variant"])] = entry
-    return {"family": FAMILY, "stage": "raw_extract", "mode": mode, "data_mode": data_mode,
-            "is_demo": is_demo, "requested_at": requested_at, "raw": raw}
+    return {
+        "schema": {"id": "trad_elatin.etf_exchange_flows.extracted_raw.v1", "version": "1.0.0"},
+        "family": FAMILY,
+        "stage": "extracted_raw",
+        "mode": mode,
+        "data_mode": data_mode,
+        "is_demo": is_demo,
+        "context": {
+            "asset": symbol,
+            "exchange_scope": exchange_scope,
+            "include_secondary": include_secondary,
+        },
+        "requested_at": requested_at,
+        "raw": raw,
+    }
 
 
 class EtfExchangeFlowsRawExtractor:

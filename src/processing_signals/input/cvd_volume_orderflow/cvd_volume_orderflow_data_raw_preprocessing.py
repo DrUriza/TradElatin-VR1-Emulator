@@ -117,10 +117,13 @@ def normalize_footprint_snapshot(row: Any) -> dict[str, Any]:
 
 
 def normalize_cryptoquant_record(row: Any, provider_window: str) -> dict[str, Any]:
-    required = {"date", "taker_buy_volume", "taker_sell_volume", "taker_buy_ratio", "taker_sell_ratio", "taker_buy_sell_ratio"}
+    required = {"taker_buy_volume", "taker_sell_volume", "taker_buy_ratio", "taker_sell_ratio", "taker_buy_sell_ratio"}
     if not isinstance(row, Mapping) or not required.issubset(row):
         raise ValueError("invalid_cryptoquant_record")
-    return {"timestamp": normalize_iso_timestamp(row["date"]), "taker_buy_volume_usd": normalize_non_negative_float(row["taker_buy_volume"]),
+    timestamp_value = row.get("datetime", row.get("date"))
+    if timestamp_value is None:
+        raise ValueError("invalid_cryptoquant_record_timestamp")
+    return {"timestamp": normalize_iso_timestamp(timestamp_value), "taker_buy_volume_usd": normalize_non_negative_float(row["taker_buy_volume"]),
         "taker_sell_volume_usd": normalize_non_negative_float(row["taker_sell_volume"]),
         "provider_taker_buy_ratio": normalize_finite_float(row["taker_buy_ratio"]),
         "provider_taker_sell_ratio": normalize_finite_float(row["taker_sell_ratio"]),

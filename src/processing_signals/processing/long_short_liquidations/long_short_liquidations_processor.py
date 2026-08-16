@@ -10,7 +10,7 @@ from typing import Any
 from .long_short_liquidations_feature_builder import (
     EVENT_INTENSITY_MIN_COMPLETE_BINS, EVENT_WINDOWS_SECONDS, MAP_BUCKET_WIDTH_BPS,
     MAP_CENTRAL_TOLERANCE_BPS, MAP_INTERPOLATION_ENABLED, MAP_PROXIMITY_DECAY_BPS,
-    PRESSURE_MIN_AVAILABLE_WEIGHT, REALIZED_WINDOWS_SECONDS, aggregate_regular_window,
+    PRESSURE_MIN_AVAILABLE_WEIGHT, REALIZED_WINDOWS_SECONDS, aggregate_regular_window, window_end_for_hourly,
     build_event_intensity, build_event_window, build_exchange_distribution, build_map_features,
     build_pressure_score, confirmation, empirical_percentile, variation,
 )
@@ -259,7 +259,7 @@ def validate_reference_price_context(context: Mapping[str, Any] | None, snapshot
         _json_safe(context, "reference_price_context")
     except ValueError:
         return None, {"status": "unavailable", "reason": "invalid_reference_price_context"}
-    required = {"source_family": "prices_ohlcv", "source_market": "futures", "source_timeframe": "1m",
+    required = {"source_family": "prices_ohlcv", "source_market": "spot", "source_timeframe": "1m",
                 "price_field": "close", "is_closed_bar": True}
     if not isinstance(context, Mapping) or any(context.get(key) != value for key, value in required.items()):
         return None, {"status": "unavailable", "reason": "invalid_reference_price_context"}
@@ -279,6 +279,22 @@ def _usable(dataset: Mapping[str, Any], collection: str) -> list[Any]:
     return deepcopy(dataset.get(collection, [])) if dataset.get("status") in {"available", "partial"} else []
 
 
+def _dataset_group_status(payload: Any) -> str:
+    if isinstance(payload, Mapping) and payload.get("status") in VALID_DATASET_STATES:
+        return str(payload["status"])
+    if isinstance(payload, Mapping):
+        statuses = [str(item.get("status")) for item in payload.values()
+                    if isinstance(item, Mapping) and item.get("status") in VALID_DATASET_STATES]
+        if statuses:
+            usable = [status for status in statuses if status in {"available", "partial"}]
+            if not usable:
+                return "invalid" if "invalid" in statuses else "unavailable"
+            if len(usable) == len(statuses) and all(status == "available" for status in statuses):
+                return "available"
+            return "partial"
+    return "unavailable"
+
+
 def _source_selection(providers: Mapping[str, Any]) -> dict[str, Any]:
     definitions = {
         "realized_aggregate": ("coinglass", "aggregated_history", "canonical"), "realized_by_exchange": ("coinglass", "pair_history", "canonical"),
@@ -293,7 +309,7 @@ def _source_selection(providers: Mapping[str, Any]) -> dict[str, Any]:
     for name, (provider, dataset, role) in definitions.items():
         parent = providers.get(provider, {}) if isinstance(providers.get(provider, {}), Mapping) else {}
         payload = parent.get(dataset, {}) if isinstance(parent, Mapping) else {}
-        status = payload.get("status", "unavailable") if isinstance(payload, Mapping) else "unavailable"
+        status = _dataset_group_status(payload)
         output[name] = {"provider": provider, "dataset_path": f"{provider}.{dataset}", "status": status,
                         "selected": status in {"available", "partial"}, "role": role, "fallback_applied": False}
     return output
@@ -302,7 +318,22 @@ def _source_selection(providers: Mapping[str, Any]) -> dict[str, Any]:
 def _events_coverage_complete(dataset: Mapping[str, Any], start: int, end: int) -> bool:
     if dataset.get("status") != "available" or "event_endpoint_record_limit_reached" in dataset.get("warnings", []):
         return False
-    params = dataset.get("provenance", {}).get("params", {})
+    provenance = dataset.get("provenance", {})
+    intervals = [item for item in provenance.get("coverage_intervals", [])
+                 if isinstance(item, Mapping) and item.get("status") == "complete"]
+    if intervals:
+        ranges = sorted((int(item["start"]), int(item["end"])) for item in intervals)
+        cursor = start
+        for left, right in ranges:
+            if right <= cursor:
+                continue
+            if left > cursor:
+                break
+            cursor = max(cursor, right)
+            if cursor >= end:
+                return True
+        return False
+    params = provenance.get("params", {})
     items = params if isinstance(params, list) else [params]
     ranges = []
     for item in items:
@@ -357,8 +388,7 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
     providers, cg = source["providers"], source["providers"]["coinglass"]
     history = cg["aggregated_history"]
     records = _usable(history, "records")
-    latest = max((record["timestamp"] for record in records), default=reference_timestamp - 3600)
-    realized_end = min(reference_timestamp // 3600 * 3600, latest + 3600)
+    realized_end = window_end_for_hourly(reference_timestamp, records)
     windows, variations = {}, {}
     for label, seconds in REALIZED_WINDOWS_SECONDS.items():
         current = aggregate_regular_window(records, window_end=realized_end, window_seconds=seconds)

@@ -4,7 +4,7 @@ import copy
 import json
 
 from processing_signals.main.on_chain_miners import run_on_chain_miners_vertical
-from test_on_chain_miners_input_vertical import DAY, NOW, FakeFetcher
+from on_chain_miners_test_helpers import DAY, NOW, FakeFetcher
 
 
 def _run(**kwargs):

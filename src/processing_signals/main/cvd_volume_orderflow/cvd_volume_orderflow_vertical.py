@@ -15,11 +15,12 @@ from processing_signals.processing.cvd_volume_orderflow.cvd_volume_orderflow_pro
 
 FAMILY = "cvd_volume_orderflow"
 MODES = {"bootstrap", "incremental", "recovery"}
-MARKETS = ("general", "spot", "futures")
-CLASSIFICATION_MARKETS = ("spot", "futures", "general")
+MARKETS = ("spot", "futures")
+CLASSIFICATION_MARKETS = ("spot", "futures")
 TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
 SCREEN_ROOT = ("schema", "screen", "stage", "mode", "context", "badges", "selectors", "operational_status",
-    "kpis", "charts", "widgets", "tables", "drilldowns", "events", "availability", "quality")
+    "kpis", "charts", "tables", "drilldowns", "events", "availability", "quality", "technical_analysis",
+    "history_contract")
 
 
 def _error(stage: str, cause: Exception | None = None) -> ValueError:
@@ -100,24 +101,25 @@ def _validate_screen(value: Any, classification: Mapping[str, Any], selected_mar
         raise _error("screen")
     schema, identity, context = value.get("schema"), value.get("screen"), value.get("context")
     if (not isinstance(schema, Mapping) or schema.get("id") != "trad_elatin.cvd_volume_orderflow.screen.v1"
-            or schema.get("version") != "1.0.0" or not isinstance(identity, Mapping)
+            or schema.get("version") != "1.5.0" or not isinstance(identity, Mapping)
             or identity.get("id") != FAMILY or identity.get("family") != FAMILY or not isinstance(context, Mapping)):
         raise _error("screen")
     source = classification["context"]
-    expected = {"base_asset": source.get("base_asset"), "pair_symbol": source.get("pair_symbol"), "markets": list(MARKETS),
-        "timeframes": list(TIMEFRAMES), "data_mode": source.get("data_mode"), "is_demo": source.get("is_demo"),
-        "reference_timestamp": source.get("reference_timestamp"), "processing_timestamp": source.get("processing_timestamp"),
-        "classification_timestamp": source.get("classification_timestamp"), "data_as_of": source.get("reference_timestamp"),
+    expected_core = {"base_asset": source.get("base_asset"), "pair_symbol": source.get("pair_symbol"),
+        "markets": list(MARKETS), "timeframes": list(TIMEFRAMES), "data_mode": source.get("data_mode"),
+        "is_demo": source.get("is_demo"), "reference_timestamp": source.get("reference_timestamp"),
+        "processing_timestamp": source.get("processing_timestamp"),
+        "classification_timestamp": source.get("classification_timestamp"),
         "presentation_default_market": selected_market, "presentation_default_timeframe": selected_timeframe,
         "display_point_limit": display_point_limit}
-    if value.get("mode") != classification.get("mode") or context != expected:
+    if value.get("mode") != classification.get("mode") or any(context.get(key) != expected for key, expected in expected_core.items()):
         raise _error("screen_context")
     result = _json_copy(value, "screen")
     _strict(result, "screen")
     return result
 
 
-def build_cvd_volume_orderflow_screen(input_contract: Mapping[str, Any], *, selected_market: str = "general",
+def build_cvd_volume_orderflow_screen(input_contract: Mapping[str, Any], *, selected_market: str = "spot",
                                       selected_timeframe: str = "15m", display_point_limit: int = 220,
                                       clock: Callable[[], Any] | None = None,
                                       include_debug_bundle: bool = False) -> dict[str, Any]:
@@ -147,7 +149,7 @@ def build_cvd_volume_orderflow_screen(input_contract: Mapping[str, Any], *, sele
 
 
 def run_cvd_volume_orderflow_vertical(*, fetcher: CvdVolumeOrderflowFetcher, reference_timestamp: int,
-                                      mode: str = "bootstrap", selected_market: str = "general",
+                                      mode: str = "bootstrap", selected_market: str = "spot",
                                       selected_timeframe: str = "15m", display_point_limit: int = 220,
                                       existing_input: Mapping[str, Any] | None = None,
                                       recovery_requests: Sequence[Mapping[str, Any]] | None = None,

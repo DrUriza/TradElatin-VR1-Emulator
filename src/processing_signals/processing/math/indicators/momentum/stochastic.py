@@ -18,7 +18,8 @@ def stochastic(
     close   = pd.to_numeric(close, errors="coerce")
     lowest  = low.rolling(window).min()
     highest = high.rolling(window).max()
-    raw_k   = 100 * (close - lowest) / (highest - lowest).replace(0, pd.NA)
+    denominator = (highest - lowest).mask((highest - lowest) == 0, float("nan"))
+    raw_k   = 100 * (close - lowest) / denominator
     k       = raw_k.rolling(k_smoothing).mean() if k_smoothing > 1 else raw_k
     d       = k.rolling(d_period or smooth).mean()
     return pd.DataFrame({"stoch_k_14": k, "stoch_d_14": d})

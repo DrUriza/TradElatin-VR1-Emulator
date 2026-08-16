@@ -19,9 +19,9 @@ CANONICAL_REASONS = {
     "conflicting_realized_and_estimated_sides", "no_clusters_detected", "classification_not_applicable",
     "missing_processing_feature",
 }
-REQUIRED = ["pressure_regime", "realized_side_regime_1h", "realized_side_regime_24h",
+REQUIRED = ["realized_side_regime_1h", "realized_side_regime_24h",
             "exchange_concentration_regime", "event_activity_regime_15m"]
-OPTIONAL = ["realized_side_regime_4h", "realized_side_regime_12h", "estimated_side_regime",
+OPTIONAL = ["pressure_regime", "realized_side_regime_4h", "realized_side_regime_12h", "estimated_side_regime",
             "aggregate_map_concentration_regime", "estimated_long_concentration_regime",
             "estimated_short_concentration_regime", "cluster_regime", "provider_confirmation_regime",
             "max_pain_proximity_regime", "event_activity_regime_1h", "composite_regime"]
@@ -474,10 +474,17 @@ def classify_long_short_liquidations(processing_contract: Mapping[str, Any], *,
     event1 = _not_applicable("events.aggregate.1h.event_usd_total", "missing_processing_feature", value=event1_value)
     exchange_conc = classify_concentration_regime(_mapping(_at(contract, "exchange_distribution.concentration"), "exchange_distribution.concentration"), source_path="exchange_distribution.concentration")
     map_conc = _mapping(_at(contract, "maps.aggregated.concentration"), "maps.aggregated.concentration")
+    def optional_map_concentration(name: str) -> dict[str, Any]:
+        path = f"maps.aggregated.concentration.{name}"
+        feature = map_conc.get(name)
+        if not isinstance(feature, Mapping):
+            return _not_applicable(path, "missing_processing_feature")
+        return classify_concentration_regime(feature, source_path=path)
+
     concentrations = {"exchanges": exchange_conc,
-        "aggregate_map": classify_concentration_regime(_mapping(map_conc.get("complete_map"), "maps.aggregated.concentration.complete_map"), source_path="maps.aggregated.concentration.complete_map"),
-        "estimated_long": classify_concentration_regime(_mapping(map_conc.get("estimated_long"), "maps.aggregated.concentration.estimated_long"), source_path="maps.aggregated.concentration.estimated_long"),
-        "estimated_short": classify_concentration_regime(_mapping(map_conc.get("estimated_short"), "maps.aggregated.concentration.estimated_short"), source_path="maps.aggregated.concentration.estimated_short")}
+        "aggregate_map": optional_map_concentration("complete_map"),
+        "estimated_long": optional_map_concentration("estimated_long"),
+        "estimated_short": optional_map_concentration("estimated_short")}
     clusters = classify_cluster_regime(_mapping(_at(contract, "maps.aggregated.clusters"), "maps.aggregated.clusters"))
     confirmations = {provider: classify_provider_confirmation_regime(_mapping(feature, f"realized.confirmations.{provider}"), source_path=f"realized.confirmations.{provider}")
                      for provider, feature in _mapping(_at(contract, "realized.confirmations"), "realized.confirmations").items()}

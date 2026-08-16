@@ -24,7 +24,7 @@ def test_etf_pc3_01_pc3_03_future_isolated_by_exchange_and_symbol():
         balance("B", "BTC", 200), balance("A", "ETH", 300),
     ]
     result = output(contract)
-    rows = {(row["exchange_name"], row["symbol"]): row for row in result["series"]["exchange_balance"]}
+    rows = {(row["exchange_name"], row["symbol"]): row for row in result["series"]["exchange_balance_source_points"]}
     assert (rows[("A", "BTC")]["status"], rows[("A", "BTC")]["reason"],
             rows[("A", "BTC")]["future_records_excluded"]) == ("partial", "future_timestamp", 1)
     for key in (("B", "BTC"), ("A", "ETH")):
@@ -37,7 +37,7 @@ def test_etf_pc3_04_pc3_05_only_future_has_local_invalid_metadata_without_row():
     contract = cloned_input()
     contract["datasets"]["exchange_balances_history"] = [balance("A", "BTC", 991001, NOW + 1)]
     result = output(contract)
-    assert result["series"]["exchange_balance"] == []
+    assert result["series"]["exchange_balance_source_points"] == []
     assert result["series_metadata"]["exchange_balance"] == {
         "status": "invalid", "reason": "future_timestamp", "warnings": ["future_timestamp"],
         "records_available": 0, "future_records_excluded": 1,
@@ -130,8 +130,8 @@ def test_etf_pc3_21_pc3_25_previous_corrections_regressions():
 
 def test_etf_pc3_26_pc3_30_boundaries_hashes_and_contract():
     root = Path(__file__).parents[1]
-    expected = {"etf_exchange_flows_data_raw_extract.py": "2E98421B5F7502877552E3DBCA6EEF3774CCD9C4476325AAE61D2B47B9A0C8CC",
-        "etf_exchange_flows_data_raw_preprocessing.py": "8353C2AE7227EDBB23D3F70B00363975FC6B44F6639AAFE47F5743E3DE1953BE"}
+    expected = {"etf_exchange_flows_data_raw_extract.py": "AF591861B05961161A38B422B211B1FFDE3A3080B98A27338FE0D5E227682298",
+        "etf_exchange_flows_data_raw_preprocessing.py": "053D57C3C8A867545C9E83C56CE3B3D309260B9474ED7D8328992DFA9869183C"}
     folder = root / "src/processing_signals/input/etf_exchange_flows"
     assert {name: canonical_text_sha256(folder / name) for name in expected} == expected
     result = output(cloned_input())

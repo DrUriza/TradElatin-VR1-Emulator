@@ -11,7 +11,7 @@ CVD_VOLUME_ORDERFLOW_FAMILY = "cvd_volume_orderflow"
 CLASSIFICATION_STAGE        = "classification"
 CLASSIFICATION_VERSION      = "0.1.0"
 PROCESSING_VERSION          = "0.1.0"
-MARKETS                     = ("spot", "futures", "general")
+MARKETS                     = ("spot", "futures")
 TIMEFRAMES                  = ("1m", "5m", "15m", "1h", "4h", "1d")
 SUMMARY_WINDOWS             = ("1h", "24h")
 VALID_AVAILABILITY          = {"available", "partial", "unavailable", "invalid"}
@@ -106,6 +106,14 @@ class CvdVolumeOrderflowClassifier:
         context, parameters, markets = contract.get("context"), contract.get("parameters"), contract.get("markets")
         if not isinstance(context, Mapping) or not isinstance(parameters, Mapping) or not isinstance(markets, Mapping) or set(markets) != set(MARKETS):
             raise ValueError("invalid_processing_structure")
+        cross_market = contract.get("cross_market")
+        if not isinstance(cross_market, Mapping):
+            raise ValueError("invalid_cross_market")
+        if not isinstance(cross_market.get("window_summaries"), Mapping) or set(cross_market["window_summaries"]) != set(SUMMARY_WINDOWS):
+            raise ValueError("invalid_cross_market_summaries")
+        ratios = cross_market.get("volume_ratios")
+        if not isinstance(ratios, Mapping) or not isinstance(ratios.get("futures_vs_spot"), Mapping) or not isinstance(ratios["futures_vs_spot"].get("1h"), Mapping):
+            raise ValueError("invalid_cross_market_ratio")
         if context.get("data_mode") == "synthetic" and context.get("is_demo") is not True:
             raise ValueError("synthetic_requires_demo")
         for market in MARKETS:
@@ -133,6 +141,10 @@ class CvdVolumeOrderflowClassifier:
                     value = summaries[window].get(field)
                     if value is not None and (type(value) is not int or value < 0):
                         raise ValueError("invalid_summary_timestamp")
+        for window in SUMMARY_WINDOWS:
+            source = cross_market["window_summaries"][window]
+            if not isinstance(source, Mapping) or source.get("status") not in VALID_AVAILABILITY:
+                raise ValueError("invalid_cross_market_summary")
 
     def classify_delta(self, value: Any, status: str, reason: str | None, path: str) -> dict[str, Any]:
         if value is None or status in {"unavailable", "invalid"}:
@@ -265,6 +277,30 @@ class CvdVolumeOrderflowClassifier:
         return {"timestamp": source.get("last_timestamp"), "atoms": atoms,
             "availability": _availability(availability_status, reason or ("summary_atoms_incomplete" if availability_status != "available" else None))}
 
+    def classify_futures_vs_spot_ratio(self, source: Mapping[str, Any], path: str) -> dict[str, Any]:
+        status = source.get("status", "unavailable")
+        reason = source.get("reason")
+        value = source.get("value")
+        if value is None or status in {"unavailable", "invalid"}:
+            return _unavailable_atom(path, "ratio", status, reason, value, "futures_vs_spot_volume_ratio_v1")
+        numeric = _finite(value, "futures_vs_spot_volume_ratio")
+        if numeric > 1.05:
+            state = "futures_dominant"
+        elif numeric < 0.95:
+            state = "spot_dominant"
+        else:
+            state = "balanced"
+        return {
+            "state": state,
+            "direction": "neutral",
+            "value": numeric,
+            "unit": "ratio",
+            "source_path": path,
+            "source_status": status,
+            "threshold_id": "futures_vs_spot_volume_ratio_v1",
+            "availability": _availability("partial" if status == "partial" else "available", reason),
+        }
+
     def build_market_agreement(self, classified: Mapping[str, Any]) -> dict[str, Any]:
         atoms = {market: classified[market]["window_summaries"]["1h"]["atoms"]["order_flow_state"] for market in MARKETS}
         states = {market: atoms[market]["state"] for market in MARKETS}
@@ -283,7 +319,7 @@ class CvdVolumeOrderflowClassifier:
             state = "mixed"
         source_status = _aggregate_status([atoms["spot"]["availability"]["status"], atoms["futures"]["availability"]["status"]])
         availability_status = "unavailable" if state == "unavailable" else ("partial" if source_status == "partial" or state == "mixed" else "available")
-        return {"state": state, "spot_state": states["spot"], "futures_state": states["futures"], "general_order_flow_state": states["general"],
+        return {"state": state, "spot_state": states["spot"], "futures_state": states["futures"],
             "availability": _availability(availability_status, "source_state_unavailable" if state == "unavailable" else (
                 "market_agreement_mixed" if state == "mixed" else ("source_partial" if availability_status == "partial" else None)))}
 
@@ -332,7 +368,7 @@ class CvdVolumeOrderflowClassifier:
             price = source_market.get("price_vs_vwap", {})
             markets[market] = {"timeframes": timeframes, "window_summaries": summaries,
                 "price_vs_vwap": {"timestamp": price.get("price_timestamp"), "value": price.get("value"), "status": price.get("status"), "reason": price.get("reason")}}
-        return {"markets": markets}
+        return {"markets": markets, "cross_market": copy.deepcopy(contract.get("cross_market", {}))}
 
     def build_interpreted_events(self, contract: Mapping[str, Any], classified: Mapping[str, Any], agreement: Mapping[str, Any]) -> list[dict[str, Any]]:
         events = []
@@ -355,13 +391,67 @@ class CvdVolumeOrderflowClassifier:
                     events.append({"event_id": f"cvd:{market}:{timeframe}:continuity_break:{current['timestamp']}", "event_type": "continuity_break",
                         "timestamp": current["timestamp"], "market": market, "timeframe": timeframe, "severity": "high",
                         "source_paths": [f"markets.{market}.timeframes.{timeframe}.current.continuity_status"], "availability": _availability("available", None)})
-        if agreement["state"] == "divergent":
-            timestamp = max(classified["spot"]["window_summaries"]["1h"]["timestamp"], classified["futures"]["window_summaries"]["1h"]["timestamp"])
-            events.append({"event_id": f"cvd:general:1h:market_divergence:{timestamp}", "event_type": "market_divergence", "timestamp": timestamp,
-                "market": "general", "timeframe": "1h", "spot_state": agreement["spot_state"], "futures_state": agreement["futures_state"],
-                "severity": "medium", "source_paths": ["confirmations.market_agreement_1h"], "availability": _availability("available", None)})
         unique = {event["event_id"]: event for event in events}
         return sorted(unique.values(), key=lambda event: (event["timestamp"], event["event_type"], event["market"], event["timeframe"], event["event_id"]))
+
+    def build_technical_events(self, contract: Mapping[str, Any]) -> dict[str, Any]:
+        by_id: dict[str, Any] = {}
+        ids: list[str] = []
+        technical = contract.get("technical_analysis", {}).get("markets", {})
+        for market in MARKETS:
+            for timeframe in TIMEFRAMES:
+                timeframe_payload = technical.get(market, {}).get("timeframes", {}).get(timeframe, {})
+                indicators = timeframe_payload.get("indicators", {}) if isinstance(timeframe_payload, Mapping) else {}
+                for candidate in timeframe_payload.get("cross_candidates", []):
+                    timestamp = candidate.get("timestamp")
+                    first, second, sign = candidate.get("first_series"), candidate.get("second_series"), candidate.get("direction")
+                    if type(timestamp) is not int or not isinstance(first, str) or not isinstance(second, str) or sign not in {-1, 1}:
+                        raise ValueError("invalid_technical_cross_candidate")
+                    # Screen-B stochastic arrows are intentionally gated to
+                    # oversold/overbought zones. The HMI must never invent this
+                    # gate from plotted values.
+                    if {first, second} == {"k", "d"}:
+                        stochastic = indicators.get("stochastic", {}) if isinstance(indicators, Mapping) else {}
+                        k_series = stochastic.get("k", []) if isinstance(stochastic, Mapping) else []
+                        d_series = stochastic.get("d", []) if isinstance(stochastic, Mapping) else []
+                        ts_series = timeframe_payload.get("timestamps", []) if isinstance(timeframe_payload, Mapping) else []
+                        if isinstance(ts_series, Sequence) and timestamp in ts_series:
+                            idx = list(ts_series).index(timestamp)
+                            if idx < len(k_series) and idx < len(d_series):
+                                k_value, d_value = k_series[idx], d_series[idx]
+                                if isinstance(k_value, (int, float)) and isinstance(d_value, (int, float)):
+                                    if sign == 1 and not (k_value <= 20 and d_value <= 20):
+                                        continue
+                                    if sign == -1 and not (k_value >= 80 and d_value >= 80):
+                                        continue
+                    direction = "bullish" if sign == 1 else "bearish"
+                    semantic_id = f"{first}_{'above' if sign == 1 else 'below'}_{second}"
+                    if {first, second} <= {"macd", "signal"}:
+                        event_group = "macd_cross"
+                    elif {first, second} <= {"plus_di", "minus_di"}:
+                        event_group = "adx_cross"
+                    elif {first, second} <= {"k", "d"}:
+                        event_group = "stochastic_cross"
+                    elif "regression_channel.middle" in {first, second} or "bollinger_bands.middle" in {first, second}:
+                        event_group = "channel_cross"
+                    else:
+                        event_group = "moving_average_cross"
+                    event_uid = f"{market}:{timeframe}:{timestamp}:technical_cross:{semantic_id}"
+                    label = semantic_id.replace("_", " ").upper()
+                    by_id[event_uid] = {
+                        "event_uid": event_uid,
+                        "event_id": semantic_id,
+                        "event_type": "technical_cross",
+                        "event_group": event_group,
+                        "timestamp": timestamp,
+                        "label": label,
+                        "signal": direction,
+                        "marker": "arrow_up" if sign == 1 else "arrow_down",
+                        "source": {"market": market, "timeframe": timeframe},
+                        "display": {"screen_a": True, "screen_b": True},
+                    }
+                    ids.append(event_uid)
+        return {"by_id": by_id, "technical_cross_ids": ids}
 
     def evaluate_availability(self, classified: Mapping[str, Any], agreement: Mapping[str, Any]) -> dict[str, Any]:
         markets, core_statuses, enrichment_statuses = {}, [], []
@@ -370,14 +460,15 @@ class CvdVolumeOrderflowClassifier:
             core.extend(classified[market]["window_summaries"][window]["availability"]["status"] for window in SUMMARY_WINDOWS)
             enrichment = classified[market]["price_vs_vwap"]["availability"]["status"]
             market_core, market_enrichment = _aggregate_status(core), enrichment
-            markets[market] = {"status": _aggregate_status([market_core, market_enrichment]), "core_status": market_core,
-                "enrichment_status": market_enrichment, "reason": None if market_core == market_enrichment == "available" else "market_classification_incomplete"}
+            market_status = market_core if market_enrichment != "invalid" else "invalid"
+            markets[market] = {"status": market_status, "core_status": market_core,
+                "enrichment_status": market_enrichment, "reason": None if market_core == "available" else "market_core_classification_incomplete"}
             core_statuses.append(market_core)
             enrichment_statuses.append(market_enrichment)
         confirmation_status = agreement["availability"]["status"]
         core_statuses.append(confirmation_status)
         core, enrichment = _aggregate_status(core_statuses), _aggregate_status(enrichment_statuses)
-        status = _aggregate_status([core, enrichment])
+        status = "invalid" if core == "invalid" or enrichment == "invalid" else core
         no_safe_base = all(classified[market]["timeframes"][timeframe]["availability"]["status"] in {"unavailable", "invalid"}
             for market in ("spot", "futures") for timeframe in TIMEFRAMES)
         return {"status": status, "core_status": core, "enrichment_status": enrichment, "markets": markets,
@@ -390,7 +481,9 @@ class CvdVolumeOrderflowClassifier:
             "ok" if processing_status == "ok" and availability["core_status"] == "available" else "partial")
         enrichment = "invalid" if availability["enrichment_status"] == "invalid" else (
             "ok" if availability["enrichment_status"] == "available" else "partial")
-        status = "invalid" if core == "invalid" else ("ok" if core == enrichment == "ok" else "partial")
+        # price-vs-VWAP is optional enrichment. Missing enrichment must not
+        # degrade a fully valid order-flow classification.
+        status = "invalid" if core == "invalid" or enrichment == "invalid" else ("ok" if core == "ok" else "partial")
         warnings = [] if status == "ok" else sorted({f"classification_availability:{availability['status']}", f"processing_quality:{processing_status}"})
         errors = [] if status != "invalid" else sorted({item for item in warnings if "invalid" in item})
         return {"status": status, "core_status": core, "enrichment_status": enrichment, "processing_quality_status": processing_status,
@@ -407,12 +500,27 @@ class CvdVolumeOrderflowClassifier:
             classified[market] = {"timeframes": timeframes, "window_summaries": summaries, "price_vs_vwap": price}
         agreement = self.build_market_agreement(classified)
         temporal = self.build_temporal_alignment(classified)
+        cross_source = contract["cross_market"]
+        cross_summaries = {
+            window: self.classify_window_summary(
+                cross_source["window_summaries"][window],
+                f"cross_market.window_summaries.{window}",
+            )
+            for window in SUMMARY_WINDOWS
+        }
+        ratio_source = cross_source["volume_ratios"]["futures_vs_spot"]["1h"]
+        cross_market = {
+            "window_summaries": cross_summaries,
+            "volume_ratios": {"futures_vs_spot": {"1h": self.classify_futures_vs_spot_ratio(
+                ratio_source, "cross_market.volume_ratios.futures_vs_spot.1h.value")}},
+        }
         for market in MARKETS:
             statuses = [classified[market]["timeframes"][timeframe]["availability"]["status"] for timeframe in TIMEFRAMES]
             statuses.extend(classified[market]["window_summaries"][window]["availability"]["status"] for window in SUMMARY_WINDOWS)
             classified[market]["availability"] = _availability(_aggregate_status(statuses), "market_core_incomplete" if any(item != "available" for item in statuses) else None)
         snapshots = self.build_snapshots(contract)
         events = self.build_interpreted_events(contract, classified, agreement)
+        technical_events = self.build_technical_events(contract)
         availability = self.evaluate_availability(classified, agreement)
         quality = self.evaluate_quality(availability, contract.get("quality", {}))
         context = contract["context"]
@@ -424,9 +532,10 @@ class CvdVolumeOrderflowClassifier:
                 "classification_timestamp": classification_timestamp},
             "parameters": {"thresholds": copy.deepcopy(THRESHOLDS), "source_processing_version": PROCESSING_VERSION,
                 "classification_policy": "interpret_processing_values_without_recalculation"},
-            "classifications": {"markets": classified}, "snapshots": snapshots,
+            "classifications": {"markets": classified, "cross_market": cross_market}, "snapshots": snapshots,
             "confirmations": {"market_agreement_1h": agreement, "temporal_alignment": temporal},
-            "interpreted_events": events, "availability": availability, "quality": quality}
+            "interpreted_events": events, "technical_events": technical_events,
+            "availability": availability, "quality": quality}
 
 
 def classify_cvd_volume_orderflow(processing_contract: Mapping[str, Any], *, clock: Callable[[], Any] | None = None) -> dict[str, Any]:

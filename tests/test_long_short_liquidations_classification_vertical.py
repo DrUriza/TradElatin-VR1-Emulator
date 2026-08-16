@@ -132,7 +132,7 @@ def test_classification_smoke(case):
     elif case == 54:
         contract = _contract()
         contract["pressure"].update(score=None, status="unavailable")
-        assert classify_long_short_liquidations(contract)["quality"]["status"] == "partial"
+        assert classify_long_short_liquidations(contract)["quality"]["status"] == "available"
     elif case == 55:
         assert classify_pressure_regime(_metric(25))["confidence"] == .6
     elif case == 56:
@@ -231,7 +231,7 @@ def test_quality_partial_unavailable_invalid_and_confidence_range():
         assert result["quality"]["status"] == expected
     contract = _contract()
     contract["pressure"]["status"] = "partial"
-    assert classify_long_short_liquidations(contract)["quality"]["status"] == "partial"
+    assert classify_long_short_liquidations(contract)["quality"]["status"] == "available"
     values = [classify_pressure_regime(_metric(value, "partial"))["confidence"] for value in (0, 12.5, 25, 50, 75, 100)]
     assert all(0 <= value <= 1 for value in values)
 

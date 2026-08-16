@@ -25,6 +25,7 @@ CONFIRMATION_METADATA = {
     "cryptoquant_funding_rates": {"provider": "cryptoquant", "endpoint_id": "funding_rates", "unit": "percent"},
     "glassnode_futures_open_interest_sum": {"provider": "glassnode", "endpoint_id": "futures_open_interest_sum", "unit": "USD"},
     "glassnode_futures_funding_rate_perpetual": {"provider": "glassnode", "endpoint_id": "futures_funding_rate_perpetual", "unit": "percent"},
+    "glassnode_futures_estimated_leverage_ratio": {"provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio", "unit": "ratio"},
 }
 
 
@@ -199,7 +200,7 @@ def normalize_cryptoquant_record(record: Mapping[str, Any], *, metric_id: str, p
 def normalize_glassnode_record(record: Mapping[str, Any], *, metric_id: str) -> dict[str, Any]:
     if not isinstance(record, Mapping):
         raise ValueError("invalid_glassnode_record")
-    value = normalize_non_negative_float(record.get("v")) if metric_id == "glassnode_futures_open_interest_sum" else normalize_finite_float(record.get("v"))
+    value = normalize_non_negative_float(record.get("v")) if metric_id in {"glassnode_futures_open_interest_sum", "glassnode_futures_estimated_leverage_ratio"} else normalize_finite_float(record.get("v"))
     return {"timestamp": normalize_timestamp_utc(record.get("t")), "value": value, "provider_interval": "1h"}
 
 
@@ -423,7 +424,9 @@ def preprocess_open_interest_and_funding_raw(raw_contract: Mapping[str, Any], *,
         "glassnode": _confirmation_payload(raw_confirmations.get("glassnode_futures_open_interest_sum"), old_confirmations.get("open_interest", {}).get("glassnode"), "glassnode_futures_open_interest_sum", context["reference_timestamp"])},
         "funding_rate": {
         "cryptoquant": _confirmation_payload(raw_confirmations.get("cryptoquant_funding_rates"), old_confirmations.get("funding_rate", {}).get("cryptoquant"), "cryptoquant_funding_rates", context["reference_timestamp"]),
-        "glassnode": _confirmation_payload(raw_confirmations.get("glassnode_futures_funding_rate_perpetual"), old_confirmations.get("funding_rate", {}).get("glassnode"), "glassnode_futures_funding_rate_perpetual", context["reference_timestamp"])}}
+        "glassnode": _confirmation_payload(raw_confirmations.get("glassnode_futures_funding_rate_perpetual"), old_confirmations.get("funding_rate", {}).get("glassnode"), "glassnode_futures_funding_rate_perpetual", context["reference_timestamp"])},
+        "estimated_leverage_ratio": {
+        "glassnode": _confirmation_payload(raw_confirmations.get("glassnode_futures_estimated_leverage_ratio"), old_confirmations.get("estimated_leverage_ratio", {}).get("glassnode"), "glassnode_futures_estimated_leverage_ratio", context["reference_timestamp"])}}
     required = {f"{metric}.{timeframe}": series[metric]["timeframes"][timeframe]["status"] for metric in series for timeframe in SCREEN_TIMEFRAMES}
     required.update({"open_interest_exchange_snapshot": snapshots["open_interest_by_exchange"]["status"], "funding_exchange_snapshot": snapshots["funding_rate_by_exchange"]["status"]})
     optional = {"options_open_interest_snapshot": snapshots["options_open_interest"]["status"]}
@@ -442,6 +445,7 @@ def preprocess_open_interest_and_funding_raw(raw_contract: Mapping[str, Any], *,
         "open_interest_exchange_snapshot": {"status": snapshots["open_interest_by_exchange"]["status"]},
         "funding_exchange_snapshot": {"status": snapshots["funding_rate_by_exchange"]["status"]},
         "options_open_interest_snapshot": {"status": snapshots["options_open_interest"]["status"]},
+        "estimated_leverage_ratio": {"status": confirmations["estimated_leverage_ratio"]["glassnode"]["status"], "provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio"},
         "open_interest_market_cap_ratio": {"status": "unavailable", "reason": "market_cap_source_not_configured"},
         "perpetual_vs_dated_futures_split": {"status": "unavailable", "reason": "dated_futures_open_interest_not_separated_by_current_sources"}}
     return {"family": FAMILY, "stage": "input", "mode": raw_contract["mode"], "context": {**copy.deepcopy(dict(context)), "generated_at": generated_at},

@@ -26,7 +26,7 @@ def isolated(tmp_path, monkeypatch):
 
 
 def test_default_atomic_pretty_strict_json(screen):
-    assert CVD_VOLUME_ORDERFLOW_OUTPUT_PATH == Path("runtime/contracts/cvd_volume_orderflow_screen.json")
+    assert CVD_VOLUME_ORDERFLOW_OUTPUT_PATH == Path("runtime/contracts/hmi_contract/cvd_volume_orderflow_screen.json")
     result = write_cvd_volume_orderflow_screen_json(screen_contract=screen)
     raw = result.read_bytes()
     assert result == CVD_VOLUME_ORDERFLOW_OUTPUT_PATH and raw.endswith(b"\n")

@@ -12,8 +12,8 @@ from typing import Any
 LIQUIDITY_MICROSTRUCTURE_FAMILY = "liquidity_microstructure"
 PROVIDER                         = "coinglass"
 REST_BASE_URL                    = "https://open-api-v4.coinglass.com"
-WEBSOCKET_BASE_URL               = "wss://open-ws.coinglass.com/ws-api"
 TIMEFRAMES                       = ("1m", "5m", "15m", "1h")
+TIMEFRAME_SECONDS                 = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 DEPTH_RANGES_PERCENT             = (1, 5, 10)
 VALID_MODES                      = {"bootstrap", "incremental", "recovery"}
 
@@ -22,10 +22,11 @@ ENDPOINT_MANIFEST = {
     "perpetual_orderbook_heatmap": {"transport": "rest", "path": "/api/futures/orderbook/history"},
     "spot_order_depth": {"transport": "rest", "path": "/api/spot/orderbook/ask-bids-history"},
     "perpetual_order_depth": {"transport": "rest", "path": "/api/futures/orderbook/ask-bids-history"},
-    "spot_large_trades": {"transport": "websocket", "channel_template": "spot_trades@{exchange}_{symbol}@{min_volume_usd}"},
-    "perpetual_large_trades": {"transport": "websocket", "channel_template": "futures_trades@{exchange}_{symbol}@{min_volume_usd}"},
+    "spot_footprint": {"transport": "rest", "path": "/api/spot/volume/footprint-history"},
+    "perpetual_footprint": {"transport": "rest", "path": "/api/futures/volume/footprint-history"},
+    "spot_large_limit_orders": {"transport": "rest", "path": "/api/spot/orderbook/large-limit-order"},
+    "perpetual_large_limit_orders": {"transport": "rest", "path": "/api/futures/orderbook/large-limit-order"},
     "whale_index": {"transport": "rest", "path": "/api/futures/whale-index/history"},
-    "market_data_history": {"transport": "rest", "path": "/api/coin/market-data-history"},
 }
 
 RawFetcher = Callable[..., Any]
@@ -55,13 +56,28 @@ def build_liquidity_microstructure_fetch_plan(*, mode: str = "bootstrap", refere
                                                asset: str = "BTC", exchange: str = "Binance", spot_symbol: str = "BTCUSDT",
                                                perpetual_symbol: str = "BTCUSDT", timeframes: Sequence[str] = TIMEFRAMES,
                                                depth_ranges_percent: Sequence[int] = DEPTH_RANGES_PERCENT,
-                                               large_trade_min_volume_usd: int = 10_000, history_limit: int = 100,
+                                               history_limit: int = 100,
+                                               hourly_history_limit: int | None = None,
                                                overlap_seconds: int = 300,
                                                recovery_requests: Sequence[str | Mapping[str, Any]] | None = None) -> list[dict[str, Any]]:
     if mode not in VALID_MODES:
         raise ValueError("invalid_liquidity_microstructure_mode")
     reference = int(reference_timestamp or time.time())
-    start = reference - (overlap_seconds if mode == "incremental" else 86_400)
+
+    def limit_for(timeframe: str) -> int:
+        return int(hourly_history_limit if timeframe == "1h" and hourly_history_limit is not None else history_limit)
+
+    def start_for(timeframe: str) -> int:
+        if mode == "incremental":
+            return reference - overlap_seconds
+        seconds = TIMEFRAME_SECONDS.get(timeframe)
+        if seconds is None:
+            raise ValueError("invalid_timeframe")
+        # ``history_limit`` is a record count.  Bootstrap/recovery therefore
+        # requests enough wall-clock history to make that count possible at
+        # each provider interval instead of using the old fixed 24h window.
+        return reference - max(seconds * limit_for(timeframe), seconds)
+
     common = {"asset": asset, "exchange": exchange}
     plan: list[dict[str, Any]] = []
     for market_type, symbol, heatmap_id, depth_id in (
@@ -70,24 +86,40 @@ def build_liquidity_microstructure_fetch_plan(*, mode: str = "bootstrap", refere
     ):
         for timeframe in timeframes:
             dimensions = {**common, "market_type": market_type, "symbol": symbol, "timeframe": timeframe, "range_percent": None}
-            params = {"exchange": exchange, "symbol": symbol, "interval": timeframe, "limit": history_limit,
+            start = start_for(timeframe)
+            params = {"exchange": exchange, "symbol": symbol, "interval": timeframe, "limit": limit_for(timeframe),
                       "start_time": start * 1000, "end_time": reference * 1000}
             plan.append(_request(heatmap_id, params=params, dimensions=dimensions))
             for range_percent in depth_ranges_percent:
                 depth_dimensions = {**dimensions, "range_percent": int(range_percent)}
                 plan.append(_request(depth_id, params={**params, "range": int(range_percent)}, dimensions=depth_dimensions))
-    for market_type, symbol, endpoint_id in (("spot", spot_symbol, "spot_large_trades"),
-                                              ("perpetual", perpetual_symbol, "perpetual_large_trades")):
-        dimensions = {**common, "market_type": market_type, "symbol": symbol, "timeframe": None, "range_percent": None}
-        plan.append(_request(endpoint_id, params={"min_volume_usd": large_trade_min_volume_usd}, dimensions=dimensions,
-                             collection_started_at=start, collection_ended_at=reference))
+    # Executed liquidity comes from CoinGlass footprint history.  The HMI keeps
+    # the historical ``large_trades`` contract name, but the provider semantic
+    # is an executed buy/sell price-bin feed, not an individual tape.
+    for market_type, symbol, endpoint_id in (("spot", spot_symbol, "spot_footprint"),
+                                              ("perpetual", perpetual_symbol, "perpetual_footprint")):
+        dimensions = {**common, "market_type": market_type, "symbol": symbol, "timeframe": "1m", "range_percent": None}
+        footprint_start = start_for("1m")
+        plan.append(_request(endpoint_id, params={"exchange": exchange, "symbol": symbol, "interval": "1m",
+                                                  "limit": min(int(history_limit), 1000),
+                                                  "start_time": footprint_start * 1000, "end_time": reference * 1000},
+                             dimensions=dimensions))
+
+    # Whale order liquidity is sourced directly from CoinGlass Large Orderbook
+    # instead of inferring "whales" from ordinary book levels.
+    for market_type, symbol, endpoint_id in (("spot", spot_symbol, "spot_large_limit_orders"),
+                                              ("perpetual", perpetual_symbol, "perpetual_large_limit_orders")):
+        dimensions = {**common, "market_type": market_type, "symbol": symbol, "timeframe": "1m", "range_percent": None}
+        plan.append(_request(endpoint_id, params={"exchange": exchange, "symbol": symbol}, dimensions=dimensions))
+
+    # Whale Index remains useful as a temporal context series; it is no longer
+    # used as a substitute for order-level whale liquidity.
     for timeframe in timeframes:
         dimensions = {**common, "market_type": "perpetual", "symbol": perpetual_symbol, "timeframe": timeframe, "range_percent": None}
-        params = {"exchange": exchange, "symbol": perpetual_symbol, "interval": timeframe, "limit": history_limit,
+        start = start_for(timeframe)
+        params = {"exchange": exchange, "symbol": perpetual_symbol, "interval": timeframe, "limit": limit_for(timeframe),
                   "start_time": start * 1000, "end_time": reference * 1000}
         plan.append(_request("whale_index", params=params, dimensions=dimensions))
-    dimensions = {"asset": asset, "exchange": exchange, "market_type": None, "symbol": asset, "timeframe": "1d", "range_percent": None}
-    plan.append(_request("market_data_history", params={"symbol": asset}, dimensions=dimensions))
     if mode != "recovery":
         return plan
     requested = list(recovery_requests or [])

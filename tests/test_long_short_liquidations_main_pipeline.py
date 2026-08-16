@@ -11,7 +11,7 @@ def test_main_pipeline_routes_full_and_screen_only_outputs():
     screen = run_main_pipeline(enabled_families=("long_short_liquidations",),
         family_arguments={"long_short_liquidations": vertical_arguments(REFERENCE)}, screens_only=True)["long_short_liquidations"]
     assert set(full) == {"input", "processing", "classification", "screen"}
-    assert screen["stage"] == "contract" and "input" not in screen
+    assert screen["stage"] == "screen_contract_final" and "input" not in screen
 
 
 def test_main_pipeline_routes_previous_state_without_mutation():

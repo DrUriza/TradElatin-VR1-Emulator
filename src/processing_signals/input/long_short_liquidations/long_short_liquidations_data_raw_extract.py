@@ -94,10 +94,10 @@ for _glassnode_endpoint in (
         "dimension_param_matches": {"asset": "a", "symbol": "a"},
     }
 
-_COINGLASS_INTERVALS = {"1m", "1h", "1d"}
+_COINGLASS_INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "6h", "8h", "12h", "1d", "1w"}
 _EXCHANGE_RANGES = {"1h", "4h", "12h", "24h"}
 _MAP_RANGES = {"1d", "7d", "30d", "180d", "365d"}
-_MAX_PAIN_RANGES = _EXCHANGE_RANGES | _MAP_RANGES
+_MAX_PAIN_RANGES = {"12h", "24h", "48h", "3d", "7d", "14d", "30d"}
 _CRYPTOQUANT_WINDOWS = {"min", "hour", "day"}
 
 
@@ -474,7 +474,7 @@ def extract_long_short_liquidations_raw(
         else:
             results.append(execute_raw_request(fetcher=fetcher, request=request))
     return {
-        "family": LONG_SHORT_LIQUIDATIONS_FAMILY, "stage": "input_raw", "mode": mode,
+        "family": LONG_SHORT_LIQUIDATIONS_FAMILY, "stage": "extracted_raw", "mode": mode,
         "reference_timestamp": reference_timestamp, "execution_timestamp": executed_at,
         "requests": results,
     }

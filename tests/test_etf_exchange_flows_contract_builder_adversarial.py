@@ -107,8 +107,11 @@ def test_cba38_cba40_non_list_series_is_invalid(chart):
     processing, classification = contracts()
     processing["series"][chart] = {}
     output = invoke(processing, classification)
-    output_name = "etf_cumulative_net_flow" if chart == "etf_cumulative_flow" else chart
-    assert output["charts"][output_name]["status"] == "invalid"
+    if chart == "etf_cumulative_flow":
+        assert output["kpis"]["cumulative_etf_net_flow"]["status"] == "invalid"
+        assert "etf_cumulative_net_flow" not in output["charts"]
+    else:
+        assert output["charts"][chart]["status"] == "invalid"
 
 
 def test_cba41_non_list_selected_netflow_series_is_invalid():
@@ -127,13 +130,13 @@ def test_cba42_future_point_is_invalid_and_not_returned():
     assert chart["status"] == "invalid" and chart["points"] == []
 
 
-@pytest.mark.parametrize("field", ("exchange_name", "symbol", "provider", "endpoint_id"))
+@pytest.mark.parametrize("field", ("open", "high", "low", "close"))
 @pytest.mark.parametrize("value", (None, True, {}, []))
-def test_cba43_cba58_invalid_exchange_identity_is_rejected(field, value):
+def test_cba43_cba58_invalid_exchange_candle_is_rejected(field, value):
     processing, classification = contracts()
     processing["series"]["exchange_balance"][0][field] = value
     chart = invoke(processing, classification)["charts"]["exchange_balance"]
-    assert chart["status"] == "invalid" and chart["points"] == []
+    assert chart["status"] == "invalid" and chart["candles"] == []
 
 
 def test_cba59_invalid_fund_does_not_degrade_valid_fund():

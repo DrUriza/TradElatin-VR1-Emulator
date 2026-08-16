@@ -6,9 +6,13 @@ NOW = 1_740_000_000
 
 def feature_input(*, hourly=24, scope="all_exchange", glassnode=True):
     timestamps = [NOW - 3600 * index for index in reversed(range(hourly))]
+    current_day = NOW - NOW % 86_400
+    reserve_end = current_day - 3_600
+    reserve_timestamps = [reserve_end - 3600 * index for index in reversed(range(hourly))]
     def cq(endpoint, field, value):
+        source_timestamps = [*reserve_timestamps, NOW] if endpoint == "exchange_reserve" else timestamps
         return [{"timestamp": timestamp, "window": "hour", "exchange_scope": scope, field: value,
-                 "provider": "cryptoquant", "endpoint_id": endpoint} for timestamp in timestamps]
+                 "provider": "cryptoquant", "endpoint_id": endpoint} for timestamp in source_timestamps]
     datasets = {
         "etf_flows_daily": [
             {"timestamp": NOW - 3 * 86400, "flow_usd": 100.0, "price_usd": 50.0, "provider": "coinglass", "endpoint_id": "bitcoin_etf_flows"},

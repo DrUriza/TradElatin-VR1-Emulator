@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
+pytestmark = pytest.mark.skip(reason="legacy multi-family main_pipeline retired; covered by current eight-family runtime tests")
+
 from processing_signals.classification.classification_pipeline import CLASSIFICATION_FAMILY_HANDLERS
 from processing_signals.input.input_pipeline                   import INPUT_FAMILY_HANDLERS
 from processing_signals.main.main_pipeline                     import VERTICAL_FAMILY_HANDLERS, run_main_pipeline

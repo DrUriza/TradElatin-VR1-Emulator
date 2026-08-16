@@ -19,7 +19,7 @@ from processing_signals.processing.volatility_market_regimes.volatility_market_r
 VOLATILITY_MARKET_REGIMES_FAMILY = "volatility_market_regimes"
 VALID_VERTICAL_MODES             = {"bootstrap", "incremental", "recovery"}
 DEFAULT_SELECTED_RANGE           = "7d"
-DEFAULT_SCREEN_EXPORT_PATH       = Path("runtime/contracts/volatility_market_regimes_screen.json")
+DEFAULT_SCREEN_EXPORT_PATH       = Path("runtime/contracts/hmi_contract/volatility_market_regimes_screen.json")
 SCREEN_JSON_INDENT               = 2
 
 
@@ -37,7 +37,7 @@ def validate_previous_volatility_market_regimes_output(previous: Any) -> None:
     for section in ("input", "processing", "classification", "screen"):
         if not isinstance(previous.get(section), Mapping):
             raise ValueError(f"previous_vertical_output.{section}:mapping_required")
-    if previous["input"].get("family") != VOLATILITY_MARKET_REGIMES_FAMILY or previous["input"].get("stage") != "input_preprocessed":
+    if previous["input"].get("family") != VOLATILITY_MARKET_REGIMES_FAMILY or previous["input"].get("stage") != "input":
         raise ValueError("previous_vertical_output.input:identity_invalid")
     if previous["processing"].get("stage") != "processing" or previous["classification"].get("stage") != "classification":
         raise ValueError("previous_vertical_output:stage_invalid")
@@ -69,7 +69,7 @@ def validate_volatility_market_regimes_vertical_request(
         raise ValueError("incremental:recovery_requests_not_allowed")
     if mode != "recovery" and derive_recovery_from_gaps:
         raise ValueError("derive_recovery_from_gaps:recovery_only")
-    if selected_range not in {"1h", "4h", "1d", "7d", "30d"}:
+    if selected_range not in {"7d", "30d", "90d", "360d"}:
         raise ValueError("selected_range:invalid")
 
 
@@ -77,7 +77,7 @@ def derive_volatility_market_regimes_recovery_requests(previous_input_contract: 
     datasets = (
         ("coinglass", "top_position_ratio", "top_position_long_short_ratio"),
         ("glassnode", "realized_volatility", "realized_volatility"),
-        ("deribit", "volatility_index", "volatility_index"),
+        ("glassnode", "dvol", "dvol_ohlc"),
     )
     requests  = []
     providers = previous_input_contract.get("providers", {})
@@ -127,7 +127,7 @@ def _check_stage(contract: Any, stage: str, mode: str) -> None:
     if not isinstance(contract, Mapping) or contract.get("family") != VOLATILITY_MARKET_REGIMES_FAMILY:
         raise ValueError("invalid_contract")
     if stage == "screen":
-        if contract.get("screen") != VOLATILITY_MARKET_REGIMES_FAMILY or contract.get("schema_version") != "0.1.0":
+        if contract.get("screen") != VOLATILITY_MARKET_REGIMES_FAMILY or contract.get("schema_version") != "1.2.0-no-regime-timeline":
             raise ValueError("invalid_screen_contract")
     elif contract.get("stage") != stage or contract.get("mode") != mode:
         raise ValueError("invalid_stage_contract")
@@ -159,7 +159,7 @@ class VolatilityMarketRegimesVertical:
             raise VolatilityMarketRegimesVerticalError("raw_extract", "raw_extract_failed", str(exc)) from exc
         try:
             input_contract = preprocess_volatility_market_regimes_input(raw_bundle, existing_contract=previous_input)
-            _check_stage(input_contract, "input_preprocessed", mode)
+            _check_stage(input_contract, "input", mode)
         except Exception as exc:
             raise VolatilityMarketRegimesVerticalError("input_preprocessing", "input_preprocessing_failed", str(exc)) from exc
         try:

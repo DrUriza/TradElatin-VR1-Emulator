@@ -51,7 +51,7 @@ def test_future_balance_history_degrades_retained_series_locally():
     future.update(timestamp=NOW + 1, balance_btc=991001)
     contract["datasets"]["exchange_balances_history"].append(future)
     result = output(contract)
-    history = result["series"]["exchange_balance"]
+    history = result["series"]["exchange_balance_source_points"]
     assert len(history) == 1 and history[0]["balance_btc"] == 100
     assert (history[0]["status"], history[0]["reason"]) == ("partial", "future_timestamp")
     assert history[0]["warnings"] == ["future_timestamp"]

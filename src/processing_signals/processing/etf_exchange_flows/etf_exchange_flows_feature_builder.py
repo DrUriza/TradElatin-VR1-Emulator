@@ -5,11 +5,19 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
 import math
+import pandas as pd
 from typing import Any
 
+from processing_signals.processing.prices_ohlcv.prices_ohlcv_processor import (
+    PRICE_INDICATOR_CONFIG,
+    calculate_prices_indicator_package,
+)
+from processing_signals.processing.math.indicators.trend.moving_averages import ema
+from processing_signals.processing.math.technical_cross_signals import detect_cross_pairs
+
 FAMILY                     = "etf_exchange_flows"
-SUPPORTED_RANGES           = ("1d", "7d", "30d", "90d")
-RANGE_SECONDS              = {"1d": 86_400, "7d": 604_800, "30d": 2_592_000, "90d": 7_776_000}
+SUPPORTED_RANGES           = ("1d", "7d", "30d", "90d", "360d")
+RANGE_SECONDS              = {"1d": 86_400, "7d": 604_800, "30d": 2_592_000, "90d": 7_776_000, "360d": 31_104_000}
 HOURLY_STEP_SECONDS        = 3_600
 DAILY_STEP_SECONDS         = 86_400
 PRESSURE_WINDOW            = 86_400
@@ -245,6 +253,61 @@ def _build_etf(datasets: Mapping[str, Any], generated_timestamp: int, snapshot_a
             "period_flow_btc": period_btc, "reported_total_aum_usd": reported}, {"etf_flow_daily": daily, "etf_cumulative_flow": cumulative}, warnings+net_warn
 
 
+def _glassnode_latest(secondary_root: Mapping[str, Any], endpoint_id: str, generated_timestamp: int, *,
+                      unit: str, preferred_intervals: Sequence[str] = ("24h", "1h")) -> dict[str, Any]:
+    """Return the latest usable Glassnode confirmation for one normalized endpoint.
+
+    This is deliberately a Processing-side confirmation feature.  It does not
+    alter the primary provider semantics used by the HMI contract.
+    """
+    glassnode = secondary_root.get("glassnode", {}) if isinstance(secondary_root.get("glassnode"), Mapping) else {}
+    endpoint = glassnode.get(endpoint_id, {}) if isinstance(glassnode.get(endpoint_id), Mapping) else {}
+    records: list[dict[str, Any]] = []
+    selected_interval = None
+    warnings: list[str] = []
+    future = 0
+    for interval in preferred_intervals:
+        source = endpoint.get(interval, [])
+        normalized, row_warnings, row_future = _dedupe(
+            source, ("timestamp", "interval", "asset", "exchange_scope", "provider", "endpoint_id"), generated_timestamp
+        )
+        warnings.extend(row_warnings)
+        future += row_future
+        usable = [item for item in normalized if item.get("asset") == "BTC" and _finite(item.get("value")) is not None]
+        if usable:
+            records = usable
+            selected_interval = interval
+            break
+    if not records:
+        return _missing(reason="future_timestamp" if future else "secondary_unavailable", unit=unit,
+                        provider="glassnode", endpoint_id=endpoint_id, status="invalid" if future else "unavailable",
+                        warnings=warnings)
+    latest = records[-1]
+    return _feature(_finite(latest.get("value")), status="partial" if future else "available",
+                    reason="future_timestamp" if future else None, timestamp=int(latest["timestamp"]), unit=unit,
+                    provider="glassnode", endpoint_id=endpoint_id, coverage=_coverage(records), warnings=warnings,
+                    interval=selected_interval, asset="BTC", exchange_scope=latest.get("exchange_scope"))
+
+
+def _comparison(primary: Mapping[str, Any], secondary: Mapping[str, Any], *, unit: str) -> dict[str, Any]:
+    primary_value = _finite(primary.get("value"))
+    secondary_value = _finite(secondary.get("value"))
+    primary_ts = _timestamp(primary.get("data_as_of"))
+    secondary_ts = _timestamp(secondary.get("data_as_of"))
+    if primary_value is None or secondary_value is None or primary_ts is None or secondary_ts is None:
+        return {"primary_value": primary_value, "secondary_value": secondary_value, "difference": None,
+                "unit": unit, "primary_provider": primary.get("provider"), "secondary_provider": secondary.get("provider"),
+                "timestamp_distance": None if primary_ts is None or secondary_ts is None else abs(primary_ts-secondary_ts),
+                "data_as_of": None, "status": "unavailable", "reason": secondary.get("reason") or primary.get("reason") or "secondary_unavailable"}
+    distance = abs(primary_ts-secondary_ts)
+    aligned = distance <= DAILY_STEP_SECONDS
+    return {"primary_value": primary_value, "secondary_value": secondary_value,
+            "difference": primary_value-secondary_value if aligned else None, "unit": unit,
+            "primary_provider": primary.get("provider"), "secondary_provider": secondary.get("provider"),
+            "timestamp_distance": distance, "data_as_of": min(primary_ts, secondary_ts) if aligned else None,
+            "status": "available" if aligned else "unavailable", "reason": None if aligned else "anchors_not_aligned"}
+
+
 def _build_funds(datasets: Mapping[str, Any], generated_timestamp: int, snapshot_anchor: int | None) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
     flows, flow_warn, flow_future = _dedupe(datasets.get("etf_fund_flows_daily", []), ("timestamp", "ticker", "provider", "endpoint_id"), generated_timestamp)
     snapshots = datasets.get("etf_funds_snapshot", []) if isinstance(datasets.get("etf_funds_snapshot", []), list) else []
@@ -312,6 +375,120 @@ def _scope_records(records: list[dict[str, Any]], exchange_scope: str | None) ->
     if exchange_scope is not None:
         return [item for item in records if item.get("exchange_scope") == exchange_scope], exchange_scope
     return (records, next(iter(scopes))) if len(scopes) == 1 else ([], None)
+
+
+def _daily_reserve_candles(records: Sequence[Mapping[str, Any]], *, limit: int = 730) -> list[dict[str, Any]]:
+    """Build closed UTC OHLC candles from one hourly aggregate reserve series."""
+    days: dict[int, list[tuple[int, float]]] = {}
+    for item in records:
+        timestamp = _timestamp(item.get("timestamp"))
+        value = _finite(item.get("reserve"))
+        if timestamp is None or value is None:
+            continue
+        day = timestamp - timestamp % DAILY_STEP_SECONDS
+        days.setdefault(day, []).append((timestamp, value))
+    candles: list[dict[str, Any]] = []
+    for day, observations in sorted(days.items()):
+        ordered = sorted(observations)
+        timestamps = {timestamp for timestamp, _ in ordered}
+        expected = {day + hour * HOURLY_STEP_SECONDS for hour in range(24)}
+        if timestamps != expected:
+            continue
+        values = [value for _, value in ordered]
+        candles.append({"timestamp": day, "open": values[0], "high": max(values), "low": min(values),
+                        "close": values[-1], "is_closed": True})
+    return candles[-limit:]
+
+
+def _exchange_balance_technical_analysis(candles: list[dict[str, Any]]) -> dict[str, Any]:
+    if not candles:
+        return {"status": "unavailable", "reason": "no_complete_candles", "indicators": {}}
+    config = deepcopy(PRICE_INDICATOR_CONFIG)
+    config["sma_periods"] = (20, 50, 100, 200)
+    package = calculate_prices_indicator_package(records=candles, market_type="all_exchange", timeframe="1d", config=config)
+    percent_candles = []
+    previous_close = None
+    for candle in candles:
+        base = previous_close if previous_close not in {None, 0} else candle["close"]
+        percent_candles.append({"timestamp": candle["timestamp"], "is_closed": candle["is_closed"],
+            **{field: (candle[field] / base - 1) * 100 for field in ("open", "high", "low", "close")}})
+        previous_close = candle["close"]
+    percent_package = calculate_prices_indicator_package(records=percent_candles, market_type="all_exchange",
+                                                          timeframe="1d", config=config)
+    for name in ("rsi", "tsi", "stochastic"):
+        package[name] = percent_package[name]
+    tsi_values = package["tsi"]["series"]["tsi"]
+    tsi_signal = [None if pd.isna(value) else float(value)
+                  for value in ema(pd.Series(tsi_values, dtype="float64"), span=13)]
+    package["tsi"]["series"]["signal"] = tsi_signal
+    package["tsi"]["current"]["signal"] = next((value for value in reversed(tsi_signal) if value is not None), None)
+    bollinger = package["bollinger_bands"]["series"]
+    widths = []
+    for upper, middle, lower in zip(bollinger["upper"], bollinger["middle"], bollinger["lower"]):
+        widths.append(None if upper is None or middle in {None, 0} or lower is None else (upper - lower) / middle * 100)
+    package["bollinger_band_width"] = {
+        "indicator_id": "bollinger_band_width", "parameters": {"period": 20, "standard_deviations": 2.0},
+        "timestamps": [item["timestamp"] for item in candles], "series": {"bollinger_band_width": widths},
+        "current": {"bollinger_band_width": next((value for value in reversed(widths) if value is not None), None)},
+        "warmup_records": 20, "source": {"market_type": "all_exchange", "timeframe": "1d", "is_synthetic_source": False},
+        "quality": {"status": "ok", "valid_points": sum(value is not None for value in widths),
+                    "null_points": sum(value is None for value in widths), "required_records": 20,
+                    "available_records": len(candles), "warnings": []},
+        "calculation": {"module": "processing.etf_exchange_flows", "function": "bollinger_band_width",
+                        "parameters": {"period": 20, "standard_deviations": 2.0}, "records": len(candles),
+                        "last_valid_timestamp": candles[-1]["timestamp"]},
+    }
+    timestamps = [item["timestamp"] for item in candles]
+    closes = [float(item["close"]) for item in candles]
+    regression = {"upper": [], "middle": [], "lower": []}
+    period = 100
+    for index in range(len(closes)):
+        if index + 1 < period:
+            for values in regression.values():
+                values.append(None)
+            continue
+        window = closes[index + 1 - period:index + 1]
+        x_mean = (period - 1) / 2
+        y_mean = sum(window) / period
+        denominator = sum((x - x_mean) ** 2 for x in range(period))
+        slope = sum((x - x_mean) * (value - y_mean) for x, value in enumerate(window)) / denominator
+        intercept = y_mean - slope * x_mean
+        fitted = [intercept + slope * x for x in range(period)]
+        residual_std = math.sqrt(sum((value - fit) ** 2 for value, fit in zip(window, fitted)) / period)
+        middle = fitted[-1]
+        regression["middle"].append(middle)
+        regression["upper"].append(middle + 2 * residual_std)
+        regression["lower"].append(middle - 2 * residual_std)
+    wasserstein = []
+    distribution_window = 30
+    for index in range(len(closes)):
+        if index + 1 < distribution_window * 2:
+            wasserstein.append(None)
+            continue
+        previous = sorted(closes[index + 1 - 2 * distribution_window:index + 1 - distribution_window])
+        current = sorted(closes[index + 1 - distribution_window:index + 1])
+        scale = max(abs(sum(previous) / distribution_window), 1e-12)
+        wasserstein.append(sum(abs(left - right) for left, right in zip(previous, current)) / distribution_window / scale)
+    package["wasserstein_distance"] = {"indicator_id": "wasserstein_distance", "parameters": {"window": distribution_window},
+        "timestamps": timestamps, "series": {"wasserstein_distance": wasserstein},
+        "current": {"wasserstein_distance": next((value for value in reversed(wasserstein) if value is not None), None)},
+        "warmup_records": distribution_window * 2, "source": {"market_type": "all_exchange", "timeframe": "1d",
+            "is_synthetic_source": False}, "quality": {"status": "ok", "valid_points": sum(v is not None for v in wasserstein),
+            "null_points": sum(v is None for v in wasserstein), "required_records": distribution_window * 2,
+            "available_records": len(candles), "warnings": []}, "calculation": {"module": "processing.etf_exchange_flows",
+            "function": "rolling_wasserstein_distance", "parameters": {"window": distribution_window},
+            "records": len(candles), "last_valid_timestamp": timestamps[-1]}}
+    cross_series = dict(package["moving_averages"]["series"])
+    for name in ("macd", "adx", "stochastic"):
+        cross_series.update(package[name]["series"])
+    crosses = detect_cross_pairs(timestamps=timestamps, series=cross_series, pairs=(
+        ("ema_9", "ema_21"), ("ema_21", "ema_50"), ("sma_20", "sma_50"),
+        ("sma_50", "sma_100"), ("sma_100", "sma_200"), ("wma_20", "wma_50"),
+        ("macd", "signal"), ("di_plus", "di_minus"), ("k", "d")))
+    return {"status": "available", "reason": None, "source_path": "series.exchange_balance",
+            "calculation_history_records": len(candles), "indicators": package,
+            "regression_channel": {"timestamps": timestamps, "series": regression,
+                "parameters": {"period": period, "standard_deviations": 2.0}}, "cross_candidates": crosses}
 
 
 def _build_exchange(datasets: Mapping[str, Any], generated_timestamp: int, exchange_scope: str | None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
@@ -416,9 +593,10 @@ def _build_exchange(datasets: Mapping[str, Any], generated_timestamp: int, excha
                  warnings=["future_timestamp"] if reserve_future else []))
     for feature in (inflow_feature, outflow_feature, net_reported, net_calculated, pressure, reserve):
         warnings.extend(feature.get("warnings", []))
+    reserve_candles = _daily_reserve_candles(prepared["exchange_reserve"]["hour"])
     return ({"inflow_24h": inflow_feature, "outflow_24h": outflow_feature, "netflow_24h_reported": net_reported,
              "netflow_24h_calculated": net_calculated, "cryptoquant_reserve": reserve}, {"flow_24h": pressure},
-            {"netflow": net_reconciliation, "series": series}, sorted(set(warnings)))
+            {"netflow": net_reconciliation, "series": series, "reserve_daily_candles": reserve_candles}, sorted(set(warnings)))
 
 
 def _build_balances(datasets: Mapping[str, Any], generated_timestamp: int, exchange_scope: str | None,
@@ -573,16 +751,33 @@ def build_etf_exchange_flows_features(*, input_contract: Mapping[str, Any], gene
     else:
         difference_usd = _missing(unit="USD", provider="calculated", endpoint_id=None)
         difference_percent = _missing(unit="percent", provider="calculated", endpoint_id=None)
+    secondary_root = datasets.get("secondary_sources", {}) if isinstance(datasets.get("secondary_sources"), Mapping) else {}
+    glassnode_confirmations = {
+        "etf_net_flow": _glassnode_latest(secondary_root, "us_spot_etf_flows_net", generated_timestamp, unit="USD", preferred_intervals=("24h",)),
+        "exchange_inflow": _glassnode_latest(secondary_root, "exchange_inflow", generated_timestamp, unit="BTC"),
+        "exchange_outflow": _glassnode_latest(secondary_root, "exchange_outflow", generated_timestamp, unit="BTC"),
+        "exchange_netflow": _glassnode_latest(secondary_root, "exchange_netflow", generated_timestamp, unit="BTC"),
+        "exchange_balance": deepcopy(balances["glassnode_secondary"]),
+    }
     reconciliation = {"aum": {"reported": deepcopy(reported), "calculated": deepcopy(calculated), "difference_usd": difference_usd,
-                              "difference_percent": difference_percent}, "netflow": exchange_payload["netflow"], "exchange_balance": balance_spread}
-    all_warnings = sorted(set(warnings+fund_warn+premium_warn+exchange_warn+balance_warn))
+                              "difference_percent": difference_percent}, "netflow": exchange_payload["netflow"], "exchange_balance": balance_spread,
+                      "etf_net_flow": _comparison(etf["net_flow_usd_latest"], glassnode_confirmations["etf_net_flow"], unit="USD")}
+    all_warnings = sorted(set(warnings+fund_warn+premium_warn+exchange_warn+balance_warn +
+                              [warning for feature in glassnode_confirmations.values() for warning in feature.get("warnings", [])]))
+    balance_candles = exchange_payload["reserve_daily_candles"]
     return {"features": {"etf": etf, "exchange_flows": {key: value for key, value in exchange.items() if key != "cryptoquant_reserve"},
             "exchange_balances": balances, "premium_discount": {"gbtc_latest": premium}, "pressure": pressure,
-            "provider_reconciliation": reconciliation},
+            "secondary_confirmations": {"glassnode": glassnode_confirmations}, "provider_reconciliation": reconciliation},
         "series": {**etf_series, "fund_premium_discount": premium_series,
             "exchange_inflow": exchange_payload["series"]["inflow"], "exchange_outflow": exchange_payload["series"]["outflow"],
             "exchange_netflow": exchange_payload["series"]["netflow"], "exchange_reserve": exchange_payload["series"]["reserve"],
-            "exchange_balance": balance_series}, "series_metadata": {"exchange_balance": balance_metadata},
+            "exchange_balance": balance_candles,
+            "exchange_balance_source_points": balance_series}, "series_metadata": {"exchange_balance": balance_metadata,
+                "exchange_balance_candles": {"construction_stage": "processing",
+                    "construction_rule": "UTC hourly first/max/min/last", "source_provider": "cryptoquant",
+                    "source_endpoint_id": "exchange_reserve", "exchange_scope": exchange_scope,
+                    "records_available": len(balance_candles)}},
+        "technical_analysis": _exchange_balance_technical_analysis(balance_candles),
         "snapshots": {"funds": funds, "exchanges": exchanges}, "warnings": all_warnings,
         "generated_timestamp": generated_timestamp}
 

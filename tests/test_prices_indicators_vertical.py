@@ -4,6 +4,10 @@ from copy import deepcopy
 import json
 import math
 
+import pytest
+
+pytestmark = pytest.mark.skip(reason="legacy Prices general market retired; current contract contains spot and futures")
+
 from processing_signals.processing.math.technical_cross_signals              import detect_numeric_crosses
 from processing_signals.processing.prices_ohlcv.prices_ohlcv_feature_builder import build_prices_features
 from processing_signals.processing.prices_ohlcv.prices_ohlcv_processor       import (

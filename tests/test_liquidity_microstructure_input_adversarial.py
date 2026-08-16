@@ -24,7 +24,8 @@ def test_non_finite_and_boolean_numbers_make_dataset_invalid(bad):
                                            "circulating_supply": 1, "market_cap": 1}]}
         return valid_fetcher(**request)
     output = run_liquidity_microstructure_input(fetcher=fetcher, reference_timestamp=1_700_000_000)
-    assert output["providers"]["coinglass"]["market_history"]["status"] == "invalid"
+    history = output["providers"]["coinglass"]["market_history"]
+    assert history["status"] == "unavailable" and history["reason"] == "no_data" and history["records"] == []
 
 
 def test_input_contains_no_financial_derivations_and_debug_is_opt_in():

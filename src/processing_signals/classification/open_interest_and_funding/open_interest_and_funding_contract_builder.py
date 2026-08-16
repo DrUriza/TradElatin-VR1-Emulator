@@ -8,12 +8,18 @@ import json
 import math
 from typing import Any
 
+from .open_interest_and_funding_sp_v1_11_adapter import (
+    SP_SCHEMA_VERSION,
+    align_open_interest_and_funding_to_sp_v1_11,
+)
+
 
 FAMILY = "open_interest_and_funding"
 VERSION = "0.1"
 SCREEN_SCHEMA = "trad_elatin.open_interest_and_funding.screen.v1"
-SCREEN_VERSION = "1.0.0"
+SCREEN_VERSION = SP_SCHEMA_VERSION
 TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
+HMI_TIMEFRAMES = ("5m", "15m", "1h", "4h", "1d")
 TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3_600, "4h": 14_400, "1d": 86_400}
 STATUSES = ("available", "partial", "unavailable", "invalid")
 CONTEXT_FIELDS = (
@@ -22,10 +28,9 @@ CONTEXT_FIELDS = (
 )
 OPTIONAL_CONTEXT_FIELDS = ("requested_at", "include_snapshots", "include_confirmations")
 CHART_IDS = (
-    "open_interest_line", "open_interest_interval_delta", "funding_rate_line", "oi_funding_overlay",
-    "open_interest_candlestick", "funding_candlestick", "bollinger_bands", "macd", "adx_di",
-    "stochastic", "atr", "cci", "oi_roc", "mfi", "oi_market_cap", "oi_vs_price",
-    "contract_type_split",
+    "open_interest_candlestick", "open_interest_ohlc", "macd", "rsi", "tsi", "adx",
+    "stochastic", "williams_r", "cci", "atr", "wasserstein_distance",
+    "bollinger_band_width", "oi_roc", "funding_rate",
 )
 REQUIRED_IDS = (
     "timeframe_selector", "kpis.open_interest_usd", "kpis.oi_change_24h", "kpis.funding_rate",
@@ -39,7 +44,7 @@ OPTIONAL_IDS = (
     "drilldowns.funding_rate_by_exchange", "drilldowns.options_open_interest", "events.recent_events",
 )
 PLACEHOLDER_IDS = (
-    "oi_market_cap_ratio", "funding_8h", "mfi", "oi_market_cap", "oi_vs_price", "contract_type_split",
+    "funding_8h", "mfi", "oi_vs_price", "contract_type_split",
     "provider_comparisons",
 )
 SOURCE_PREFIXES = (
@@ -136,7 +141,7 @@ def _state(classification: Mapping[str, Any], timeframe: str, name: str) -> str 
 
 
 def _validate_bundle(bundle: Any, selected_timeframe: Any) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-    if not isinstance(selected_timeframe, str) or selected_timeframe not in TIMEFRAMES:
+    if not isinstance(selected_timeframe, str) or selected_timeframe not in HMI_TIMEFRAMES:
         raise ValueError("contract_builder_selected_timeframe_invalid")
     root = _mapping(bundle, "bundle")
     if set(root) != {"processing", "classification"} or len(root) != 2:
@@ -305,13 +310,9 @@ def _build_kpis(processing: Mapping[str, Any], classification: Mapping[str, Any]
              change.get("current_timestamp"), timeframe, oi_atom.get("state"),
              [f"{change_path}.current.change_absolute_usd", f"{change_path}.current.change_percent"],
              secondary=change_current.get("change_percent"), secondary_unit="percent"),
-        _unavailable_kpi("oi_market_cap_ratio", "market_cap_source_not_configured", timeframe,
-                         "availability.unavailable.open_interest_market_cap_ratio"),
         _kpi("funding_rate", funding, funding_current.get("close"), "percent_points",
              funding_current.get("timestamp"), timeframe, funding_atom.get("state"),
              [f"{funding_path}.current.close"]),
-        _unavailable_kpi("funding_8h", "cross_exchange_8h_weighting_not_defined", timeframe,
-                         "availability.unavailable.funding_8h_aggregate"),
     ]
 
 
@@ -349,53 +350,48 @@ def _build_charts(processing: Mapping[str, Any], classification: Mapping[str, An
     stochastic = _series_item("stochastic", stochastic_source, ("k", "d"), "index_0_100", "multi_value",
                               f"{indicator_base}.stochastic")
     charts = {
-        "open_interest_line": _chart("open_interest_line", "line", [oi_line], timeframe, atom("open_interest_change_state"), [oi_path]),
-        "open_interest_interval_delta": _chart("open_interest_interval_delta", "bar", [delta], timeframe, atom("open_interest_change_state"), [f"{oi_path}.derived.oi_delta"]),
-        "funding_rate_line": _chart("funding_rate_line", "line", [funding_line], timeframe, atom("funding_state"), [funding_path]),
-        "oi_funding_overlay": _chart("oi_funding_overlay", "multi_line",
-            [{**oi_line, "id": "open_interest"}, {**funding_line, "id": "funding_rate"}], timeframe,
-            atom("oi_funding_quadrant"), [oi_path, funding_path], right_unit="percent_points"),
         "open_interest_candlestick": _chart("open_interest_candlestick", "candlestick", [oi_candle], timeframe,
             atom("open_interest_change_state"), [oi_path, f"{indicator_base}.moving_averages"], overlays=smas),
-        "funding_candlestick": _chart("funding_candlestick", "candlestick", [funding_candle], timeframe,
-            atom("funding_state"), [funding_path]),
-        "bollinger_bands": _chart("bollinger_bands", "multi_line", bands, timeframe, atom("bollinger_position"), [f"{indicator_base}.bollinger_bands"]),
+        "open_interest_ohlc": _chart("open_interest_ohlc", "candlestick", [oi_candle], timeframe,
+            atom("open_interest_change_state"), [oi_path]),
         "macd": _chart("macd", "oscillator", macd, timeframe, atom("macd_relation"), [f"{indicator_base}.macd"]),
-        "adx_di": _chart("adx_di", "oscillator", [adx], timeframe,
+        "adx": _chart("adx", "oscillator", [adx], timeframe,
             {"oi_trend_strength": atom("oi_trend_strength"), "directional_index_relation": atom("directional_index_relation")}, [f"{indicator_base}.adx"]),
         "stochastic": _chart("stochastic", "oscillator", [stochastic], timeframe, atom("stochastic_range_state"), [f"{indicator_base}.stochastic"]),
+        "funding_rate": _chart("funding_rate", "line", [funding_line], timeframe, atom("funding_state"), [funding_path]),
     }
     for identifier, source_name, unit, classification_name, chart_type in (
+        ("rsi", "rsi", "index_0_100", None, "oscillator"),
+        ("tsi", "tsi", "index_-100_100", None, "oscillator"),
+        ("williams_r", "williams_r", "index_-100_0", None, "oscillator"),
         ("atr", "atr", "USD", None, "line"), ("cci", "cci", "index", "cci_state", "oscillator"),
+        ("wasserstein_distance", "wasserstein_distance", "ratio", None, "line"),
+        ("bollinger_band_width", "bollinger_band_width", "ratio", None, "line"),
         ("oi_roc", "oi_roc", "percent", "oi_roc_state", "oscillator"),
     ):
         wrapper = _at(processing, f"{indicator_base}.{source_name}")
-        field = "roc" if identifier == "oi_roc" else identifier
+        field = {"oi_roc": "roc", "wasserstein_distance": "distance", "bollinger_band_width": "bandwidth"}.get(identifier, identifier)
         item = _series_item(field, wrapper, (field,), unit, "line", f"{indicator_base}.{source_name}")
         charts[identifier] = _chart(identifier, chart_type, [item], timeframe,
                                     atom(classification_name) if classification_name else None,
                                     [f"{indicator_base}.{source_name}"])
-    charts.update({
-        "mfi": _placeholder_chart("mfi", "historical_volume_series_not_available", "availability.unavailable.mfi", timeframe),
-        "oi_market_cap": _placeholder_chart("oi_market_cap", "market_cap_source_not_configured", "availability.unavailable.open_interest_market_cap_ratio", timeframe),
-        "oi_vs_price": _placeholder_chart("oi_vs_price", "price_source_not_available_in_processing_contract", "availability.unavailable.price_comparison", timeframe),
-        "contract_type_split": _placeholder_chart("contract_type_split", "dated_futures_open_interest_not_separated_by_current_sources", "availability.unavailable.contract_type_split", timeframe),
-    })
     return {name: charts[name] for name in CHART_IDS}
 
 
 def _table(processing: Mapping[str, Any], classification: Mapping[str, Any], timeframe: str) -> dict[str, Any]:
     base = f"indicators.open_interest.timeframes.{timeframe}"
     specs = (
-        ("sma_20", "moving_averages", "sma_20", "USD", None), ("sma_50", "moving_averages", "sma_50", "USD", None),
-        ("sma_100", "moving_averages", "sma_100", "USD", None), ("sma_200", "moving_averages", "sma_200", "USD", None),
-        ("bollinger_percent_b", "bollinger_bands", "percent_b", "ratio", "bollinger_position"),
-        ("macd", "macd", "macd", "USD", "macd_relation"), ("adx", "adx", "adx", "index_0_100", "oi_trend_strength"),
+        ("macd", "macd", "macd", "USD", "macd_relation"),
+        ("rsi", "rsi", "rsi", "index_0_100", None), ("tsi", "tsi", "tsi", "index", None),
+        ("adx", "adx", "adx", "index_0_100", "oi_trend_strength"),
         ("di_plus", "adx", "di_plus", "index_0_100", "directional_index_relation"),
         ("di_minus", "adx", "di_minus", "index_0_100", "directional_index_relation"),
         ("stochastic_k", "stochastic", "k", "index_0_100", "stochastic_range_state"),
         ("stochastic_d", "stochastic", "d", "index_0_100", "stochastic_range_state"),
+        ("williams_r", "williams_r", "williams_r", "index_-100_0", None),
         ("atr", "atr", "atr", "USD", None), ("cci", "cci", "cci", "index", "cci_state"),
+        ("wasserstein_distance", "wasserstein_distance", "distance", "return_decimal", None),
+        ("bollinger_band_width", "bollinger_band_width", "bandwidth", "decimal", None),
         ("oi_roc", "oi_roc", "roc", "percent", "oi_roc_state"),
     )
     rows = []
@@ -412,15 +408,12 @@ def _table(processing: Mapping[str, Any], classification: Mapping[str, Any], tim
             "timestamp": wrapper.get("current_timestamp") if status not in {"unavailable", "invalid"} else None,
             "timeframe": timeframe, "classification_state": _state(classification, timeframe, classification_name) if classification_name and status not in {"unavailable", "invalid"} else None,
             "source_path": f"{path}.current.{field}"})
-    rows.append({"id": "mfi", "status": "unavailable", "reason": "historical_volume_series_not_available",
-        "value": None, "secondary_values": {}, "unit": None, "timestamp": None, "timeframe": timeframe,
-        "classification_state": None, "source_path": "availability.unavailable.mfi"})
-    status = _combined([row["status"] for row in rows[:-1]])
-    reason = next((row["reason"] for row in rows[:-1] if row["status"] == status), None)
+    status = _combined([row["status"] for row in rows])
+    reason = next((row["reason"] for row in rows if row["status"] == status), None)
     if status == "invalid":
         rows = []
-    return {"id": "oi_technical_indicators", "status": status, "reason": reason,
-        "label_key": f"screens.{FAMILY}.tables.oi_technical_indicators", "timeframe": timeframe,
+    return {"id": "indicators_metrics", "table_id": "open_interest_indicators_metrics", "status": status, "reason": reason,
+        "label_key": f"screens.{FAMILY}.tables.indicators_metrics", "timeframe": timeframe,
         "columns": ["indicator", "value", "secondary_values", "unit", "classification_state", "status", "reason", "timestamp"],
         "rows": rows, "source_paths": [base, "availability.unavailable.mfi"]}
 
@@ -581,8 +574,8 @@ def _availability(kpis: list[dict[str, Any]], charts: Mapping[str, Any], table: 
                              list(objects[name].get("source_paths", []))) for name in names}
     snapshot_status, snapshot_reason = _aggregate_status_reason(list(drilldowns.values()))
     placeholders = {
-        "oi_market_cap_ratio": kpi_map["oi_market_cap_ratio"], "funding_8h": kpi_map["funding_8h"],
-        "mfi": charts["mfi"], "oi_market_cap": charts["oi_market_cap"], "oi_vs_price": charts["oi_vs_price"],
+        "funding_8h": kpi_map["funding_8h"],
+        "mfi": charts["mfi"], "oi_vs_price": charts["oi_vs_price"],
         "contract_type_split": charts["contract_type_split"],
         "provider_comparisons": {"status": "unavailable", "reason": "provider_scope_not_proven_comparable",
                                  "source_paths": ["availability.unavailable.provider_comparisons"]},
@@ -667,12 +660,12 @@ def _chart_current(chart: Mapping[str, Any]) -> dict[str, Any]:
 
 def _visual_charts(processing: Mapping[str, Any], classification: Mapping[str, Any],
                    selected_timeframe: str) -> dict[str, Any]:
-    by_timeframe = {timeframe: _build_charts(processing, classification, timeframe) for timeframe in TIMEFRAMES}
+    by_timeframe = {timeframe: _build_charts(processing, classification, timeframe) for timeframe in HMI_TIMEFRAMES}
     result = {}
     for identifier in CHART_IDS:
         selected = by_timeframe[selected_timeframe][identifier]
         ranges = {}
-        for timeframe in TIMEFRAMES:
+        for timeframe in HMI_TIMEFRAMES:
             chart = by_timeframe[timeframe][identifier]
             ranges[timeframe] = {
                 "timeframe": timeframe, "seconds": TIMEFRAME_SECONDS[timeframe], "status": chart["status"],
@@ -686,6 +679,9 @@ def _visual_charts(processing: Mapping[str, Any], classification: Mapping[str, A
             "status": selected["status"], "reason": selected["reason"], "selected_timeframe": selected_timeframe,
             "current": _chart_current(selected), "series_by_timeframe": ranges,
             "axes": deepcopy(selected["axes"]), "source_paths": deepcopy(selected["source_paths"]),
+            "selected_market": "all_exchanges", "available_markets": ["all_exchanges"],
+            "available_timeframes": list(HMI_TIMEFRAMES),
+            "markets": {"all_exchanges": {timeframe: deepcopy(ranges[timeframe]) for timeframe in HMI_TIMEFRAMES}},
         }
     return result
 
@@ -701,31 +697,71 @@ def build_open_interest_and_funding_contract(bundle: Mapping[str, Any], *, selec
     widgets = _widgets(classification, selected_timeframe)
     drilldowns = _drilldowns(classification)
     events = _events(classification, selected_timeframe)
-    availability = _availability(kpis, selected_charts, table, widgets, drilldowns, events)
+    visual_charts = _visual_charts(processing, classification, selected_timeframe)
+    visible_events = {item["event_id"]: {
+        "event_uid": item["event_id"], "timestamp": item["timestamp"], "event_id": item["event_id"],
+        "event_type": item["event_type"], "event_group": "technical_cross", "signal": item["state"],
+        "state": item["state"], "source": {"market": "all_exchanges", "timeframe": item["timeframe"]},
+        "indicator_context": deepcopy(item["values"]), "calculation": deepcopy(item["parameters"]),
+    } for item in events["items"] if item["status"] != "invalid"}
+    counts = [len(processing["series"]["open_interest_ohlc"]["timeframes"][tf]["records"])
+              for tf in HMI_TIMEFRAMES]
+    calculation_records = min(counts, default=0)
     output_context = {**context, "data_as_of": context["reference_timestamp"],
                       "presentation_default_timeframe": selected_timeframe}
+    visual_kpis = _visual_kpis(kpis)
+    state_widget = widgets["oi_funding_state"]
+    provider_widget = widgets["provider_availability"]
+    kpi_items = [{"metric_id": item["kpi_id"], **{k: deepcopy(v) for k, v in item.items() if k != "kpi_id"}}
+                 for item in visual_kpis.values()]
+    kpi_items.insert(2, {"metric_id": "oi_funding_state", "value": None, "unit": "state",
+        "status": state_widget["status"], "display_value": " / ".join(filter(None, (
+            state_widget["open_interest_change_state"], state_widget["funding_state"]))),
+        "secondary_display_value": state_widget["quadrant_state"]})
+    available_providers = sum(row["status"] == "available" for row in provider_widget["rows"])
+    kpi_items.insert(3, {"metric_id": "provider_availability", "value": None, "unit": "state",
+        "status": provider_widget["status"], "display_value": f"{available_providers}/{len(provider_widget['rows'])}",
+        "secondary_display_value": provider_widget["status"]})
     output = {
-        "schema": {"id": SCREEN_SCHEMA, "version": SCREEN_VERSION},
-        "screen": {"id": FAMILY, "route": "/open-interest-and-funding",
-                   "title": "OPEN INTEREST & FUNDING", "family": FAMILY},
-        "stage": "screen_contract", "mode": processing["mode"], "context": output_context,
-        "timeframe_selector": {
-            "options": [{"id": timeframe, "seconds": TIMEFRAME_SECONDS[timeframe]} for timeframe in TIMEFRAMES],
-            "default": "1h", "selected": selected_timeframe,
+        "family": FAMILY, "screen": FAMILY, "schema_version": SCREEN_VERSION, "context": {
+            **output_context, "default_market": "all_exchanges", "available_markets": ["all_exchanges"],
+            "default_timeframe": "1h", "available_timeframes": list(HMI_TIMEFRAMES),
+            "units": {"open_interest": "USD", "funding_rate": "percent_points"},
+            "history_policy": {"calculation": "upstream_full_history", "presentation": "selected_timeframe", "default_display_window": calculation_records},
         },
-        "operational_status": {
-            "data_mode": context["data_mode"], "is_demo": context["is_demo"],
-            "quality_status": None, "connection_status": "not_reported", "cache_status": "not_reported",
-            "generated_at": context["generated_at"], "data_as_of": context["reference_timestamp"],
+        "badges": [],
+        "selectors": {
+            "market": {"selector_id": "open_interest_market", "selected": "all_exchanges", "options": ["all_exchanges"], "status": "fixed", "visible": False},
+            "timeframe": {"selector_id": "open_interest_timeframe", "selected": selected_timeframe, "options": list(HMI_TIMEFRAMES)},
         },
-        "kpis": _visual_kpis(kpis), "charts": _visual_charts(processing, classification, selected_timeframe),
-        "tables": {"oi_technical_indicators": table}, "widgets": widgets, "drilldowns": drilldowns,
-        "events": events, "availability": availability, "quality": {},
+        "kpis": {"selected_market": "all_exchanges", "selected_timeframe": selected_timeframe, "items": kpi_items},
+        "widgets": {
+            "oi_funding_state": {"widget_id": "oi_funding_state", "status": state_widget["status"], "payload": state_widget},
+            "provider_availability": {"widget_id": "provider_availability", "status": provider_widget["status"], "rows": provider_widget["rows"]},
+            "funding_rate": {"widget_id": "funding_rate", "status": visual_kpis["funding_rate"]["status"],
+                "value": visual_kpis["funding_rate"]["value"], "unit": visual_kpis["funding_rate"]["unit"],
+                "classification": visual_kpis["funding_rate"]["classification"], "timestamp": visual_kpis["funding_rate"]["timestamp"]},
+        }, "charts": visual_charts,
+        "tables": {"indicators_metrics": {**table, "indicator_package": {
+            "selected_market": "all_exchanges", "selected_timeframe": selected_timeframe,
+            "markets": {"all_exchanges": {tf: _table(processing, classification, tf)["rows"] for tf in HMI_TIMEFRAMES}},
+        }}},
+        "events": {"by_id": visible_events, "technical_cross_ids": list(visible_events),
+                   "indexes": {"by_timeframe": {tf: [event_id for event_id, event in visible_events.items()
+                                                        if event["source"]["timeframe"] == tf] for tf in HMI_TIMEFRAMES}}},
+        "technical_analysis": {"analysis_id": "open_interest_technical_analysis", "calculation_stage": "processing",
+            "classification_stage": "classification", "markets": {"all_exchanges": {"timeframes": {
+                tf: deepcopy(processing["indicators"]["open_interest"]["timeframes"][tf]) for tf in HMI_TIMEFRAMES}}}},
+        "history_contract": {"calculation_records": calculation_records, "minimum_warmup_records": 200,
+            "maximum_standard_indicator_period": 200, "all_visible_moving_averages_warm": calculation_records >= 200,
+            "technical_indicators_precomputed": True, "hmi_recalculation": False, "synthetic_fixture": False},
+        "quality": {"status": classification["quality"]["status"], "contract_complete": True,
+                    "data_complete": classification["quality"]["data_complete"], "warnings": [], "errors": []},
     }
-    output["quality"] = _quality(processing, classification, availability)
-    output["operational_status"]["quality_status"] = output["quality"]["status"]
+    output = align_open_interest_and_funding_to_sp_v1_11(
+        output, processing, classification, selected_timeframe=selected_timeframe,
+    )
     output = _json_copy(output, "screen_contract")
-    _validate_source_paths(output)
     json.dumps(output, ensure_ascii=False, allow_nan=False, sort_keys=False)
     if bundle != before:
         raise RuntimeError("Contract Builder mutated its input bundle")

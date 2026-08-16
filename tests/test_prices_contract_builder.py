@@ -15,7 +15,7 @@ def test_contract_has_complete_prices_screen_structure():
     classification = run_prices_ohlcv_classification(processing)
     contract       = build_prices_screen_contract(processing, classification)
     assert len(contract["charts"]) == 10
-    assert contract["selectors"]["market"]["options"] == list(MARKETS)
+    assert contract["selectors"]["market"]["options"] == ["general"]
     assert contract["selectors"]["timeframe"]["options"] == list(TIMEFRAMES)
     tables = contract["tables"]["indicators_metrics"]
     assert len(tables["indicator_package"]["rows"]) == 11
@@ -40,8 +40,8 @@ def test_main_chart_switches_market_and_timeframe_together():
     contract   = build_prices_screen_contract(processing, run_prices_ohlcv_classification(processing))
     chart      = contract["charts"]["ohlcv"]
     assert chart["selected_market"] == "general" and chart["selected_timeframe"] == "1h"
-    assert set(chart["markets"]) == set(MARKETS)
-    assert chart["optional_overlays"] == {"spot_close": True, "futures_close": True, "general_close": True}
+    assert set(chart["markets"]) == {"general"}
+    assert chart["optional_overlays"] == {"general_close": True, "regression_channel": True, "moving_average_cross_markers": True, "regression_bollinger_cross_markers": True, "buy_sell_volume_split": True}
 
 
 def test_events_keep_market_and_timeframe_sources():
@@ -55,12 +55,13 @@ def test_single_selection_is_shared_by_every_consumer():
     processing = make_processing_output()
     processing["features"]["market_selector"].update({"selected_market": "spot", "selected_timeframe": "4h"})
     contract = build_prices_screen_contract(processing, run_prices_ohlcv_classification(processing))
-    assert contract["selectors"]["market"]["selected"] == "spot"
+    assert contract["selectors"]["market"]["selected"] == "general"
+    assert contract["selectors"]["market"]["visible"] is False
     assert contract["selectors"]["timeframe"]["selected"] == "4h"
-    assert all(chart["selected_market"] == "spot" and chart["selected_timeframe"] == "4h" for chart in contract["charts"].values())
+    assert all(chart["selected_market"] == "general" and chart["selected_timeframe"] == "4h" for chart in contract["charts"].values())
     tables = contract["tables"]["indicators_metrics"]
-    assert tables["indicator_package"]["selected_market"] == "spot" and tables["indicator_package"]["selected_timeframe"] == "4h"
-    assert contract["comparison"]["spot_futures_general"]["selected_timeframe"] == "4h"
+    assert tables["indicator_package"]["selected_market"] == "general" and tables["indicator_package"]["selected_timeframe"] == "4h"
+    assert "comparison" not in contract
 
 
 def test_unavailable_is_valid_but_missing_classification_is_reported():

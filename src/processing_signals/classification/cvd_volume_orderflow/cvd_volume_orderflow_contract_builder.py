@@ -7,21 +7,24 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .cvd_sp_v1_5_adapter import align_cvd_contract_to_sp_v1_5
+
 FAMILY = "cvd_volume_orderflow"
 PROCESSING_VERSION = "0.1.0"
 CLASSIFICATION_VERSION = "0.1.0"
 SCREEN_SCHEMA = "trad_elatin.cvd_volume_orderflow.screen.v1"
-SCREEN_VERSION = "1.0.0"
+SCREEN_VERSION = "1.5.0"
 SCREEN_ID = "cvd_volume_orderflow"
 SCREEN_ROUTE = "/cvd-orderflow"
 SCREEN_TITLE = "CVD & ORDER FLOW"
 SCREEN_SUBTITLE = "Cumulative volume delta, trades & market microstructure"
-MARKETS = ("general", "spot", "futures")
+MARKETS = ("spot", "futures")
 TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
 TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
-DEFAULT_MARKET = "general"
+DEFAULT_MARKET = "spot"
 DEFAULT_TIMEFRAME = "15m"
 DISPLAY_POINT_LIMIT = 220
+CALCULATION_HISTORY_LIMIT = 730
 VALID_SOURCE_STATUS = {"available", "partial", "unavailable", "invalid"}
 VALID_QUALITY_STATUS = {"ok", "partial", "invalid"}
 _PRIORITY = {"available": 0, "partial": 1, "unavailable": 2, "invalid": 3}
@@ -31,15 +34,34 @@ def _sequence(value: Any) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
 
-def _finite_tree(value: Any, path: str = "bundle") -> None:
+def _find_non_finite_path(value: Any, path: str) -> str | None:
     if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"non_finite_value:{path}")
+        return path
     if isinstance(value, Mapping):
         for key, child in value.items():
-            _finite_tree(child, f"{path}.{key}")
+            found = _find_non_finite_path(child, f"{path}.{key}")
+            if found is not None:
+                return found
     elif _sequence(value):
         for index, child in enumerate(value):
-            _finite_tree(child, f"{path}[{index}]")
+            found = _find_non_finite_path(child, f"{path}[{index}]")
+            if found is not None:
+                return found
+    return None
+
+
+def _finite_tree(value: Any, path: str = "bundle") -> None:
+    """Validate finiteness without materializing a path string for every node."""
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, float) and not math.isfinite(current):
+            found = _find_non_finite_path(value, path)
+            raise ValueError(f"non_finite_value:{found or path}")
+        if isinstance(current, Mapping):
+            stack.extend(current.values())
+        elif _sequence(current):
+            stack.extend(current)
 
 
 def _number(value: Any, path: str, *, nullable: bool = True) -> Any:
@@ -184,6 +206,9 @@ class CvdVolumeOrderflowContractBuilder:
         context, parameters, markets, quality = (contract.get(key) for key in ("context", "parameters", "markets", "quality"))
         if not all(isinstance(value, Mapping) for value in (context, parameters, markets, quality)) or set(markets) != set(MARKETS):
             raise ValueError("invalid_processing_structure")
+        cross_market = contract.get("cross_market")
+        if not isinstance(cross_market, Mapping) or not isinstance(cross_market.get("window_summaries"), Mapping):
+            raise ValueError("invalid_cross_market")
         if context.get("data_mode") == "synthetic" and context.get("is_demo") is not True:
             raise ValueError("synthetic_requires_demo")
         if context.get("data_mode") == "live" and context.get("is_demo") is not False:
@@ -231,6 +256,8 @@ class CvdVolumeOrderflowContractBuilder:
         markets = classified.get("markets")
         if not isinstance(markets, Mapping) or set(markets) != set(MARKETS):
             raise ValueError("invalid_classification_markets")
+        if not isinstance(classified.get("cross_market"), Mapping):
+            raise ValueError("invalid_cross_market_classification")
         if quality.get("status") not in VALID_QUALITY_STATUS:
             raise ValueError("invalid_classification_quality")
         _timestamp(context.get("classification_timestamp"), "classification.context.classification_timestamp", nullable=False)
@@ -262,44 +289,45 @@ class CvdVolumeOrderflowContractBuilder:
 
     def build_selectors(self, processing: Mapping[str, Any]) -> dict[str, Any]:
         return {"market": {"id": "market_selector", "selected": self.selected_market,
-                "options": [{"id": item, "label": item.title()} for item in MARKETS]},
+                "options": [{"id": item, "label": item.title()} for item in MARKETS],
+                "status": "context_only", "visible": False},
             "timeframe": {"id": "timeframe_selector", "selected": self.selected_timeframe,
                 "options": [{"id": item, "seconds": TIMEFRAME_SECONDS[item],
                     "status": processing["markets"][self.selected_market]["timeframes"][item]["status"]} for item in TIMEFRAMES]}}
 
     def _kpi(self, identifier: str, title: str, value: Any, unit: str, status: str, reason: Any, timestamp: Any,
              classification: Any, paths: Sequence[str], *, secondary: Mapping[str, Any] | None = None,
-             window: str | None = "1h", format_hint: str = "number") -> dict[str, Any]:
+             window: str | None = "1h", format_hint: str = "number", market: str = "cross_market") -> dict[str, Any]:
         return {"kpi_id": identifier, "title": title, "status": status, "reason": _reason(status, reason), "value": value,
             "unit": unit, "secondary_values": copy.deepcopy(dict(secondary or {})), "timestamp": timestamp,
-            "market": self.selected_market, "window": window, "classification": _classification(classification),
+            "market": market, "window": window, "classification": _classification(classification),
             "format_hint": format_hint, "source_paths": list(paths)}
 
     def build_kpis(self, processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
-        market = self.selected_market
-        summary = processing["markets"][market]["window_summaries"]["1h"]
-        atoms = classification["classifications"]["markets"][market]["window_summaries"]["1h"]["atoms"]
-        base = f"processing.markets.{market}.window_summaries.1h"
-        cbase = f"classification.classifications.markets.{market}.window_summaries.1h.atoms"
+        summary = processing["cross_market"]["window_summaries"]["1h"]
+        atoms = classification["classifications"]["cross_market"]["window_summaries"]["1h"]["atoms"]
+        base = "processing.cross_market.window_summaries.1h"
+        cbase = "classification.classifications.cross_market.window_summaries.1h.atoms"
         ratio, ratio_status, ratio_reason = _metric(summary["buy_sell_ratio"], f"{base}.buy_sell_ratio")
         imbalance, imbalance_status, imbalance_reason = _metric(summary["order_flow_imbalance"], f"{base}.order_flow_imbalance")
         efficiency, efficiency_status, efficiency_reason = _metric(summary["flow_efficiency"], f"{base}.flow_efficiency")
         buy_share, _, _ = _metric(summary["buy_share"], f"{base}.buy_share")
         sell_share, _, _ = _metric(summary["sell_share"], f"{base}.sell_share")
-        footprint = processing["markets"][market].get("footprint_summaries", {}).get("1h", {})
-        footprint_status = _status(footprint.get("status", "unavailable"), "processing.footprint.status")
-        price = processing["markets"][market].get("price_vs_vwap", {})
-        price_status = _status(price.get("status", "unavailable"), "processing.price_vs_vwap.status")
-        price_atom = classification["classifications"]["markets"][market].get("price_vs_vwap")
+        footprint = processing["cross_market"].get("footprint_summaries", {}).get("1h", {})
+        footprint_status = _status(footprint.get("status", "unavailable"), "processing.cross_market.footprint.status")
         source_status = _status(summary.get("status"), f"{base}.status")
         timestamp = _timestamp(summary.get("last_timestamp"), f"{base}.last_timestamp")
+        volume_ratio_source = processing["cross_market"]["volume_ratios"]["futures_vs_spot"]["1h"]
+        volume_ratio_status = _status(volume_ratio_source.get("status", "unavailable"), "processing.cross_market.volume_ratio.status")
+        volume_ratio = _number(volume_ratio_source.get("value"), "processing.cross_market.volume_ratio.value")
+        volume_ratio_atom = classification["classifications"]["cross_market"]["volume_ratios"]["futures_vs_spot"]["1h"]
         return {
             "delta_1h": self._kpi("delta_1h", "Delta 1H", _number(summary.get("volume_delta_usd"), f"{base}.volume_delta_usd"), "USD", source_status, summary.get("reason"), timestamp, atoms.get("delta_state"), [f"{base}.volume_delta_usd", f"{cbase}.delta_state"], format_hint="currency"),
             "buy_sell_ratio_1h": self._kpi("buy_sell_ratio_1h", "Buy/Sell", ratio, "ratio", ratio_status, ratio_reason, timestamp, atoms.get("buy_sell_pressure_state"), [f"{base}.buy_sell_ratio.value", f"{base}.buy_share.value", f"{base}.sell_share.value", f"{cbase}.buy_sell_pressure_state"], secondary={"buy_share": {"value": buy_share, "unit": "decimal"}, "sell_share": {"value": sell_share, "unit": "decimal"}}),
-            "order_flow_1h": self._kpi("order_flow_1h", "Order Flow", imbalance, "decimal", imbalance_status, imbalance_reason, timestamp, atoms.get("order_flow_state"), [f"{base}.order_flow_imbalance.value", f"{cbase}.order_flow_state"]),
+            "futures_vs_spot_volume_ratio_1h": {**self._kpi("futures_vs_spot_volume_ratio_1h", "Futures vs Spot Volume Ratio", volume_ratio, "ratio", volume_ratio_status, volume_ratio_source.get("reason"), volume_ratio_source.get("timestamp"), volume_ratio_atom, ["processing.cross_market.volume_ratios.futures_vs_spot.1h"], secondary={"futures_volume_usd": {"value": volume_ratio_source.get("futures_volume_usd"), "unit": "USD"}, "spot_volume_usd": {"value": volume_ratio_source.get("spot_volume_usd"), "unit": "USD"}}), "provider_group": "API Market", "recalculate_in_hmi": False},
             "flow_efficiency_1h": self._kpi("flow_efficiency_1h", "Flow Efficiency", efficiency, "decimal", efficiency_status, efficiency_reason, timestamp, atoms.get("flow_efficiency_state"), [f"{base}.flow_efficiency.value", f"{cbase}.flow_efficiency_state"]),
-            "vwap_1h": self._kpi("vwap_1h", "VWAP 1H", _number(footprint.get("vwap_usd"), "processing.footprint.vwap"), "USD", footprint_status, footprint.get("reason"), timestamp, None, [f"processing.markets.{market}.footprint_summaries.1h.vwap_usd"], format_hint="currency"),
-            "price_vs_vwap": self._kpi("price_vs_vwap", "Price vs VWAP", _number(price.get("value"), "processing.price_vs_vwap.value"), "decimal", price_status, price.get("reason"), _timestamp(price.get("price_timestamp"), "processing.price_vs_vwap.timestamp"), price_atom, [f"processing.markets.{market}.price_vs_vwap.value", f"classification.classifications.markets.{market}.price_vs_vwap"], window=None),
+            "vwap_1h": self._kpi("vwap_1h", "VWAP 1H", _number(footprint.get("vwap_usd"), "processing.cross_market.footprint.vwap"), "USD", footprint_status, footprint.get("reason"), timestamp, None, ["processing.cross_market.footprint_summaries.1h.vwap_usd"], format_hint="currency"),
+            "order_flow_imbalance_1h": self._kpi("order_flow_imbalance_1h", "Order Flow Imbalance", imbalance, "decimal", imbalance_status, imbalance_reason, timestamp, atoms.get("order_flow_state"), [f"{base}.order_flow_imbalance.value", f"{cbase}.order_flow_state"]),
         }
 
     def _visual_status(self, source: Mapping[str, Any], count: int) -> tuple[str, str | None]:
@@ -318,41 +346,52 @@ class CvdVolumeOrderflowContractBuilder:
         for timeframe in TIMEFRAMES:
             source = processing["markets"][market]["timeframes"][timeframe]
             records = source["records"]
-            points = [{"timestamp": row["timestamp"], "open": _number(row.get("cvd_ohlc_usd", {}).get("open"), "cvd.open"),
+            full_points = [{"timestamp": row["timestamp"], "open": _number(row.get("cvd_ohlc_usd", {}).get("open"), "cvd.open"),
                 "high": _number(row.get("cvd_ohlc_usd", {}).get("high"), "cvd.high"), "low": _number(row.get("cvd_ohlc_usd", {}).get("low"), "cvd.low"),
                 "close": _number(row.get("cvd_ohlc_usd", {}).get("close"), "cvd.close"), "is_partial": row.get("is_partial"),
-                "continuity_status": row.get("continuity_status")} for row in records[-self.display_point_limit:]]
+                "continuity_status": row.get("continuity_status")} for row in records[-CALCULATION_HISTORY_LIMIT:]]
+            points = full_points[-self.display_point_limit:]
             status, reason = self._visual_status(source, len(points))
             series[timeframe] = {"timeframe": timeframe, "seconds": TIMEFRAME_SECONDS[timeframe], "status": status, "reason": reason,
                 "records_available": len(records), "records_returned": len(points), "history_truncated": len(records) > self.display_point_limit,
-                "points": points, "source_path": f"processing.markets.{market}.timeframes.{timeframe}.records"}
-        selected = series[self.selected_timeframe]["points"]
+                "source_path": f"processing.markets.{market}.timeframes.{timeframe}.records",
+                "representation": "candlestick", "candle_fields": ["timestamp", "open", "high", "low", "close"],
+                "candle_count": len(points), "candles": points,
+                "calculation_history": {"record_count": len(full_points), "candles": full_points,
+                    "recalculate_in_hmi": False, "fabricated_records": 0}}
+        selected = series[self.selected_timeframe]["candles"]
         chart_status = _combine([payload["status"] for payload in series.values()])
         return {"chart_id": f"cvd_{market}", "title": f"CVD {market.title()}", "subtitle": "Cumulative Volume Delta",
-            "chart_type": "candlestick", "preferred_representation": "candlestick", "fallback_representation": "line_close",
+            "chart_type": "candlestick", "preferred_representation": "candlestick", "ohlc_available": True,
             "native_ohlc": False, "construction": "derived_from_interval_volume_delta_path", "unit": "USD",
             "status": chart_status, "reason": _reason(chart_status, "chart_series_incomplete"),
             "selected_timeframe": self.selected_timeframe, "current": copy.deepcopy(selected[-1]) if selected else None,
             "series_by_timeframe": series, "source_paths": [f"processing.markets.{market}.timeframes"]}
 
-    def build_delta_chart(self, processing: Mapping[str, Any]) -> dict[str, Any]:
-        market, series = self.selected_market, {}
+    def build_delta_chart(self, processing: Mapping[str, Any], market: str) -> dict[str, Any]:
+        series = {}
         for timeframe in TIMEFRAMES:
             source = processing["markets"][market]["timeframes"][timeframe]
             records = source["records"]
-            points = [{"timestamp": row["timestamp"], "volume_delta_usd": _number(row.get("volume_delta_usd"), "delta.value"),
-                "delta_ma_21_usd": _number(row.get("delta_ma_21_usd"), "delta.ma"), "is_partial": row.get("is_partial"),
-                "continuity_status": row.get("continuity_status")} for row in records[-self.display_point_limit:]]
+            full_points = [{"timestamp": row["timestamp"], "delta_buy_sell_usd": _number(row.get("cvd_ohlc_usd", {}).get("close"), "delta.close") - _number(row.get("cvd_ohlc_usd", {}).get("open"), "delta.open"),
+                "delta_ma_21": _number(row.get("delta_ma_21_usd"), "delta.ma"),
+                "direction": "buy" if row.get("volume_delta_usd", 0) > 0 else "sell" if row.get("volume_delta_usd", 0) < 0 else "neutral"} for row in records[-CALCULATION_HISTORY_LIMIT:]]
+            points = full_points[-self.display_point_limit:]
             status, reason = self._visual_status(source, len(points))
             series[timeframe] = {"timeframe": timeframe, "seconds": TIMEFRAME_SECONDS[timeframe], "status": status, "reason": reason,
                 "records_available": len(records), "records_returned": len(points), "history_truncated": len(records) > self.display_point_limit,
-                "points": points, "source_path": f"processing.markets.{market}.timeframes.{timeframe}.records"}
-        selected = series[self.selected_timeframe]["points"]
+                "bars": points, "calculation": "cvd_close - cvd_open",
+                "source_paths": [f"processing.markets.{market}.timeframes.{timeframe}.records"],
+                "calculation_history": {"record_count": len(full_points),
+                    "timestamps": [row["timestamp"] for row in full_points],
+                    "delta_buy_sell_usd": [row["delta_buy_sell_usd"] for row in full_points],
+                    "delta_ma_21": [row["delta_ma_21"] for row in full_points],
+                    "recalculate_in_hmi": False, "construction": "cvd_close_minus_cvd_open"}}
+        selected = series[self.selected_timeframe]["bars"]
         period = processing["parameters"].get("delta_ma_period", processing["parameters"].get("delta_ma", {}).get("period", 21))
         chart_status = _combine([payload["status"] for payload in series.values()])
-        return {"chart_id": "volume_delta", "title": "Delta (Buy-Sell) USD", "chart_type": "bar_with_line_overlay",
-            "primary_series": {"field": "volume_delta_usd", "representation": "bar"},
-            "overlays": [{"id": "delta_ma_21", "field": "delta_ma_21_usd", "representation": "line", "period": period}],
+        return {"chart_id": f"delta_buy_sell_{market}", "title": f"Delta Buy/Sell {market.title()}", "subtitle": "CVD candle close minus open", "chart_type": "delta_histogram_with_ma",
+            "presentation": {"bar_field": "delta_buy_sell_usd", "line_field": "delta_ma_21", "moving_average_period": period},
             "unit": "USD", "market": market, "status": chart_status,
             "reason": _reason(chart_status, "chart_series_incomplete"), "selected_timeframe": self.selected_timeframe,
             "current": copy.deepcopy(selected[-1]) if selected else None, "series_by_timeframe": series,
@@ -360,7 +399,8 @@ class CvdVolumeOrderflowContractBuilder:
 
     def build_charts(self, processing: Mapping[str, Any]) -> dict[str, Any]:
         return {"cvd_spot": self.build_cvd_chart(processing, "spot"), "cvd_futures": self.build_cvd_chart(processing, "futures"),
-            "cvd_general": self.build_cvd_chart(processing, "general"), "volume_delta": self.build_delta_chart(processing)}
+            "delta_buy_sell_spot": self.build_delta_chart(processing, "spot"),
+            "delta_buy_sell_futures": self.build_delta_chart(processing, "futures")}
 
     def _side_widget(self, processing: Mapping[str, Any], window: str) -> dict[str, Any]:
         market = self.selected_market
@@ -445,7 +485,7 @@ class CvdVolumeOrderflowContractBuilder:
                 "current": copy.deepcopy(current), "atoms": _copy_classification(atoms), "source_paths": [f"processing.markets.{market}.timeframes.{timeframe}.current", f"classification.classifications.markets.{market}.timeframes.{timeframe}.atoms"]},
             "market_agreement_detail": {"drilldown_id": "market_agreement_detail", "value": _copy_classification(classification["confirmations"]["market_agreement_1h"]), "source_path": "classification.confirmations.market_agreement_1h"},
             "temporal_alignment_detail": {"drilldown_id": "temporal_alignment_detail", "value": _copy_classification(classification["confirmations"]["temporal_alignment"]), "source_path": "classification.confirmations.temporal_alignment"},
-            "footprint_vwap_scope": {"drilldown_id": "footprint_vwap_scope", "rows": footprint_rows, "source_paths": ["processing.markets.general.footprint_summaries.1h", "processing.markets.spot.footprint_summaries.1h", "processing.markets.futures.footprint_summaries.1h"]},
+            "footprint_vwap_scope": {"drilldown_id": "footprint_vwap_scope", "rows": footprint_rows, "source_paths": [f"processing.markets.{item}.footprint_summaries.1h" for item in MARKETS]},
             "classification_snapshots": {"drilldown_id": "classification_snapshots", "value": _copy_classification(classification.get("snapshots", {})), "source_path": "classification.snapshots"}}
 
     def build_events(self, classification: Mapping[str, Any]) -> dict[str, Any]:
@@ -469,10 +509,13 @@ class CvdVolumeOrderflowContractBuilder:
     def _inventory(self, selectors: Mapping[str, Any], kpis: Mapping[str, Any], charts: Mapping[str, Any], widgets: Mapping[str, Any],
                    tables: Mapping[str, Any], drilldowns: Mapping[str, Any], events: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         required_objects = {"selectors.market": selectors["market"], "selectors.timeframe": selectors["timeframe"],
-            **{f"kpis.{key}": value for key, value in kpis.items()}, **{f"charts.{key}": value for key, value in charts.items()},
+            **{f"kpis.{key}": kpis[key] for key in ("delta_1h", "buy_sell_ratio_1h", "futures_vs_spot_volume_ratio_1h", "flow_efficiency_1h", "order_flow_imbalance_1h")},
+            **{f"charts.{key}": value for key, value in charts.items()},
             **{f"widgets.{key}": widgets[key] for key in ("volume_by_side_1h", "volume_by_side_24h", "order_flow_imbalance_1h")},
             **{f"tables.{key}": value for key, value in tables.items()}}
-        optional_objects = {**{f"widgets.{key}": widgets[key] for key in ("market_agreement_1h", "temporal_alignment")},
+        optional_objects = {
+            **{f"kpis.{key}": kpis[key] for key in ("vwap_1h",)},
+            **{f"widgets.{key}": widgets[key] for key in ("market_agreement_1h", "temporal_alignment")},
             **{f"drilldowns.{key}": value for key, value in drilldowns.items()}, "events.recent_events": events}
         def entry(obj: Mapping[str, Any], name: str) -> dict[str, Any]:
             status = obj.get("status", obj.get("availability", {}).get("status", "available"))
@@ -535,6 +578,120 @@ class CvdVolumeOrderflowContractBuilder:
             "required_components_available": sum(value == "available" for value in statuses.values()), "required_components_total": len(statuses),
             "warnings": copy.deepcopy(quality["warnings"]), "errors": copy.deepcopy(quality["errors"])}
 
+    @staticmethod
+    def _indicator_unit(indicator_id: str) -> str:
+        return {
+            "rsi": "percent", "stochastic": "percent", "williams_r": "percent",
+            "tsi": "index", "cci": "index", "adx": "index", "macd": "value",
+            "atr": "value", "wasserstein_distance": "distance",
+            "bollinger_band_width": "ratio",
+        }.get(indicator_id, "value")
+
+    @staticmethod
+    def _summary(indicator_id: str, package: Mapping[str, Any]) -> dict[str, Any]:
+        series = package.get("series", {}) if isinstance(package, Mapping) else {}
+        current = package.get("current", {}) if isinstance(package, Mapping) else {}
+        primary_by_indicator = {
+            "macd": "macd", "rsi": "rsi", "tsi": "tsi", "stochastic": "k",
+            "williams_r": "williams_r", "cci": "cci", "adx": "adx", "atr": "atr",
+            "wasserstein_distance": "wasserstein_distance", "bollinger_band_width": "bollinger_band_width",
+        }
+        primary = primary_by_indicator[indicator_id]
+        value = current.get(primary)
+        if value is None and isinstance(series, Mapping):
+            values = series.get(primary, [])
+            if isinstance(values, Sequence):
+                value = next((item for item in reversed(values) if isinstance(item, (int, float)) and not isinstance(item, bool)), None)
+        secondary = {key: val for key, val in current.items() if key != primary and isinstance(val, (int, float)) and not isinstance(val, bool)} if isinstance(current, Mapping) else {}
+        display = "—" if value is None else (f"{value:.4f}" if abs(float(value)) < 1000 else f"{value:.2f}")
+        return {
+            "indicator_id": indicator_id,
+            "label": indicator_id.replace("_", " ").upper(),
+            "section": "volatility" if indicator_id in {"atr", "bollinger_band_width"} else ("distribution" if indicator_id == "wasserstein_distance" else "momentum"),
+            "status": "available" if value is not None else "unavailable",
+            "value": value,
+            "display_value": display,
+            "secondary": secondary,
+            "signal": "NEUTRAL" if value is not None else "UNAVAILABLE",
+            "signal_color": "#ffab00" if value is not None else "#8998a5",
+            "strength": 1 if value is not None else 0,
+            "classification_basis": "processing_precomputed_summary",
+            "recalculate_in_hmi": False,
+        }
+
+    def build_technical_analysis(self, processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
+        source_ta = processing.get("technical_analysis", {})
+        event_registry = classification.get("technical_events", {}).get("by_id", {})
+        markets: dict[str, Any] = {}
+        indicator_ids = (
+            "macd", "rsi", "tsi", "stochastic", "williams_r", "cci", "adx", "atr",
+            "wasserstein_distance", "bollinger_band_width",
+        )
+        for market in MARKETS:
+            target_timeframes: dict[str, Any] = {}
+            market_source = source_ta.get("markets", {}).get(market, {})
+            for timeframe in TIMEFRAMES:
+                source = market_source.get("timeframes", {}).get(timeframe, {})
+                timestamps = list(source.get("timestamps", []))
+                history_timestamps = timestamps[-CALCULATION_HISTORY_LIMIT:]
+                tail_timestamps = timestamps[-self.display_point_limit:]
+                packages = source.get("indicators", {}) if isinstance(source, Mapping) else {}
+                overlays: dict[str, Any] = {}
+                for overlay_id in ("moving_averages", "bollinger_bands", "regression_channel"):
+                    package = packages.get(overlay_id, {}) if isinstance(packages, Mapping) else {}
+                    overlay_series = package.get("series", {}) if isinstance(package, Mapping) else {}
+                    overlays[overlay_id] = {
+                        "status": source.get("status", "unavailable") if overlay_series else "unavailable",
+                        "parameters": copy.deepcopy(package.get("parameters", {})) if isinstance(package, Mapping) else {},
+                        "series": {key: list(values)[-self.display_point_limit:] for key, values in overlay_series.items()} if isinstance(overlay_series, Mapping) else {},
+                        "recalculate_in_hmi": False,
+                    }
+                indicators: dict[str, Any] = {}
+                for indicator_id in indicator_ids:
+                    package = packages.get(indicator_id, {}) if isinstance(packages, Mapping) else {}
+                    raw_series = package.get("series", {}) if isinstance(package, Mapping) else {}
+                    current = copy.deepcopy(package.get("current", {})) if isinstance(package, Mapping) else {}
+                    indicator = {
+                        "status": source.get("status", "unavailable") if raw_series else "unavailable",
+                        "unit": self._indicator_unit(indicator_id),
+                        "parameters": copy.deepcopy(package.get("parameters", {})) if isinstance(package, Mapping) else {},
+                        "timestamps": tail_timestamps,
+                        "series": {key: list(values)[-self.display_point_limit:] for key, values in raw_series.items()} if isinstance(raw_series, Mapping) else {},
+                        "current": current,
+                        "thresholds": [],
+                        "recalculate_in_hmi": False,
+                        "summary": self._summary(indicator_id, package),
+                        "calculation_history_records": len(history_timestamps),
+                    }
+                    indicators[indicator_id] = indicator
+                history_start = history_timestamps[0] if history_timestamps else None
+                events = [copy.deepcopy(event) for event in event_registry.values()
+                    if isinstance(event, Mapping) and event.get("source", {}).get("market") == market
+                    and event.get("source", {}).get("timeframe") == timeframe
+                    and (history_start is None or int(event.get("timestamp", 0)) >= history_start)]
+                events.sort(key=lambda event: (event.get("timestamp", 0), event.get("event_uid", "")))
+                target_timeframes[timeframe] = {
+                    "status": source.get("status", "unavailable"),
+                    "source_records": len(history_timestamps),
+                    "timestamps": tail_timestamps,
+                    "overlays": overlays,
+                    "indicators": indicators,
+                    "events": events,
+                    "calculation_history_records": len(history_timestamps),
+                }
+            markets[market] = {
+                "source_chart_id": f"cvd_{market}",
+                "title": f"CVD {market.title()}",
+                "timeframes": target_timeframes,
+            }
+        return {
+            "analysis_id": "cvd_three_candle_technical_analysis",
+            "contract_version": "1.0.0",
+            "source": "CVD OHLC close/high/low series",
+            "recalculate_in_hmi": False,
+            "markets": markets,
+        }
+
     def run(self, bundle: Mapping[str, Any]) -> dict[str, Any]:
         self.validate_bundle(bundle)
         processing, classification = bundle["processing"], bundle["classification"]
@@ -546,6 +703,12 @@ class CvdVolumeOrderflowContractBuilder:
         tables = self.build_tables(processing, classification)
         drilldowns = self.build_drilldowns(processing, classification)
         events = self.build_events(classification)
+        technical_analysis = self.build_technical_analysis(processing, classification)
+        filtered_events = [event for market in technical_analysis.get("markets", {}).values()
+            for payload in market.get("timeframes", {}).values() for event in payload.get("events", [])]
+        technical_events = {"by_id": {event["event_uid"]: copy.deepcopy(event) for event in filtered_events},
+            "technical_cross_ids": [event["event_uid"] for event in filtered_events]}
+        events.update(technical_events)
         required, optional = self._inventory(selectors, kpis, charts, widgets, tables, drilldowns, events)
         availability = self.evaluate_availability(processing, classification, required, optional)
         quality = self.evaluate_quality(processing, classification, required, optional, charts)
@@ -555,10 +718,27 @@ class CvdVolumeOrderflowContractBuilder:
             "badges": self.build_badges(context, quality), "selectors": selectors,
             "operational_status": self.build_operational_status(context, quality), "kpis": kpis, "charts": charts,
             "widgets": widgets, "tables": tables, "drilldowns": drilldowns, "events": events,
+            "technical_analysis": technical_analysis,
+            "history_contract": {
+                "calculation_records": min((payload["calculation_history_records"] for market in technical_analysis.get("markets", {}).values() for payload in market.get("timeframes", {}).values()), default=0),
+                "minimum_warmup_records": 200,
+                "maximum_standard_indicator_period": 200,
+                "all_visible_moving_averages_warm": min((payload["calculation_history_records"] for market in technical_analysis.get("markets", {}).values() for payload in market.get("timeframes", {}).values()), default=0) >= 200,
+                "technical_indicators_precomputed": True,
+                "hmi_recalculation": False,
+                "synthetic_fixture": bool(context.get("is_demo", False)),
+                "fixture_seed": 20260807 if bool(context.get("is_demo", False)) else None,
+                "note": (
+                    f"Up to {CALCULATION_HISTORY_LIMIT} calculation records are retained per Spot/Futures CVD timeframe; "
+                    f"current minimum available history is {min((payload['calculation_history_records'] for market in technical_analysis.get('markets', {}).values() for payload in market.get('timeframes', {}).values()), default=0)} records. "
+                    "CVD has no General market and HMI performs no indicator recalculation."
+                ),
+            },
             "availability": availability, "quality": quality}
         _validated_paths(output)
-        json.dumps(output, ensure_ascii=False, allow_nan=False)
-        return output
+        aligned = align_cvd_contract_to_sp_v1_5(output)
+        json.dumps(aligned, ensure_ascii=False, allow_nan=False)
+        return aligned
 
 
 def build_cvd_volume_orderflow_contract(bundle: Mapping[str, Any], *, selected_market: str = DEFAULT_MARKET,

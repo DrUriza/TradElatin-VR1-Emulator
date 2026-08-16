@@ -15,21 +15,17 @@ REQUIRED_TYPES = ("open_interest_change_state", "funding_state", "oi_funding_qua
 OPTIONAL_TYPES = ("oi_trend_strength", "directional_index_relation", "macd_relation",
                   "stochastic_range_state", "bollinger_position", "cci_state", "oi_roc_state")
 ROOT_SECTIONS = ("context", "series", "indicators", "events", "snapshots", "confirmations", "availability", "quality")
-EVENT_TYPES = {"moving_average_cross", "macd_signal_cross", "stochastic_cross", "directional_indicator_cross",
+EVENT_TYPES = {"moving_average_cross", "channel_cross", "macd_signal_cross", "stochastic_cross", "directional_indicator_cross",
                "adx_threshold_cross", "oi_roc_zero_cross", "funding_zero_cross"}
 EVENT_STATES = {
-    ("moving_average_cross", "sma_20_x_sma_50", 1): "sma_20_crossed_above_sma_50",
-    ("moving_average_cross", "sma_20_x_sma_50", -1): "sma_20_crossed_below_sma_50",
-    ("moving_average_cross", "sma_50_x_sma_100", 1): "sma_50_crossed_above_sma_100",
-    ("moving_average_cross", "sma_50_x_sma_100", -1): "sma_50_crossed_below_sma_100",
-    ("moving_average_cross", "sma_100_x_sma_200", 1): "sma_100_crossed_above_sma_200",
-    ("moving_average_cross", "sma_100_x_sma_200", -1): "sma_100_crossed_below_sma_200",
     ("macd_signal_cross", "macd_x_signal", 1): "macd_crossed_above_signal",
     ("macd_signal_cross", "macd_x_signal", -1): "macd_crossed_below_signal",
     ("stochastic_cross", "k_x_d", 1): "k_crossed_above_d",
     ("stochastic_cross", "k_x_d", -1): "k_crossed_below_d",
     ("directional_indicator_cross", "di_plus_x_di_minus", 1): "di_plus_crossed_above_di_minus",
     ("directional_indicator_cross", "di_plus_x_di_minus", -1): "di_plus_crossed_below_di_minus",
+    ("channel_cross", "regression_middle_x_bollinger_middle", 1): "regression_middle_crossed_above_bollinger_middle",
+    ("channel_cross", "regression_middle_x_bollinger_middle", -1): "regression_middle_crossed_below_bollinger_middle",
     ("adx_threshold_cross", "adx_x_25", 1): "adx_crossed_above_25",
     ("adx_threshold_cross", "adx_x_25", -1): "adx_crossed_below_25",
     ("oi_roc_zero_cross", "oi_roc_12_x_0", 1): "oi_roc_crossed_above_zero",
@@ -37,6 +33,17 @@ EVENT_STATES = {
     ("funding_zero_cross", "funding_close_x_0", 1): "funding_crossed_above_zero",
     ("funding_zero_cross", "funding_close_x_0", -1): "funding_crossed_below_zero",
 }
+_MA_EVENT_PAIRS = (
+    ("ema_9", "ema_21"), ("ema_9", "ema_50"), ("ema_21", "ema_50"),
+    ("sma_20", "sma_50"), ("sma_20", "sma_100"), ("sma_20", "sma_200"),
+    ("sma_50", "sma_100"), ("sma_50", "sma_200"), ("sma_100", "sma_200"),
+    ("wma_20", "wma_50"),
+)
+for _fast, _slow in _MA_EVENT_PAIRS:
+    _pair_name = f"{_fast}_x_{_slow}"
+    EVENT_STATES[("moving_average_cross", _pair_name, 1)] = f"{_fast}_crossed_above_{_slow}"
+    EVENT_STATES[("moving_average_cross", _pair_name, -1)] = f"{_fast}_crossed_below_{_slow}"
+
 EVENT_TYPES_FOR_ATOM = {
     "funding_state": {"funding_zero_cross"}, "oi_funding_quadrant": {"funding_zero_cross"},
     "oi_trend_strength": {"adx_threshold_cross"}, "directional_index_relation": {"directional_indicator_cross"},
@@ -245,8 +252,10 @@ def _quadrant(oi: Mapping[str, Any], funding: Mapping[str, Any], timeframe: str)
 def _pair(event: Mapping[str, Any]) -> str | None:
     event_type, first, second, threshold = (event.get("event_type"), event.get("first_series"),
                                              event.get("second_series"), event.get("threshold"))
-    if event_type == "moving_average_cross" and first in {"sma_20", "sma_50", "sma_100"}:
+    if event_type == "moving_average_cross" and (first, second) in _MA_EVENT_PAIRS:
         return f"{first}_x_{second}"
+    if event_type == "channel_cross" and first == "regression_middle" and second == "bollinger_middle":
+        return "regression_middle_x_bollinger_middle"
     if event_type == "macd_signal_cross" and first == "macd" and second == "signal":
         return "macd_x_signal"
     if event_type == "stochastic_cross" and first == "k" and second == "d":
@@ -409,6 +418,10 @@ def _confirmations(source: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(providers, Mapping):
             providers = {}
         output[metric] = {provider: _provider_copy(providers.get(provider)) for provider in ("cryptoquant", "glassnode")}
+    leverage = source.get("estimated_leverage_ratio")
+    if not isinstance(leverage, Mapping):
+        leverage = {}
+    output["estimated_leverage_ratio"] = {"glassnode": _provider_copy(leverage.get("glassnode"))}
     comparisons = source.get("comparisons")
     if not isinstance(comparisons, Mapping):
         output["comparisons"] = {"status": "invalid", "reason": "classification_input_invalid",
@@ -437,18 +450,29 @@ def _confirmations(source: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _availability(by_timeframe: Mapping[str, Any], snapshots: Mapping[str, Any], confirmations: Mapping[str, Any],
-                  processing_availability: Mapping[str, Any]) -> dict[str, Any]:
-    required = {name: {timeframe: by_timeframe[timeframe]["current"][name]["status"] for timeframe in TIMEFRAMES}
-                for name in REQUIRED_TYPES}
-    optional = {name: {timeframe: by_timeframe[timeframe]["current"][name]["status"] for timeframe in TIMEFRAMES}
-                for name in OPTIONAL_TYPES}
+                  processing_availability: Mapping[str, Any], optional_calculations: set[str]) -> dict[str, Any]:
+    required: dict[str, dict[str, str]] = {name: {} for name in REQUIRED_TYPES}
+    optional: dict[str, dict[str, str]] = {name: {} for name in (*REQUIRED_TYPES, *OPTIONAL_TYPES)}
+    for timeframe in TIMEFRAMES:
+        dynamic_optional = f"oi_change_24h.{timeframe}" in optional_calculations
+        for name in REQUIRED_TYPES:
+            status = by_timeframe[timeframe]["current"][name]["status"]
+            if dynamic_optional and name in {"open_interest_change_state", "oi_funding_quadrant"}:
+                optional[name][timeframe] = status
+            else:
+                required[name][timeframe] = status
+        for name in OPTIONAL_TYPES:
+            optional[name][timeframe] = by_timeframe[timeframe]["current"][name]["status"]
+    optional = {name: values for name, values in optional.items() if values}
+    required = {name: values for name, values in required.items() if values}
     passthrough = {"snapshots": {name: payload.get("status", "invalid") if isinstance(payload, Mapping) else "invalid"
                                   for name, payload in snapshots.items()},
-                   "confirmations": {metric: {provider: confirmations[metric][provider]["status"]
-                                               for provider in ("cryptoquant", "glassnode")}
-                                     for metric in ("open_interest", "funding_rate")}}
+                   "confirmations": {
+                       "open_interest": {provider: confirmations["open_interest"][provider]["status"] for provider in ("cryptoquant", "glassnode")},
+                       "funding_rate": {provider: confirmations["funding_rate"][provider]["status"] for provider in ("cryptoquant", "glassnode")},
+                       "estimated_leverage_ratio": {"glassnode": confirmations["estimated_leverage_ratio"]["glassnode"]["status"]},
+                   }}
     unavailable_names = {
-        "open_interest_market_cap_ratio": "open_interest_market_cap_ratio",
         "funding_8h_aggregate": "funding_8h_aggregate",
         "contract_type_split": "contract_type_split",
         "mfi": "mfi",
@@ -463,9 +487,30 @@ def _availability(by_timeframe: Mapping[str, Any], snapshots: Mapping[str, Any],
     return {"required": required, "optional": optional, "passthrough": passthrough, "unavailable": unavailable}
 
 
+def _leverage_context(confirmations: Mapping[str, Any]) -> dict[str, Any]:
+    payload = confirmations.get("estimated_leverage_ratio", {}).get("glassnode", {}) if isinstance(confirmations, Mapping) else {}
+    if not isinstance(payload, Mapping) or payload.get("status") not in {"available", "partial"}:
+        return {"status": "unavailable", "state": None, "value": None, "recent_median": None,
+                "reason": payload.get("reason") if isinstance(payload, Mapping) else "source_unavailable",
+                "provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio"}
+    records = payload.get("records") if isinstance(payload.get("records"), list) else []
+    values = [float(row["value"]) for row in records if isinstance(row, Mapping) and isinstance(row.get("value"), (int, float)) and not isinstance(row.get("value"), bool)]
+    if not values:
+        return {"status": "unavailable", "state": None, "value": None, "recent_median": None, "reason": "empty_data",
+                "provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio"}
+    recent = sorted(values[-30:])
+    n = len(recent)
+    median = recent[n // 2] if n % 2 else (recent[n // 2 - 1] + recent[n // 2]) / 2.0
+    current = values[-1]
+    state = "above_recent_median" if current > median else "below_recent_median" if current < median else "at_recent_median"
+    return {"status": payload.get("status"), "state": state, "value": current, "recent_median": median, "reason": None,
+            "provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio", "window_records": n}
+
+
 def classify_open_interest_and_funding(processing_contract: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and classify a direct Processing contract or a bundle containing ``processing``."""
     contract = _processing_contract(processing_contract)
+    optional_calculations = set(contract.get("quality", {}).get("optional_calculations", []))
     interpreted_events, indexed_events, event_warnings = _events(contract["events"])
     oi_frames = contract["series"]["open_interest_ohlc"]["timeframes"]
     funding_frames = contract["series"]["funding_rate_ohlc"]["timeframes"]
@@ -527,19 +572,26 @@ def classify_open_interest_and_funding(processing_contract: Mapping[str, Any]) -
                 current[name] = _atom(classification_type=name, timeframe=timeframe, status="invalid", state=None,
                                       reason=processing_reason, timestamp=None, source_path=source_path,
                                       values={}, units={}, event_ids=())
-        required_statuses = [current[name]["status"] for name in REQUIRED_TYPES]
+        dynamic_optional = f"oi_change_24h.{timeframe}" in optional_calculations
+        required_names = ("funding_state",) if dynamic_optional else REQUIRED_TYPES
+        required_statuses = [current[name]["status"] for name in required_names]
         timeframe_status = "invalid" if "invalid" in required_statuses else "available" if all(item == "available" for item in required_statuses) else "partial"
         timeframe_reason = None if timeframe_status == "available" else "classification_input_invalid" if timeframe_status == "invalid" else "classification_source_partial"
-        timestamps = {current[name]["evidence"]["timestamp"] for name in REQUIRED_TYPES if current[name]["evidence"]["timestamp"] is not None}
+        timestamps = {current[name]["evidence"]["timestamp"] for name in required_names if current[name]["evidence"]["timestamp"] is not None}
         by_timeframe[timeframe] = {"status": timeframe_status, "reason": timeframe_reason,
                                   "timestamp": next(iter(timestamps)) if len(timestamps) == 1 else None, "current": current}
     snapshots = _json_copy(contract["snapshots"])
     confirmations = _confirmations(contract["confirmations"])
-    availability = _availability(by_timeframe, snapshots, confirmations, contract["availability"])
-    required_atoms = {f"{timeframe}.{name}": by_timeframe[timeframe]["current"][name]
-                      for timeframe in TIMEFRAMES for name in REQUIRED_TYPES}
-    optional_atoms = {f"{timeframe}.{name}": by_timeframe[timeframe]["current"][name]
-                      for timeframe in TIMEFRAMES for name in OPTIONAL_TYPES}
+    availability = _availability(by_timeframe, snapshots, confirmations, contract["availability"], optional_calculations)
+    required_atoms: dict[str, Any] = {}
+    optional_atoms: dict[str, Any] = {}
+    for timeframe in TIMEFRAMES:
+        dynamic_optional = f"oi_change_24h.{timeframe}" in optional_calculations
+        for name in REQUIRED_TYPES:
+            target = optional_atoms if dynamic_optional and name in {"open_interest_change_state", "oi_funding_quadrant"} else required_atoms
+            target[f"{timeframe}.{name}"] = by_timeframe[timeframe]["current"][name]
+        for name in OPTIONAL_TYPES:
+            optional_atoms[f"{timeframe}.{name}"] = by_timeframe[timeframe]["current"][name]
     required_statuses = {name: atom["status"] for name, atom in required_atoms.items()}
     optional_statuses = {name: atom["status"] for name, atom in optional_atoms.items()}
     if contract["quality"].get("status") == "invalid" or "invalid" in required_statuses.values():
@@ -555,12 +607,14 @@ def classify_open_interest_and_funding(processing_contract: Mapping[str, Any]) -
     for metric in ("open_interest", "funding_rate"):
         warnings.extend(f"confirmation_{confirmations[metric][provider]['status']}:{metric}.{provider}"
                         for provider in ("cryptoquant", "glassnode") if confirmations[metric][provider]["status"] == "invalid")
+    if confirmations["estimated_leverage_ratio"]["glassnode"]["status"] == "invalid":
+        warnings.append("confirmation_invalid:estimated_leverage_ratio.glassnode")
     errors = [f"required_invalid:{name}" for name, status in required_statuses.items() if status == "invalid"]
     classification_quality = {"status": quality_status, "required_statuses": required_statuses,
                               "optional_statuses": optional_statuses,
                               "passthrough_statuses": _json_copy(availability["passthrough"])}
     result = {"family": FAMILY, "stage": "classification", "version": VERSION, "mode": contract["mode"],
-        "context": _json_copy(contract["context"]), "classifications": {"by_timeframe": by_timeframe},
+        "context": _json_copy(contract["context"]), "classifications": {"by_timeframe": by_timeframe, "leverage_context": _leverage_context(confirmations)},
         "interpreted_events": interpreted_events, "snapshots": snapshots, "confirmations": confirmations,
         "availability": availability, "quality": {"status": quality_status, "contract_complete": True,
             "data_complete": data_complete, "processing_quality": _json_copy(contract["quality"]),

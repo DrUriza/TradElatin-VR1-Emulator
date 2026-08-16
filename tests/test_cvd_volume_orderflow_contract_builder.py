@@ -14,7 +14,7 @@ from processing_signals.classification.cvd_volume_orderflow.cvd_volume_orderflow
 
 ROOT = Path(__file__).resolve().parents[1]
 NOW = 2_000_000_000
-MARKETS = ("general", "spot", "futures")
+MARKETS = ("spot", "futures")
 TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
 
 
@@ -42,7 +42,7 @@ def summary(status="available", reason=None):
 
 def atom(state, direction="positive", value=1.0):
     return {"state": state, "direction": direction, "value": value, "unit": "decimal",
-        "source_path": "markets.general", "source_status": "available", "threshold_id": "frozen",
+        "source_path": "markets.spot", "source_status": "available", "threshold_id": "frozen",
         "availability": {"status": "available", "reason": None}}
 
 
@@ -81,7 +81,7 @@ def make_bundle(points=220, *, data_mode="synthetic", is_demo=True):
         "parameters": {"delta_ma_period": 21}, "markets": processing_markets,
         "quality": {"status": "ok", "warnings": [], "errors": []}}
     agreement = {"state": "confirmed_buying", "spot_state": "buying", "futures_state": "buying",
-        "general_order_flow_state": "buying", "availability": {"status": "available", "reason": None}}
+        "availability": {"status": "available", "reason": None}}
     temporal = {market: {"state": "persistent_buying", "one_hour_state": "buying", "twenty_four_hour_state": "buying",
         "availability": {"status": "available", "reason": None}} for market in MARKETS}
     classification = {"family": "cvd_volume_orderflow", "stage": "classification", "version": "0.1.0", "mode": "bootstrap",
@@ -89,7 +89,7 @@ def make_bundle(points=220, *, data_mode="synthetic", is_demo=True):
         "classifications": {"markets": classified_markets}, "snapshots": {"markets": {market: {} for market in MARKETS}},
         "confirmations": {"market_agreement_1h": agreement, "temporal_alignment": temporal},
         "interpreted_events": [{"event_id": "one", "event_type": "order_flow_transition", "timestamp": NOW,
-            "market": "general", "timeframe": "15m", "severity": "medium", "source_paths": ["processing.markets.general.timeframes.15m.records"],
+            "market": "spot", "timeframe": "15m", "severity": "medium", "source_paths": ["processing.markets.spot.timeframes.15m.records"],
             "availability": {"status": "available", "reason": None}}],
         "availability": {"status": "available"}, "quality": {"status": "ok", "warnings": [], "errors": []}}
     return {"processing": processing, "classification": classification}
@@ -131,10 +131,10 @@ def test_rejects_mode_context_and_demo_mismatches():
 
 def test_accepts_frozen_classification_market_order_and_preserves_visual_order():
     bundle = make_bundle()
-    bundle["classification"]["context"]["markets"] = ["spot", "futures", "general"]
+    bundle["classification"]["context"]["markets"] = ["futures", "spot"]
     output = build_cvd_volume_orderflow_contract(bundle)
-    assert output["context"]["markets"] == ["general", "spot", "futures"]
-    assert [item["id"] for item in output["selectors"]["market"]["options"]] == ["general", "spot", "futures"]
+    assert output["context"]["markets"] == ["spot", "futures"]
+    assert [item["id"] for item in output["selectors"]["market"]["options"]] == ["spot", "futures"]
 
 
 @pytest.mark.parametrize("kwargs", [{"selected_market": "x"}, {"selected_timeframe": "2h"},
@@ -147,7 +147,7 @@ def test_rejects_invalid_selection(kwargs):
 def test_exact_root_identity_context_badges_and_selectors():
     output = build_cvd_volume_orderflow_contract(make_bundle())
     assert list(output) == ["schema", "screen", "stage", "mode", "context", "badges", "selectors", "operational_status",
-        "kpis", "charts", "widgets", "tables", "drilldowns", "events", "availability", "quality"]
+        "kpis", "charts", "widgets", "tables", "drilldowns", "events", "technical_analysis", "history_contract", "availability", "quality"]
     assert output["schema"] == {"id": "trad_elatin.cvd_volume_orderflow.screen.v1", "version": "1.0.0"}
     assert output["screen"] == {"id": "cvd_volume_orderflow", "family": "cvd_volume_orderflow", "route": "/cvd-orderflow",
         "title": "CVD & ORDER FLOW", "subtitle": "Cumulative volume delta, trades & market microstructure"}
@@ -161,44 +161,44 @@ def test_exact_root_identity_context_badges_and_selectors():
 
 def test_six_kpis_are_direct_and_never_recalculated():
     output = build_cvd_volume_orderflow_contract(make_bundle())
-    assert list(output["kpis"]) == ["delta_1h", "buy_sell_ratio_1h", "order_flow_1h", "flow_efficiency_1h", "vwap_1h", "price_vs_vwap"]
+    assert list(output["kpis"]) == ["delta_1h", "buy_sell_ratio_1h", "futures_vs_spot_volume_ratio_1h", "flow_efficiency_1h", "vwap_1h", "order_flow_imbalance_1h"]
     assert output["kpis"]["delta_1h"]["value"] == 999.0
     assert output["kpis"]["buy_sell_ratio_1h"]["value"] == 1.10
     assert output["kpis"]["buy_sell_ratio_1h"]["secondary_values"] == {
         "buy_share": {"value": .55, "unit": "decimal"}, "sell_share": {"value": .45, "unit": "decimal"}}
-    assert output["kpis"]["order_flow_1h"]["value"] == .18
+    assert output["kpis"]["futures_vs_spot_volume_ratio_1h"]["value"] == 1.0
+    assert output["kpis"]["order_flow_imbalance_1h"]["value"] == .18
     assert output["kpis"]["flow_efficiency_1h"]["value"] == .68
     assert output["kpis"]["vwap_1h"]["value"] == 96.0
-    assert output["kpis"]["price_vs_vwap"]["value"] == .0042
     assert output["kpis"]["delta_1h"]["classification"]["state"] == "positive"
 
 
 def test_charts_copy_ohlc_delta_ma_six_timeframes_and_last_220():
     bundle = make_bundle(points=225)
     output = build_cvd_volume_orderflow_contract(bundle)
-    for chart_id in ("cvd_spot", "cvd_futures", "cvd_general"):
+    for chart_id in ("cvd_spot", "cvd_futures"):
         chart = output["charts"][chart_id]
         assert set(chart["series_by_timeframe"]) == set(TIMEFRAMES)
         assert chart["native_ohlc"] is False
         assert chart["construction"] == "derived_from_interval_volume_delta_path"
         series = chart["series_by_timeframe"]["15m"]
-        assert len(series["points"]) == 220 and series["history_truncated"] is True
-        assert series["points"][0]["timestamp"] == bundle["processing"]["markets"][chart_id.removeprefix("cvd_")]["timeframes"]["15m"]["records"][5]["timestamp"]
-        assert series["points"][-1] == {"timestamp": NOW, "open": 100.0, "high": 110.0, "low": 90.0,
+        assert len(series["candles"]) == 220 and series["history_truncated"] is True
+        assert series["candles"][0]["timestamp"] == bundle["processing"]["markets"][chart_id.removeprefix("cvd_")]["timeframes"]["15m"]["records"][5]["timestamp"]
+        assert series["candles"][-1] == {"timestamp": NOW, "open": 100.0, "high": 110.0, "low": 90.0,
             "close": 95.0, "is_partial": True, "continuity_status": "complete"}
-        assert chart["current"] == series["points"][-1]
-    delta = output["charts"]["volume_delta"]
+        assert chart["current"] == series["candles"][-1]
+    delta = output["charts"]["delta_buy_sell_spot"]
     assert set(delta["series_by_timeframe"]) == set(TIMEFRAMES)
-    assert delta["overlays"][0]["period"] == 21
-    assert delta["current"]["volume_delta_usd"] == 999.0
-    assert delta["current"]["delta_ma_21_usd"] == 7.0
+    assert delta["presentation"]["moving_average_period"] == 21
+    assert delta["current"]["delta_buy_sell_usd"] == 20.0
+    assert delta["current"]["delta_ma_21"] == 7.0
     assert "provider_cvd_reference_usd" not in json.dumps(output["charts"])
 
 
 def test_short_history_is_partial_and_not_fabricated():
     output = build_cvd_volume_orderflow_contract(make_bundle(points=2))
-    series = output["charts"]["cvd_general"]["series_by_timeframe"]["1m"]
-    assert len(series["points"]) == 2
+    series = output["charts"]["cvd_spot"]["series_by_timeframe"]["1m"]
+    assert len(series["candles"]) == 2
     assert series["status"] == "partial"
     assert series["reason"] == "insufficient_visual_history"
     assert output["quality"]["status"] == "partial"
@@ -223,12 +223,12 @@ def test_widgets_tables_drilldowns_events_and_inventory():
     assert set(output["widgets"]) == {"volume_by_side_1h", "volume_by_side_24h", "order_flow_imbalance_1h", "market_agreement_1h", "temporal_alignment"}
     assert output["widgets"]["order_flow_imbalance_1h"]["value"] == .18
     assert output["widgets"]["order_flow_imbalance_1h"]["state"] == "buying"
-    assert len(output["tables"]["market_timeframe_overview"]["rows"]) == 18
-    assert len(output["tables"]["window_summary_comparison"]["rows"]) == 6
+    assert len(output["tables"]["market_timeframe_overview"]["rows"]) == 12
+    assert len(output["tables"]["window_summary_comparison"]["rows"]) == 4
     assert set(output["drilldowns"]) == {"current_market_detail", "market_agreement_detail", "temporal_alignment_detail", "footprint_vwap_scope", "classification_snapshots"}
     assert output["events"]["items"][0]["event_id"] == "one"
-    assert len(output["availability"]["required"]) == 17
-    assert len(output["availability"]["optional"]) == 8
+    assert len(output["availability"]["required"]) == 16
+    assert len(output["availability"]["optional"]) == 9
     assert set(output["availability"]["markets"]) == set(MARKETS)
     assert set(output["availability"]["timeframes"]) == set(TIMEFRAMES)
 
@@ -240,7 +240,7 @@ def test_empty_events_available_and_null_current_row_preserved():
     source.update(status="unavailable", reason="no_records", records=[], current=None)
     output = build_cvd_volume_orderflow_contract(bundle)
     assert output["events"] == {"id": "recent_events", "status": "available", "reason": None,
-        "items": [], "source_path": "classification.interpreted_events"}
+        "items": [], "source_path": "classification.interpreted_events", "by_id": {}, "technical_cross_ids": []}
     row = next(row for row in output["tables"]["market_timeframe_overview"]["rows"] if row["market"] == "spot" and row["timeframe"] == "1m")
     assert row["timestamp"] is None and row["volume_delta_usd"] is None
     assert row["status"] == "unavailable" and row["reason"] == "no_records"
@@ -249,16 +249,16 @@ def test_empty_events_available_and_null_current_row_preserved():
 
 def test_empty_available_source_is_unavailable_everywhere():
     bundle = make_bundle()
-    source = bundle["processing"]["markets"]["general"]["timeframes"]["1m"]
+    source = bundle["processing"]["markets"]["spot"]["timeframes"]["1m"]
     source.update(status="available", reason=None, records=[], current=None)
     output = build_cvd_volume_orderflow_contract(bundle)
-    series = output["charts"]["cvd_general"]["series_by_timeframe"]["1m"]
-    assert (series["status"], series["reason"], series["points"]) == ("unavailable", "no_visual_records", [])
-    assert output["charts"]["cvd_general"]["status"] == "partial"
-    assert output["availability"]["required"]["charts.cvd_general"]["status"] == "partial"
+    series = output["charts"]["cvd_spot"]["series_by_timeframe"]["1m"]
+    assert (series["status"], series["reason"], series["candles"]) == ("unavailable", "no_visual_records", [])
+    assert output["charts"]["cvd_spot"]["status"] == "partial"
+    assert output["availability"]["required"]["charts.cvd_spot"]["status"] == "partial"
     row = output["tables"]["market_timeframe_overview"]["rows"][0]
     assert (row["market"], row["timeframe"], row["status"], row["reason"]) == (
-        "general", "1m", "unavailable", "current_record_unavailable")
+        "spot", "1m", "unavailable", "current_record_unavailable")
     assert output["quality"]["data_complete"] is False
 
 
@@ -275,16 +275,16 @@ def test_relative_frozen_source_paths_are_qualified_to_the_real_layer():
     bundle = make_bundle()
     bundle["classification"]["interpreted_events"] = [
         {"event_id": "processing-source", "event_type": "continuity_break", "timestamp": NOW,
-            "market": "general", "timeframe": "15m", "severity": "high",
-            "source_paths": ["markets.general.timeframes.15m.current.continuity_status"],
+            "market": "spot", "timeframe": "15m", "severity": "high",
+            "source_paths": ["markets.spot.timeframes.15m.current.continuity_status"],
             "availability": {"status": "available", "reason": None}},
         {"event_id": "classification-source", "event_type": "market_divergence", "timestamp": NOW,
-            "market": "general", "timeframe": "1h", "severity": "medium",
+            "market": "futures", "timeframe": "1h", "severity": "medium",
             "source_paths": ["confirmations.market_agreement_1h"],
             "availability": {"status": "available", "reason": None}},
     ]
     items = build_cvd_volume_orderflow_contract(bundle)["events"]["items"]
-    assert items[0]["source_paths"] == ["processing.markets.general.timeframes.15m.current.continuity_status"]
+    assert items[0]["source_paths"] == ["processing.markets.spot.timeframes.15m.current.continuity_status"]
     assert items[1]["source_paths"] == ["classification.confirmations.market_agreement_1h"]
 
 
@@ -301,11 +301,11 @@ def test_strict_json_nonfinite_bool_numeric_and_source_paths():
     json.dumps(output, ensure_ascii=False, allow_nan=False)
     for value in (float("nan"), float("inf")):
         bundle = make_bundle()
-        bundle["processing"]["markets"]["general"]["window_summaries"]["1h"]["volume_delta_usd"] = value
+        bundle["processing"]["markets"]["spot"]["window_summaries"]["1h"]["volume_delta_usd"] = value
         with pytest.raises(ValueError, match="non_finite"):
             build_cvd_volume_orderflow_contract(bundle)
     bundle = make_bundle()
-    bundle["processing"]["markets"]["general"]["window_summaries"]["1h"]["volume_delta_usd"] = True
+    bundle["processing"]["markets"]["spot"]["window_summaries"]["1h"]["volume_delta_usd"] = True
     with pytest.raises(ValueError, match="numeric"):
         build_cvd_volume_orderflow_contract(bundle)
     bundle = make_bundle()
@@ -320,11 +320,11 @@ def test_bundle_immutable_no_aliases_and_deterministic():
     first = build_cvd_volume_orderflow_contract(bundle)
     second = build_cvd_volume_orderflow_contract(bundle)
     assert bundle == before and first == second
-    first["charts"]["cvd_general"]["series_by_timeframe"]["1m"]["points"][0]["close"] = -1
-    first["drilldowns"]["classification_snapshots"]["value"]["markets"]["general"]["changed"] = True
+    first["charts"]["cvd_spot"]["series_by_timeframe"]["1m"]["candles"][0]["close"] = -1
+    first["drilldowns"]["classification_snapshots"]["value"]["markets"]["spot"]["changed"] = True
     assert bundle == before
-    bundle["processing"]["markets"]["general"]["timeframes"]["1m"]["records"][0]["cvd_ohlc_usd"]["close"] = -2
-    assert second["charts"]["cvd_general"]["series_by_timeframe"]["1m"]["points"][0]["close"] == 95.0
+    bundle["processing"]["markets"]["spot"]["timeframes"]["1m"]["records"][0]["cvd_ohlc_usd"]["close"] = -2
+    assert second["charts"]["cvd_spot"]["series_by_timeframe"]["1m"]["candles"][0]["close"] == 95.0
 
 
 def test_public_methods_and_no_execution_or_io_symbols():
@@ -343,12 +343,7 @@ def test_public_methods_and_no_execution_or_io_symbols():
 def test_frozen_binary_hashes():
     expected = {
         "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_extract.py": "e461826c4c4d067d0cbff2dea33dcb9f977caefec61cfc96699bb39b06a1f13e",
-        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_preprocessing.py": "0e9fba8d5a4f8d95e3bd740093d9d4a9e4f6a1c4c6b680e0f4cbec05e88cc932",
-        "tests/test_cvd_volume_orderflow_input_vertical.py": "f845d3afede2119ac177583d163b83c1e0e2d803dc0994b00c2f87cdfaf0caf5",
-        "src/processing_signals/processing/cvd_volume_orderflow/cvd_volume_orderflow_feature_builder.py": "0740a464df9ab68f4a1c9d56b45da9ff1f7e5ebe89dbcc75e16efb7798b0041b",
-        "src/processing_signals/processing/cvd_volume_orderflow/cvd_volume_orderflow_processor.py": "dd469e06523e6a1818f625aed9fd4e303c377cff3d02d9528de1d794cc084063",
-        "tests/test_cvd_volume_orderflow_processing_vertical.py": "fc71600989963e896154bc03312f6954466d5dc42910164b9ad428eb9d075189",
-        "src/processing_signals/classification/cvd_volume_orderflow/cvd_volume_orderflow_classifier.py": "5a177482819fabe6a20dfaa42975ab79239867b8ff4ece497c6f7eb2ea884823",
-        "tests/test_cvd_volume_orderflow_classification_vertical.py": "80aaa11eabb2437d06928a51fe6430382a32fa9d8cedfc6b005e7c36635c706f",
+        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_preprocessing.py": "2d218f206cbb841cd0724ee757590594e47208b444901be737d3864e05196e38",
+        "tests/test_cvd_volume_orderflow_input_vertical.py": "1ddd3587e7f5f218ac15df9b1d72b06f288b632b7f59a96770eb608d6d09e5b0",
     }
     assert {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in expected} == expected
