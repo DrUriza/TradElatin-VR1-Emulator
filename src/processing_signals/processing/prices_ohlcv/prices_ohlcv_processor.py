@@ -20,6 +20,9 @@ from processing_signals.processing.math.indicators.volatility.atr               
 from processing_signals.processing.math.indicators.volatility.bollinger_bands        import bollinger_bands
 from processing_signals.processing.math.indicators.volume.mfi                        import mfi
 from processing_signals.processing.math.technical_cross_signals                      import detect_cross_pairs
+from processing_signals.processing.math.native_analysis import (
+    interpolated_cross, rolling_wasserstein, support_resistance_levels, finite as native_finite,
+)
 from processing_signals.processing.math.patterns                                     import detect_candlestick_patterns
 from processing_signals.processing.math.statistics.descriptive_statistics            import (
     calculate_kurtosis, calculate_mean, calculate_skewness,
@@ -60,8 +63,8 @@ RESAMPLING_RULES = {
 OHLC_FIELDS = ("open", "high", "low", "close")
 
 PRICE_INDICATOR_CONFIG = {
-    "ema_periods": (9, 21, 50),
-    "sma_periods": (20, 50, 100, 200),
+    "ema_periods": (9, 21),
+    "sma_periods": (20, 50),
     "wma_periods": (20, 50),
     "bollinger": {"period": 20, "standard_deviations": 2.0},
     "rsi_period": 14,
@@ -73,6 +76,8 @@ PRICE_INDICATOR_CONFIG = {
     "williams_r_period": 14,
     "atr_period": 14,
     "fibonacci_lookback": 100,
+    "support_resistance_lookback": 120,
+    "wasserstein": {"recent_window": 20, "reference_window": 100},
     "tsi": {"slow_period": 25, "fast_period": 13},
 }
 
@@ -383,6 +388,44 @@ def calculate_prices_indicator_package(
     package["regression_channel"] = build_regression_channel_indicator(
         records=records, market_type=market_type, timeframe=timeframe, window=100, deviation_multiplier=2.0
     )
+
+    bb_upper = package["bollinger_bands"]["series"]["upper"]
+    bb_middle = package["bollinger_bands"]["series"]["middle"]
+    bb_lower = package["bollinger_bands"]["series"]["lower"]
+    bb_width = []
+    for upper_value, middle_value, lower_value in zip(bb_upper, bb_middle, bb_lower, strict=True):
+        if upper_value is None or middle_value in (None, 0) or lower_value is None:
+            bb_width.append(None)
+        else:
+            bb_width.append((float(upper_value) - float(lower_value)) / abs(float(middle_value)))
+    package["bollinger_band_width"] = {
+        "indicator_id": "bollinger_band_width", "parameters": {"period": bb_cfg["period"]},
+        "timestamps": list(ts), "series": {"bollinger_band_width": bb_width},
+        "current": {"bollinger_band_width": last_valid_value(bb_width)},
+        "warmup_records": bb_cfg["period"], "source": _source_metadata(market_type, timeframe),
+        "quality": evaluate_indicator_quality({"bollinger_band_width": bb_width}, required_records=bb_cfg["period"], available_records=len(ts)),
+        "calculation": {"module": "processing.prices_ohlcv.prices_ohlcv_processor", "function": "bollinger_band_width", "records": len(ts)},
+    }
+
+    close_returns = close.pct_change(fill_method=None).tolist()
+    wcfg = cfg["wasserstein"]
+    wasserstein = rolling_wasserstein(close_returns, recent_window=wcfg["recent_window"], reference_window=wcfg["reference_window"])
+    package["wasserstein_distance"] = {
+        "indicator_id": "wasserstein_distance", "parameters": dict(wcfg), "timestamps": list(ts),
+        "series": {"wasserstein_distance": wasserstein}, "current": {"wasserstein_distance": last_valid_value(wasserstein)},
+        "warmup_records": wcfg["recent_window"] + wcfg["reference_window"], "source": _source_metadata(market_type, timeframe),
+        "quality": evaluate_indicator_quality({"wasserstein_distance": wasserstein}, required_records=wcfg["recent_window"] + wcfg["reference_window"], available_records=len(ts)),
+        "calculation": {"module": "processing.math.native_analysis", "function": "rolling_wasserstein", "records": len(ts)},
+    }
+
+    sr = support_resistance_levels(high.tolist(), low.tolist(), close.tolist(), lookback=cfg["support_resistance_lookback"], levels=3)
+    package["support_resistance"] = {
+        "indicator_id": "support_resistance", "parameters": {"lookback": cfg["support_resistance_lookback"], "levels": 3},
+        "current": {"support": sr["support"], "resistance": sr["resistance"]},
+        "source": _source_metadata(market_type, timeframe),
+        "quality": {"status": "ok" if sr["support"] or sr["resistance"] else "insufficient_data"},
+        "calculation": {"module": "processing.math.native_analysis", "function": "support_resistance_levels"},
+    }
     return package
 
 
@@ -460,9 +503,8 @@ def calculate_prices_crosses(indicators: Mapping[str, Any]) -> dict[str, Any]:
             if bollinger_middle is not None:
                 combined["bollinger_middle"] = bollinger_middle
             pairs = [
-                ("ema_9", "ema_21"), ("ema_9", "ema_50"), ("ema_21", "ema_50"),
-                ("sma_20", "sma_50"), ("sma_20", "sma_100"), ("sma_20", "sma_200"),
-                ("sma_50", "sma_100"), ("sma_50", "sma_200"), ("sma_100", "sma_200"),
+                ("ema_9", "ema_21"),
+                ("sma_20", "sma_50"),
                 ("wma_20", "wma_50"),
                 ("regression_middle", "bollinger_middle"),
                 ("macd", "signal"), ("k", "d"), ("di_plus", "di_minus"),
@@ -480,6 +522,15 @@ def calculate_prices_crosses(indicators: Mapping[str, Any]) -> dict[str, Any]:
                     second_series_values = combined.get(second_name, [])
                     event["first_value"] = _finite_or_none(first_series_values[index]) if index < len(first_series_values) else None
                     event["second_value"] = _finite_or_none(second_series_values[index]) if index < len(second_series_values) else None
+                    if index > 0:
+                        exact = interpolated_cross(
+                            previous_timestamp=int(timestamps[index - 1]), timestamp=int(timestamps[index]),
+                            previous_first=first_series_values[index - 1] if index - 1 < len(first_series_values) else None,
+                            previous_second=second_series_values[index - 1] if index - 1 < len(second_series_values) else None,
+                            first=event["first_value"], second=event["second_value"],
+                        )
+                        event.update(exact)
+                        event["event_price"] = exact.get("event_value_exact")
             output[market_type][timeframe] = cross_events
     return output
 
@@ -858,6 +909,31 @@ def evaluate_prices_processing_quality(markets: Mapping[str, Any]) -> dict[str, 
     return {"status": status, "warnings": warnings, "errors": errors}
 
 
+
+def apply_cvd_volume_sides(markets: dict[str, Any], cvd_processing_context: Mapping[str, Any] | None) -> None:
+    if not isinstance(cvd_processing_context, Mapping):
+        return
+    spot = cvd_processing_context.get("markets", {}).get("spot", {})
+    for timeframe in TIMEFRAME_ORDER:
+        cvd_records = spot.get("timeframes", {}).get(timeframe, {}).get("records", [])
+        lookup = {int(row["timestamp"]): row for row in cvd_records if isinstance(row, Mapping) and row.get("timestamp") is not None}
+        for market_name in ("spot", "general"):
+            records = markets.get(market_name, {}).get("timeframes", {}).get(timeframe, {}).get("records", [])
+            for row in records:
+                source = lookup.get(int(row.get("timestamp", -1)))
+                if source is None:
+                    continue
+                buy = native_finite(source.get("taker_buy_volume_usd"))
+                sell = native_finite(source.get("taker_sell_volume_usd"))
+                if buy is None or sell is None:
+                    continue
+                row["buy_volume_usd"] = buy
+                row["sell_volume_usd"] = sell
+                total = buy + sell
+                row["buy_share"] = buy / total if total else None
+                row["sell_share"] = sell / total if total else None
+
+
 class PricesOhlcvProcessor:
     """Family-specific OO orchestrator for numeric Prices processing."""
 
@@ -871,6 +947,7 @@ class PricesOhlcvProcessor:
         existing_processing: Mapping[str, Any] | None = None,
         now_timestamp: int | None = None,
         dirty_timeframes: Sequence[str] | None = None,
+        cvd_processing_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if input_contract.get("family") != "prices_ohlcv":
             raise ValueError("Prices processor requires family=prices_ohlcv")
@@ -880,6 +957,7 @@ class PricesOhlcvProcessor:
             existing_processing=existing_processing,
             now_timestamp=now_timestamp,
         )
+        apply_cvd_volume_sides(markets, cvd_processing_context)
         comparison              = calculate_spot_futures_comparison(markets)
         dirty = set(dirty_timeframes or ())
         previous_features = (existing_processing or {}).get("features", {})
@@ -957,6 +1035,7 @@ def run_prices_ohlcv_processing(
     existing_processing: Mapping[str, Any] | None = None,
     now_timestamp: int | None = None,
     dirty_timeframes: Sequence[str] | None = None,
+    cvd_processing_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Single public facade for Processing Prices."""
     return PricesOhlcvProcessor().run(
@@ -964,4 +1043,5 @@ def run_prices_ohlcv_processing(
         existing_processing=existing_processing,
         now_timestamp=now_timestamp,
         dirty_timeframes=dirty_timeframes,
+        cvd_processing_context=cvd_processing_context,
     )

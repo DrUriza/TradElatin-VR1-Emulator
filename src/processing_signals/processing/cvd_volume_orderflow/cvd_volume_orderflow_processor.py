@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from processing_signals.processing.math.technical_cross_signals import detect_cross_pairs
+from processing_signals.processing.math.native_analysis import (difference, rolling_zscore, rolling_wasserstein, interpolated_cross, latest, finite)
 from processing_signals.processing.prices_ohlcv.prices_ohlcv_processor import (
     PRICE_INDICATOR_CONFIG, build_regression_channel_indicator, calculate_prices_indicator_package,
 )
@@ -225,66 +226,143 @@ class CvdVolumeOrderflowProcessor:
         }
         return package
 
-    def build_technical_analysis(self, markets: Mapping[str, Any]) -> dict[str, Any]:
-        """Precompute the frozen Screen-B CVD indicator family from true CVD OHLC."""
-        output: dict[str, Any] = {}
-        pairs = (
-            ("ema_9", "ema_21"), ("ema_9", "ema_50"), ("ema_21", "ema_50"),
-            ("sma_20", "sma_50"), ("sma_20", "sma_100"), ("sma_20", "sma_200"),
-            ("sma_50", "sma_100"), ("sma_50", "sma_200"), ("sma_100", "sma_200"),
-            ("wma_20", "wma_50"), ("regression_middle", "bollinger_middle"),
-            ("macd", "signal"), ("di_plus", "di_minus"), ("k", "d"),
-        )
-        config = copy.deepcopy(PRICE_INDICATOR_CONFIG)
-        config["sma_periods"] = (20, 50, 100, 200)
+    @staticmethod
+    def _native_indicator(indicator_id: str, timestamps: Sequence[int], series: Mapping[str, Sequence[Any]], *, section: str, label: str, unit: str = "score") -> dict[str, Any]:
+        current = {name: latest(values) for name, values in series.items()}
+        primary = next((value for value in current.values() if value is not None), None)
+        if primary is None:
+            signal, strength, status = "unavailable", 0.0, "unavailable"
+        else:
+            signal = "positive" if primary > 0.25 else ("negative" if primary < -0.25 else "neutral")
+            strength, status = min(1.0, abs(float(primary)) / 2.0), "available"
+        return {
+            "indicator_id": indicator_id, "status": status, "timestamps": list(timestamps),
+            "series": {name: list(values) for name, values in series.items()},
+            "thresholds": [{"value": 0.0, "role": "neutral"}],
+            "current": current,
+            "summary": {"section": section, "label": label, "display_value": None if primary is None else f"{primary:.3f}",
+                        "signal": signal, "signal_color": signal, "strength": strength},
+            "calculation_owner": "Processing", "recalculate_in_hmi": False, "unit": unit,
+        }
+
+    def build_technical_analysis(
+        self, markets: Mapping[str, Any], *,
+        price_history_by_market_timeframe: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]] | None = None,
+    ) -> dict[str, Any]:
+        """Build the frozen native CVD Screen A overlays and six Screen-B analyses."""
+        price_history = price_history_by_market_timeframe or {}
+        prepared: dict[str, dict[str, Any]] = {market: {} for market in MARKETS}
+
+        # Precompute normalized Spot/Futures CVD changes used by divergence.
+        cvd_change_z: dict[str, dict[str, list[float | None]]] = {market: {} for market in MARKETS}
         for market in MARKETS:
-            timeframes: dict[str, Any] = {}
+            for timeframe in TARGET_TIMEFRAMES:
+                records = markets[market]["timeframes"][timeframe]["records"][-730:]
+                closes = [row.get("cvd_ohlc_usd", {}).get("close") for row in records]
+                cvd_change_z[market][timeframe] = rolling_zscore(difference(closes), 30, 10)
+
+        for market in MARKETS:
             for timeframe in TARGET_TIMEFRAMES:
                 source = markets[market]["timeframes"][timeframe]
-                candles = [
-                    {"timestamp": row["timestamp"], **copy.deepcopy(row["cvd_ohlc_usd"]),
-                     "volume_usd": row.get("total_volume_usd", 0.0)}
-                    for row in source["records"]
-                ]
-                indicators = calculate_prices_indicator_package(
+                records = source["records"][-730:]
+                candles = [{"timestamp": row["timestamp"], **copy.deepcopy(row["cvd_ohlc_usd"]),
+                            "volume_usd": row.get("total_volume_usd", 0.0)} for row in records]
+                timestamps = [int(row["timestamp"]) for row in records]
+                closes = [row.get("cvd_ohlc_usd", {}).get("close") for row in records]
+                deltas = [row.get("volume_delta_usd") for row in records]
+                imbalances = [row.get("order_flow_imbalance", {}).get("value") for row in records]
+
+                config = copy.deepcopy(PRICE_INDICATOR_CONFIG)
+                config["ema_periods"], config["sma_periods"], config["wma_periods"] = (9, 21), (20, 50), (20, 50)
+                indicator_package = calculate_prices_indicator_package(
                     records=candles, market_type=f"cvd_{market}", timeframe=timeframe, config=config
                 ) if candles else {}
-                if candles:
-                    indicators = self._augment_cvd_indicators(indicators, candles, market, timeframe)
-                cross_series: dict[str, Any] = {}
-                for group in ("moving_averages", "macd", "adx", "stochastic"):
-                    payload = indicators.get(group, {})
-                    if isinstance(payload, Mapping) and isinstance(payload.get("series"), Mapping):
-                        cross_series.update(payload["series"])
-                regression_middle = indicators.get("regression_channel", {}).get("series", {}).get("middle")
-                bollinger_middle = indicators.get("bollinger_bands", {}).get("series", {}).get("middle")
-                if regression_middle is not None:
-                    cross_series["regression_middle"] = regression_middle
-                if bollinger_middle is not None:
-                    cross_series["bollinger_middle"] = bollinger_middle
-                timestamps = [row["timestamp"] for row in candles]
-                crosses = detect_cross_pairs(timestamps=timestamps, series=cross_series, pairs=pairs) if candles else []
-                index_by_timestamp = {int(timestamp): index for index, timestamp in enumerate(timestamps)}
-                for event in crosses:
-                    index = index_by_timestamp.get(int(event["timestamp"]))
-                    first_name, second_name = str(event.get("first_series")), str(event.get("second_series"))
-                    if index is not None:
-                        first_values, second_values = cross_series.get(first_name, []), cross_series.get(second_name, [])
-                        event["first_value"] = first_values[index] if index < len(first_values) else None
-                        event["second_value"] = second_values[index] if index < len(second_values) else None
-                timeframes[timeframe] = {
-                    "status": source["status"], "reason": source.get("reason"),
-                    "source_path": f"processing.markets.{market}.timeframes.{timeframe}.records",
-                    "source_field": "cvd_ohlc_usd", "timestamps": timestamps, "indicators": indicators,
-                    "cross_candidates": crosses, "calculation_history_records": len(candles),
-                    "minimum_warmup_records": 200, "recalculate_in_hmi": False,
+                moving = indicator_package.get("moving_averages", {})
+                ma_series = moving.get("series", {})
+                cross_pairs = (("ema_9", "ema_21"), ("sma_20", "sma_50"), ("wma_20", "wma_50"))
+                crosses = detect_cross_pairs(timestamps=timestamps, series=ma_series, pairs=cross_pairs) if candles else []
+                index_by_timestamp = {ts: index for index, ts in enumerate(timestamps)}
+                events: list[dict[str, Any]] = []
+                for cross in crosses:
+                    index = index_by_timestamp.get(int(cross["timestamp"]))
+                    first_name, second_name = str(cross.get("first_series")), str(cross.get("second_series"))
+                    if index is None:
+                        continue
+                    first_values, second_values = ma_series.get(first_name, []), ma_series.get(second_name, [])
+                    first_value = first_values[index] if index < len(first_values) else None
+                    second_value = second_values[index] if index < len(second_values) else None
+                    signal = "bullish" if int(cross.get("direction", 0)) > 0 else "bearish"
+                    exact = {}
+                    if index > 0:
+                        exact = interpolated_cross(
+                            previous_timestamp=timestamps[index - 1], timestamp=timestamps[index],
+                            previous_first=first_values[index - 1], previous_second=second_values[index - 1],
+                            first=first_value, second=second_value,
+                        )
+                    event_id = f"{first_name}_{'above' if signal == 'bullish' else 'below'}_{second_name}"
+                    crossing_value = exact.get("event_value_exact")
+                    events.append({
+                        "event_uid": f"{market}:{timeframe}:{timestamps[index]}:technical_cross:{event_id}",
+                        "timestamp": timestamps[index], "event_id": event_id, "event_type": "technical_cross",
+                        "event_group": "moving_average_cross", "signal": signal,
+                        "label": f"{first_name.replace('_',' ').upper()} {'ABOVE' if signal == 'bullish' else 'BELOW'} {second_name.replace('_',' ').upper()}",
+                        "marker": "arrow_up" if signal == "bullish" else "arrow_down",
+                        "source": {"market": market, "timeframe": timeframe},
+                        "display": {"screen_a": True, "screen_b": True,
+                                    "anchor_timestamp": exact.get("event_timestamp_exact", timestamps[index]),
+                                    "anchor_value": crossing_value if crossing_value is not None else finite(first_value),
+                                    "marker_anchor": "exact_interpolated_cross" if crossing_value is not None else "source_candle"},
+                        "calculation": {"first_series": first_name, "second_series": second_name,
+                                        "first_value": finite(first_value), "second_value": finite(second_value),
+                                        **exact, "crossing_value": crossing_value,
+                                        "reference_basis": "precomputed_contract_series_linear_cross_interpolation"},
+                        "event_timestamp_exact": exact.get("event_timestamp_exact"),
+                        "event_value_exact": crossing_value, "event_price": crossing_value,
+                    })
+
+                slope = rolling_zscore(difference(closes), 30, 10)
+                acceleration = difference(slope)
+                delta_z = rolling_zscore(deltas, 30, 10)
+                own_cvd_z = cvd_change_z[market][timeframe]
+                other = "futures" if market == "spot" else "spot"
+                cross_div = []
+                for own, peer in zip(cvd_change_z["spot"][timeframe], cvd_change_z["futures"][timeframe], strict=True):
+                    cross_div.append(None if own is None or peer is None else float(own) - float(peer))
+
+                price_records = price_history.get(market, {}).get(timeframe, [])
+                price_by_ts = {int(row["timestamp"]): row.get("close") for row in price_records if isinstance(row, Mapping) and row.get("timestamp") is not None}
+                price_closes = [price_by_ts.get(ts) for ts in timestamps]
+                price_z = rolling_zscore(difference(price_closes), 30, 10)
+                price_cvd_div = [None if pz is None or cz is None else float(pz) - float(cz) for pz, cz in zip(price_z, own_cvd_z, strict=True)]
+                wasserstein = rolling_wasserstein(difference(closes), 20, 100)
+
+                native = {
+                    "cvd_slope_acceleration": self._native_indicator("cvd_slope_acceleration", timestamps, {"slope": slope, "acceleration": acceleration}, section="CVD DYNAMICS", label="CVD SLOPE / ACCELERATION"),
+                    "delta_zscore": self._native_indicator("delta_zscore", timestamps, {"zscore": delta_z}, section="DELTA", label="DELTA Z-SCORE"),
+                    "buy_sell_imbalance": self._native_indicator("buy_sell_imbalance", timestamps, {"imbalance": imbalances}, section="ORDER FLOW", label="BUY / SELL IMBALANCE"),
+                    "price_cvd_divergence": self._native_indicator("price_cvd_divergence", timestamps, {"divergence": price_cvd_div}, section="DIVERGENCE", label="PRICE ↔ CVD DIVERGENCE"),
+                    "spot_futures_divergence": self._native_indicator("spot_futures_divergence", timestamps, {"divergence": cross_div}, section="CROSS MARKET", label="SPOT ↔ FUTURES DIVERGENCE"),
+                    "wasserstein_distance": self._native_indicator("wasserstein_distance", timestamps, {"wasserstein_distance": wasserstein}, section="REGIME", label="WASSERSTEIN DISTANCE"),
                 }
-            output[market] = {"source_chart_id": f"cvd_{market}", "title": f"CVD {market.title()}", "timeframes": timeframes}
+                prepared[market][timeframe] = {
+                    "status": source["status"], "source_records": len(records), "timestamps": timestamps,
+                    "overlays": {"moving_averages": {"alignment": "cvd_candles_by_index",
+                                                     "series": {name: list(values) for name, values in ma_series.items() if name in {"ema_9","ema_21","sma_20","sma_50","wma_20","wma_50"}},
+                                                     "parameters": {"ema_periods": [9,21], "sma_periods": [20,50], "wma_periods": [20,50]},
+                                                     "status": moving.get("quality", {}).get("status", "unavailable")}},
+                    "indicators": native, "events": events, "calculation_history_records": len(records),
+                    "screen_b_data_mode": "runtime_processing", "screen_b_processing_contract": "native_cvd_orderflow_vr1",
+                }
         return {
-            "analysis_id": "cvd_three_candle_technical_analysis",
-            "contract_version": "1.0.0",
-            "source": "CVD OHLC close/high/low series",
-            "markets": output, "recalculate_in_hmi": False, "calculation_owner": "Processing",
+            "analysis_id": "cvd_native_orderflow_analysis", "contract_version": "2.0.0",
+            "source": "CVD OHLC + taker buy/sell + Price context",
+            "markets": {m: {"source_chart_id": f"cvd_{m}", "title": f"CVD {m.title()}", "timeframes": prepared[m]} for m in MARKETS},
+            "recalculate_in_hmi": False, "calculation_owner": "Processing",
+            "selector_contract": {"markets": list(MARKETS), "timeframes": list(TARGET_TIMEFRAMES)},
+            "screen_b_native_orderflow_contract": {"enabled": True, "indicator_order": [
+                "cvd_slope_acceleration", "delta_zscore", "buy_sell_imbalance",
+                "price_cvd_divergence", "spot_futures_divergence", "wasserstein_distance"
+            ]},
         }
 
     def build_cross_market(self, markets: Mapping[str, Any]) -> dict[str, Any]:
@@ -463,7 +541,8 @@ class CvdVolumeOrderflowProcessor:
         return {"status": status, "core_status": core_status, "enrichment_status": enrichment_status,
             "warnings": warnings, "errors": errors}
 
-    def run(self, input_contract: Mapping[str, Any], *, price_reference_by_market: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    def run(self, input_contract: Mapping[str, Any], *, price_reference_by_market: Mapping[str, Mapping[str, Any]] | None = None,
+            price_history_by_market_timeframe: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]] | None = None) -> dict[str, Any]:
         normalized = self.validate_input_contract(input_contract)
         processing_timestamp = _clock_timestamp(self.clock)
         input_markets = input_contract["markets"]
@@ -485,9 +564,13 @@ class CvdVolumeOrderflowProcessor:
             "mode": input_contract["mode"], "context": self.build_context(input_contract, processing_timestamp),
             "parameters": self.build_parameters(), "markets": markets, "cross_market": cross_market,
             "provider_reconciliation": provider_reconciliation,
-            "technical_analysis": self.build_technical_analysis(markets), "quality": quality}
+            "technical_analysis": self.build_technical_analysis(markets, price_history_by_market_timeframe=price_history_by_market_timeframe), "quality": quality}
 
 
 def process_cvd_volume_orderflow(input_contract: Mapping[str, Any], *, price_reference_by_market: Mapping[str, Mapping[str, Any]] | None = None,
+                                 price_history_by_market_timeframe: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]] | None = None,
                                  clock: Callable[[], Any] | None = None) -> dict[str, Any]:
-    return CvdVolumeOrderflowProcessor(clock=clock).run(input_contract, price_reference_by_market=price_reference_by_market)
+    return CvdVolumeOrderflowProcessor(clock=clock).run(
+        input_contract, price_reference_by_market=price_reference_by_market,
+        price_history_by_market_timeframe=price_history_by_market_timeframe,
+    )

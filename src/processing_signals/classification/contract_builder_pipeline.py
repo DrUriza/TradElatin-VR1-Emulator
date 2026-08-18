@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
+from copy import deepcopy
 
 from .prices_ohlcv.prices_ohlcv_contract_builder import build_prices_screen_contract
 from .etf_exchange_flows.etf_exchange_flows_contract_builder import build_etf_exchange_flows_contract
@@ -10,6 +11,7 @@ from .on_chain_miners.on_chain_miners_contract_builder import build_on_chain_min
 from .open_interest_and_funding.open_interest_and_funding_contract_builder import build_open_interest_and_funding_contract
 from .volatility_market_regimes.volatility_market_regimes_contract_builder import build_volatility_market_regimes_screen
 from .cvd_volume_orderflow.cvd_volume_orderflow_contract_builder import build_cvd_volume_orderflow_contract
+from .final_screen_projection import project_final_screen_contract
 
 
 FAMILY_ORDER = (
@@ -37,10 +39,23 @@ def _etf(processing: Mapping[str, Any], classification: Mapping[str, Any], argum
 
 
 def _liquidity(processing: Mapping[str, Any], classification: Mapping[str, Any], arguments: Mapping[str, Any]) -> dict[str, Any]:
-    return build_liquidity_microstructure_screen_contract(
-        {"processing": processing, "classification": classification},
-        **dict(arguments),
-    )
+    args = dict(arguments)
+    selected = str(args.pop("selected_market", "perpetual"))
+    built_by_market = {
+        market: build_liquidity_microstructure_screen_contract(
+            {"processing": processing, "classification": classification}, selected_market=market, **args
+        )
+        for market in ("spot", "perpetual")
+    }
+    base = built_by_market[selected if selected in built_by_market else "perpetual"]
+    base["_prebuilt_market_views"] = {
+        market: {
+            "kpis": deepcopy(view.get("kpis", {})), "charts": deepcopy(view.get("charts", {})),
+            "tables": deepcopy(view.get("tables", {})), "widgets": deepcopy(view.get("widgets", {})),
+            "context": {"market": market},
+        } for market, view in built_by_market.items()
+    }
+    return base
 
 
 def _liquidations(processing: Mapping[str, Any], classification: Mapping[str, Any], arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -106,9 +121,10 @@ def run_contract_builder_pipeline(
             raise ValueError(f"Processing contract missing for family: {family}")
         if family not in classification_contracts:
             raise ValueError(f"Classification contract missing for family: {family}")
-        outputs[family] = handler(
+        built = handler(
             processing_contracts[family],
             classification_contracts[family],
             dict(arguments.get(family, {})),
         )
+        outputs[family] = project_final_screen_contract(family, built, processing_contracts[family])
     return outputs

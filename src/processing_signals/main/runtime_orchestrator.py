@@ -317,11 +317,23 @@ def run_all(
         else int(reference_timestamp or datetime.now(tz=UTC).timestamp())
     )
     if "cvd_volume_orderflow" in families:
+        prices_input = inputs.get("prices_ohlcv") or (existing_inputs or {}).get("prices_ohlcv")
+        price_history_by_market_timeframe = {}
+        if isinstance(prices_input, Mapping):
+            for market in ("spot", "futures"):
+                tf_map = prices_input.get("markets", {}).get(market, {}).get("timeframes", {})
+                if isinstance(tf_map, Mapping):
+                    price_history_by_market_timeframe[market] = {
+                        tf: block.get("records", []) for tf, block in tf_map.items() if isinstance(block, Mapping)
+                    }
         processing.update(run_processing_pipeline(
             input_contracts=inputs,
             enabled_families=("cvd_volume_orderflow",),
             now_timestamp=now_timestamp,
-            family_arguments={"cvd_volume_orderflow": {"clock": lambda ref=now_timestamp: ref}},
+            family_arguments={"cvd_volume_orderflow": {
+                "clock": lambda ref=now_timestamp: ref,
+                "price_history_by_market_timeframe": price_history_by_market_timeframe,
+            }},
             existing_processing=existing_processing,
         ))
 
@@ -330,23 +342,50 @@ def run_all(
             input_contracts=inputs,
             enabled_families=("prices_ohlcv",),
             now_timestamp=now_timestamp,
-            family_arguments={"prices_ohlcv": {"dirty_timeframes": list((dirty_timeframes or {}).get("prices_ohlcv", ())) }},
+            family_arguments={"prices_ohlcv": {
+                "dirty_timeframes": list((dirty_timeframes or {}).get("prices_ohlcv", ())),
+                "cvd_processing_context": processing.get("cvd_volume_orderflow") or (existing_processing or {}).get("cvd_volume_orderflow"),
+            }},
             existing_processing=existing_processing,
         ))
 
     remaining = tuple(family for family in families if family not in {"prices_ohlcv", "cvd_volume_orderflow"})
     processing_arguments: dict[str, dict[str, Any]] = {}
+    prices_input = inputs.get("prices_ohlcv") or (existing_inputs or {}).get("prices_ohlcv")
+    if "open_interest_and_funding" in remaining and isinstance(prices_input, Mapping):
+        spot_tfs = prices_input.get("markets", {}).get("spot", {}).get("timeframes", {})
+        processing_arguments["open_interest_and_funding"] = {
+            "price_history_by_timeframe": {tf: block.get("records", []) for tf, block in spot_tfs.items() if isinstance(block, Mapping)}
+        }
+    if "etf_exchange_flows" in remaining and isinstance(prices_input, Mapping):
+        daily = prices_input.get("markets", {}).get("spot", {}).get("timeframes", {}).get("1d", {})
+        processing_arguments["etf_exchange_flows"] = {"price_history_daily": daily.get("records", []) if isinstance(daily, Mapping) else []}
     if "long_short_liquidations" in remaining:
         prices_context = processing.get("prices_ohlcv") or (existing_processing or {}).get("prices_ohlcv")
         if not isinstance(prices_context, Mapping):
             raise ValueError("long_short_liquidations requires current or persisted prices_ohlcv Processing context")
         target_timestamp = int(inputs["long_short_liquidations"]["reference_timestamp"])
+        price_history = []
+        if isinstance(prices_input, Mapping):
+            block = prices_input.get("markets", {}).get("spot", {}).get("timeframes", {}).get("1h", {})
+            if isinstance(block, Mapping):
+                price_history = block.get("records", [])
+        vol_input = inputs.get("volatility_market_regimes") or (existing_inputs or {}).get("volatility_market_regimes")
+        positioning_history = []
+        if isinstance(vol_input, Mapping):
+            positioning_history = (
+                vol_input.get("providers", {}).get("coinglass", {}).get("top_position_ratio", {}).get("records", [])
+                or vol_input.get("top_position_ratio", {}).get("records", [])
+                or []
+            )
         processing_arguments["long_short_liquidations"] = {
             "reference_price_context": build_liquidations_reference_price_context(
                 prices_context,
                 target_timestamp=target_timestamp,
                 synthetic_replay_alignment=synthetic,
-            )
+            ),
+            "price_history": price_history,
+            "positioning_history": positioning_history,
         }
     if "liquidity_microstructure" in remaining:
         prices_input = inputs.get("prices_ohlcv") or (existing_inputs or {}).get("prices_ohlcv")

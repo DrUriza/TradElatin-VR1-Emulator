@@ -127,6 +127,8 @@ def _ohlcv_overlays(indicators: Mapping[str, Any], limit: int) -> dict[str, Any]
     bands     = indicators.get("bollinger_bands", {})
     fibonacci = indicators.get("fibonacci_levels", {})
     regression = indicators.get("regression_channel", {})
+    support_resistance = indicators.get("support_resistance", {})
+    sr_current = support_resistance.get("current", {}) if isinstance(support_resistance, Mapping) else {}
     overlays  = {
         "moving_averages": {"alignment": "ohlcv_records_by_index", "series": _tail_series(moving.get("series", {}), limit), "parameters": deepcopy(moving.get("parameters", {})),
                             "status": moving.get("quality", {}).get("status", "unavailable")},
@@ -144,7 +146,21 @@ def _ohlcv_overlays(indicators: Mapping[str, Any], limit: int) -> dict[str, Any]
             "provenance": {"owner": "Prices Processing", "calculation": "rolling_ordinary_least_squares", "recalculate_in_hmi": False},
         },
     }
-    for overlay_id in ("pivot_points", "support", "resistance", "vwap"):
+    supports = list(sr_current.get("support_levels", []) or [])
+    resistances = list(sr_current.get("resistance_levels", []) or [])
+    overlays["support"] = {
+        "status": "available" if supports else "unavailable",
+        "reason": None if supports else "support_levels_unavailable",
+        "current": {"levels": [{"id": f"S{i+1}", "label": f"S{i+1}", "value": value} for i, value in enumerate(supports)]},
+        "parameters": deepcopy(support_resistance.get("parameters", {})) if isinstance(support_resistance, Mapping) else {},
+    }
+    overlays["resistance"] = {
+        "status": "available" if resistances else "unavailable",
+        "reason": None if resistances else "resistance_levels_unavailable",
+        "current": {"levels": [{"id": f"R{i+1}", "label": f"R{i+1}", "value": value} for i, value in enumerate(resistances)]},
+        "parameters": deepcopy(support_resistance.get("parameters", {})) if isinstance(support_resistance, Mapping) else {},
+    }
+    for overlay_id in ("pivot_points", "vwap"):
         overlays[overlay_id] = {"status": "unavailable", "reason": "not_available_in_prices_processing"}
     return overlays
 
@@ -198,17 +214,25 @@ def _chart_annotations(classification_output: Mapping[str, Any], processing_outp
 
 
 def _volume_side_row(record: Mapping[str, Any]) -> dict[str, Any]:
-    high = _finite(record.get("high"))
-    low = _finite(record.get("low"))
-    close = _finite(record.get("close"))
-    volume = _finite(record.get("volume_usd"))
+    direct_buy = _finite(record.get("buy_volume_usd"))
+    direct_sell = _finite(record.get("sell_volume_usd"))
+    if direct_buy is not None and direct_sell is not None and direct_buy >= 0 and direct_sell >= 0:
+        total = direct_buy + direct_sell
+        return {
+            "timestamp": record.get("timestamp"),
+            "buy_volume_usd": direct_buy,
+            "sell_volume_usd": direct_sell,
+            "buy_share": direct_buy / total if total > 0 else None,
+            "sell_share": direct_sell / total if total > 0 else None,
+            "is_proxy": False,
+        }
+    high = _finite(record.get("high")); low = _finite(record.get("low")); close = _finite(record.get("close")); volume = _finite(record.get("volume_usd"))
     if high is None or low is None or close is None or volume is None:
-        return {"timestamp": record.get("timestamp"), "buy_volume_usd": None, "sell_volume_usd": None, "buy_share": None, "sell_share": None}
+        return {"timestamp": record.get("timestamp"), "buy_volume_usd": None, "sell_volume_usd": None, "buy_share": None, "sell_share": None, "is_proxy": True}
     span = high - low
-    buy_share = 0.5 if span <= 0 else max(0.0, min(1.0, (close - low) / span))
-    sell_share = 1.0 - buy_share
+    buy_share = 0.5 if span <= 0 else max(0.0, min(1.0, (close - low) / span)); sell_share = 1.0 - buy_share
     return {"timestamp": record.get("timestamp"), "buy_volume_usd": volume * buy_share, "sell_volume_usd": volume * sell_share,
-            "buy_share": buy_share, "sell_share": sell_share}
+            "buy_share": buy_share, "sell_share": sell_share, "is_proxy": True}
 
 
 def _volume_side_summary(rows: list[Mapping[str, Any]], *, expected: int | None = None) -> dict[str, Any]:
@@ -229,7 +253,9 @@ def _volume_by_side_contract(records: list[Mapping[str, Any]]) -> dict[str, Any]
     current = deepcopy(visible[-1]) if visible else {"timestamp": None, "buy_volume_usd": None, "sell_volume_usd": None, "buy_share": None, "sell_share": None}
     return {
         "alignment": "ohlcv_records_by_index", "status": "available" if visible else "unavailable", "reason": None if visible else "records_unavailable",
-        "unit": "USD", "source_volume_field": "volume_usd", "method": "synthetic_candle_position_proxy", "is_proxy": True,
+        "unit": "USD", "source_volume_field": "buy_volume_usd/sell_volume_usd",
+        "method": "cvd_taker_buy_sell_when_aligned_else_candle_position_proxy",
+        "is_proxy": any(bool(row.get("is_proxy")) for row in visible),
         "series": {"buy_volume_usd": [row.get("buy_volume_usd") for row in visible], "sell_volume_usd": [row.get("sell_volume_usd") for row in visible],
                    "buy_volume_share": [row.get("buy_share") for row in visible], "sell_volume_share": [row.get("sell_share") for row in visible]},
         "current": current, "summary": summary,
@@ -444,35 +470,18 @@ def build_prices_events(classification_output: Mapping[str, Any], processing_out
         uid for uid in technical if registry["by_id"].get(uid, {}).get("event_group") == "channel_cross"
     ]
     registry["technical_cross_policy"] = {
-        "moving_average_families": {
-            "ema": ["ema_9", "ema_21", "ema_50"],
-            "sma": ["sma_20", "sma_50", "sma_100", "sma_200"],
-            "wma": ["wma_20", "wma_50"],
-        },
+        "moving_average_families": {"ema": ["ema_9", "ema_21"], "sma": ["sma_20", "sma_50"], "wma": ["wma_20", "wma_50"]},
         "supported_moving_average_pairs": [
             {"family": "ema", "first_series": "ema_9", "second_series": "ema_21"},
-            {"family": "ema", "first_series": "ema_9", "second_series": "ema_50"},
-            {"family": "ema", "first_series": "ema_21", "second_series": "ema_50"},
             {"family": "sma", "first_series": "sma_20", "second_series": "sma_50"},
-            {"family": "sma", "first_series": "sma_20", "second_series": "sma_100"},
-            {"family": "sma", "first_series": "sma_20", "second_series": "sma_200"},
-            {"family": "sma", "first_series": "sma_50", "second_series": "sma_100"},
-            {"family": "sma", "first_series": "sma_50", "second_series": "sma_200"},
-            {"family": "sma", "first_series": "sma_100", "second_series": "sma_200"},
             {"family": "wma", "first_series": "wma_20", "second_series": "wma_50"},
         ],
-        "pair_generation": "same_family_only",
-        "cross_family_policy": "forbidden",
-        "moving_average_pair_count": 10,
-        "channel_pairs": [{
-            "first_series": "regression_channel.middle",
-            "second_series": "bollinger_bands.middle",
-            "selection_requirements": ["regression_channel", "bollinger_bands"],
-        }],
-        "cross_rule": {
-            "above": "previous_difference <= 0 and current_difference > 0",
-            "below": "previous_difference >= 0 and current_difference < 0",
-        },
+        "pair_generation": "same_family_only", "cross_family_policy": "forbidden", "moving_average_pair_count": 3,
+        "channel_pairs": [{"first_series": "regression_channel.middle", "second_series": "bollinger_bands.middle",
+                           "selection_requirements": ["regression_channel", "bollinger_bands"]}],
+        "cross_rule": {"above": "previous_difference <= 0 and current_difference > 0",
+                       "below": "previous_difference >= 0 and current_difference < 0"},
+        "exact_interpolation": True,
         "event_groups": ["moving_average_cross", "channel_cross"],
     }
 

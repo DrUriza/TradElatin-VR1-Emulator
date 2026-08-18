@@ -4,7 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Mapping
 
-ROOT_SECTIONS = ("mode", "context", "series", "indicators", "events", "snapshots", "confirmations", "availability", "quality")
+ROOT_SECTIONS = ("mode", "context", "series", "indicators", "events", "snapshots", "confirmations", "availability", "quality", "native_analysis")
 
 
 def build_open_interest_and_funding_features(processed_sections: Mapping[str, Any]) -> dict[str, Any]:

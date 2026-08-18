@@ -12,6 +12,7 @@ from typing import Any
 from ..math.microstructure.order_book import depth_metrics, derive_cumulative_band, process_order_book_levels
 from ..math.microstructure.series_metrics import absolute_change, clean_zero, observation_at_or_before, rolling_mean, rolling_std, rolling_z_score, safe_percent_change
 from ..math.microstructure.trade_flow import aggregate_trade_window, enrich_trade_event
+from ..math.native_analysis import rolling_zscore as native_rolling_zscore, rolling_wasserstein, difference as native_difference, latest as native_latest
 from .liquidity_microstructure_feature_builder import build_liquidity_microstructure_features
 
 PROCESSING_VERSION                  = "0.1"
@@ -333,81 +334,106 @@ def _whale(dataset: Mapping[str, Any], lookback: int) -> dict[str, Any]:
 
 
 def _historical_market_join(prices_input: Mapping[str, Any], provider: Mapping[str, Any]) -> dict[str, Any]:
-    """Join normalized 1h inputs without filling a missing regular source."""
+    """Join normalized 1h inputs for independent Spot and Perpetual analytical histories."""
     try:
         price_source = prices_input["confirmations"]["glassnode"]["price_ohlc"]
         cap_source = prices_input["provider_features"]["market_cap"]
     except (KeyError, TypeError):
-        return {"status": "unavailable", "reason": "normalized_glassnode_context_unavailable", "records": [],
-                "source_data_as_of": None, "provenance": {"providers": ["glassnode", "coinglass"]}}
-
+        return {"status":"unavailable","reason":"normalized_glassnode_context_unavailable","records":[],"market_records":{},"source_data_as_of":None,"provenance":{"providers":["glassnode","coinglass"]}}
     prices = {row["timestamp"]: row for row in price_source.get("records", [])}
     caps = {row["timestamp"]: row for row in cap_source.get("records", [])}
-    books = {market: {row["timestamp"]: row for row in provider["orderbook"][market].get("records", [])
-                      if row.get("timeframe") == "1h" and row.get("bid_levels") and row.get("ask_levels")}
-             for market in MARKETS}
-    depths = {
-        market: {row["timestamp"]: row for row in provider["order_depth"][market].get("records", [])
-                 if row.get("timeframe") == "1h" and row.get("range_percent") == REFERENCE_DEPTH_RANGE_PERCENT}
-        for market in MARKETS
-    }
-    whales = {row["timestamp"]: row for row in provider["whale_activity"].get("records", []) if row.get("timeframe") == "1h"}
-    required_sets = [set(prices), set(caps), set(whales)]
-    required_sets.extend(set(books[market]) for market in MARKETS)
-    required_sets.extend(set(depths[market]) for market in MARKETS)
-    timestamps = sorted(set.intersection(*required_sets)) if all(required_sets) else []
-
-    trade_bins: dict[int, dict[str, float | int]] = {}
+    books = {market:{row["timestamp"]:row for row in provider["orderbook"][market].get("records",[]) if row.get("timeframe")=="1h" and row.get("bid_levels") and row.get("ask_levels")} for market in MARKETS}
+    depths = {market:{row["timestamp"]:row for row in provider["order_depth"][market].get("records",[]) if row.get("timeframe")=="1h" and row.get("range_percent")==REFERENCE_DEPTH_RANGE_PERCENT} for market in MARKETS}
+    whales = {row["timestamp"]:row for row in provider["whale_activity"].get("records",[]) if row.get("timeframe")=="1h"}
+    required_sets=[set(prices),set(caps),set(whales),*(set(books[m]) for m in MARKETS),*(set(depths[m]) for m in MARKETS)]
+    timestamps=sorted(set.intersection(*required_sets)) if all(required_sets) else []
+    trade_bins={market:{} for market in MARKETS}
     for market in MARKETS:
-        for event in provider["large_trades"][market].get("events", []):
-            bucket = int(event["timestamp"]) // 3600 * 3600
-            totals = trade_bins.setdefault(bucket, {"buy": 0.0, "sell": 0.0, "count": 0})
-            totals[str(event["side"])] += float(event.get("volume_usd", 0.0))
-            totals["count"] += 1
-
-    records = []
+        for event in provider["large_trades"][market].get("events",[]):
+            bucket=int(event["timestamp"])//3600*3600
+            totals=trade_bins[market].setdefault(bucket,{"buy":0.0,"sell":0.0,"count":0})
+            totals[str(event["side"])]+=float(event.get("volume_usd",0.0)); totals["count"]+=1
+    market_records={market:[] for market in MARKETS}
     for timestamp in timestamps:
-        spot_book = books["spot"][timestamp]
-        bid_prices = [float(level["price"]) for level in spot_book["bid_levels"] if float(level["quantity"]) > 0]
-        ask_prices = [float(level["price"]) for level in spot_book["ask_levels"] if float(level["quantity"]) > 0]
-        if not bid_prices or not ask_prices:
-            continue
-        best_bid, best_ask = max(bid_prices), min(ask_prices)
-        if best_bid >= best_ask:
-            continue
-        mid_price = (best_bid + best_ask) / 2
-        spread = best_ask - best_bid
-        spot_depth = depths["spot"][timestamp]
-        trades = trade_bins.get(timestamp, {"buy": 0.0, "sell": 0.0, "count": 0})
-        buy, sell = float(trades["buy"]), float(trades["sell"])
-        records.append({
-            "timestamp": timestamp, "price": float(prices[timestamp]["close"]),
-            "market_cap": float(caps[timestamp]["value"]),
-            "best_bid": best_bid, "best_ask": best_ask, "mid_price": mid_price, "spread": spread,
-            "spread_bps": 10_000 * spread / mid_price,
-            "bid_depth": float(spot_depth["bids_usd"]), "ask_depth": float(spot_depth["asks_usd"]),
-            "depth_range_percent": REFERENCE_DEPTH_RANGE_PERCENT,
-            "whale_index_value": float(whales[timestamp]["whale_index_value"]),
-            "large_trade_buy_notional": buy, "large_trade_sell_notional": sell,
-            "large_trade_delta": clean_zero(buy - sell), "large_trade_count": int(trades["count"]),
-            "status": "available",
-        })
-    as_of_candidates = [max(values) for values in (prices, caps, whales, *books.values(), *depths.values()) if values]
-    effective_as_of = min(as_of_candidates) if as_of_candidates else None
-    records = [row for row in records if effective_as_of is not None and row["timestamp"] <= effective_as_of]
-    return {
-        "status": "available" if records else "unavailable",
-        "reason": None if records else "no_common_hourly_buckets", "records": records,
-        "source_data_as_of": effective_as_of,
-        "provenance": {"providers": ["glassnode", "coinglass"], "timezone": "UTC",
-                       "bucket_seconds": 3600, "bucket_semantics": "closed_hourly",
-                       "staleness_tolerance_seconds": 3600, "forward_fill": False,
-                       "reference_depth_range_percent": REFERENCE_DEPTH_RANGE_PERCENT,
-                       "canonical_market": "spot", "effective_as_of_rule": "minimum_source_data_as_of",
-                       "source_coverage": {"price": len(prices), "market_cap": len(caps),
-                                           "orderbook_spot": len(books["spot"]), "orderbook_perpetual": len(books["perpetual"]),
-                                           "depth_spot": len(depths["spot"]), "depth_perpetual": len(depths["perpetual"]),
-                                           "whale_index": len(whales)}}}
+        for market in MARKETS:
+            processed=process_order_book_levels(books[market][timestamp]["bid_levels"],books[market][timestamp]["ask_levels"],impact_quantity=MARKET_IMPACT_QUANTITY_BASE)
+            if processed.get("status")!="available": continue
+            depth=depths[market][timestamp]
+            trades=trade_bins[market].get(timestamp,{"buy":0.0,"sell":0.0,"count":0})
+            bid_depth=float(depth["bids_usd"]); ask_depth=float(depth["asks_usd"]); total_depth=bid_depth+ask_depth
+            bid_levels=processed.get("bid_levels",[]); ask_levels=processed.get("ask_levels",[])
+            bid_total=sum(float(x.get("notional_quote",0.0)) for x in bid_levels); ask_total=sum(float(x.get("notional_quote",0.0)) for x in ask_levels)
+            bid_wall=(max((float(x.get("notional_quote",0.0)) for x in bid_levels),default=0.0)/bid_total) if bid_total else None
+            ask_wall=(max((float(x.get("notional_quote",0.0)) for x in ask_levels),default=0.0)/ask_total) if ask_total else None
+            buy=float(trades["buy"]); sell=float(trades["sell"])
+            market_records[market].append({
+                "timestamp":timestamp,"price":float(prices[timestamp]["close"]),"market_cap":float(caps[timestamp]["value"]),
+                "best_bid":processed["best_bid"],"best_ask":processed["best_ask"],"mid_price":processed["mid_price"],
+                "spread":processed["spread_quote"],"spread_bps":processed["spread_bps"],
+                "bid_depth":bid_depth,"ask_depth":ask_depth,"depth_range_percent":REFERENCE_DEPTH_RANGE_PERCENT,
+                "depth_imbalance":None if total_depth==0 else (bid_depth-ask_depth)/total_depth,
+                "bid_ask_depth_ratio":None if ask_depth==0 else bid_depth/ask_depth,
+                "market_impact_1btc_bps":processed.get("market_impact",{}).get("worst_side_impact_bps"),
+                "bid_wall_score":bid_wall,"ask_wall_score":ask_wall,
+                "whale_index_value":float(whales[timestamp]["whale_index_value"]),
+                "large_trade_buy_notional":buy,"large_trade_sell_notional":sell,"large_trade_delta":clean_zero(buy-sell),"large_trade_count":int(trades["count"]),
+                "status":"available","market":market,
+            })
+    as_of_candidates=[max(values) for values in (prices,caps,whales,*books.values(),*depths.values()) if values]
+    effective_as_of=min(as_of_candidates) if as_of_candidates else None
+    for market in MARKETS:
+        market_records[market]=[row for row in market_records[market] if effective_as_of is not None and row["timestamp"]<=effective_as_of]
+    records=deepcopy(market_records["spot"])
+    return {"status":"available" if records else "unavailable","reason":None if records else "no_common_hourly_buckets",
+            "records":records,"market_records":market_records,"source_data_as_of":effective_as_of,
+            "provenance":{"providers":["glassnode","coinglass"],"timezone":"UTC","bucket_seconds":3600,"bucket_semantics":"closed_hourly",
+                          "staleness_tolerance_seconds":3600,"forward_fill":False,"reference_depth_range_percent":REFERENCE_DEPTH_RANGE_PERCENT,
+                          "canonical_market":"spot","market_views":["spot","perpetual"],"effective_as_of_rule":"minimum_source_data_as_of"}}
+
+
+def _native_liquidity_analysis(records: Sequence[Mapping[str, Any]], *, whale_order_history_available: bool = False) -> dict[str, Any]:
+    rows=list(records); timestamps=[int(r["timestamp"]) for r in rows]
+    depth_imb=[r.get("depth_imbalance") for r in rows]; depth_z=native_rolling_zscore(depth_imb,30,10); ratios=[r.get("bid_ask_depth_ratio") for r in rows]
+    spreads=[r.get("spread_bps") for r in rows]; impacts=[r.get("market_impact_1btc_bps") for r in rows]
+    spread_z=native_rolling_zscore(spreads,30,10); impact_z=native_rolling_zscore(impacts,30,10)
+    stress=[None if a is None and b is None else float((a or 0.0)+(b or 0.0))/2.0 for a,b in zip(spread_z,impact_z,strict=True)]
+    bid_wall=[r.get("bid_wall_score") for r in rows]; ask_wall=[r.get("ask_wall_score") for r in rows]
+    wall_conc=[None if a is None and b is None else max(float(a or 0.0),float(b or 0.0)) for a,b in zip(bid_wall,ask_wall,strict=True)]
+    bid_depth=[r.get("bid_depth") for r in rows]; ask_depth=[r.get("ask_depth") for r in rows]
+    bid_depth_z=native_rolling_zscore(bid_depth,30,10); ask_depth_z=native_rolling_zscore(ask_depth,30,10)
+    upside_vac=[None if v is None else max(0.0,-float(v)) for v in ask_depth_z]; downside_vac=[None if v is None else max(0.0,-float(v)) for v in bid_depth_z]
+    whale=[r.get("whale_index_value") for r in rows]; whale_z=native_rolling_zscore(whale,30,10)
+    whale_persistence=[]
+    for i,v in enumerate(whale_z):
+        if v is None: whale_persistence.append(None); continue
+        prev=[x for x in whale_z[max(0,i-5):i+1] if x is not None]
+        whale_persistence.append(None if not prev else sum(1.0 if x*float(v)>0 else 0.0 for x in prev)/len(prev))
+    cancellation=[None]*len(rows); cancellation_z=[None]*len(rows)
+    price=[r.get("price") for r in rows]; price_return=([None]+[None if price[i-1] in (None,0) or price[i] is None else float(price[i])/float(price[i-1])-1 for i in range(1,len(price))]) if price else []
+    buy=[r.get("large_trade_buy_notional") for r in rows]; sell=[r.get("large_trade_sell_notional") for r in rows]
+    buy_int=[]; sell_int=[]
+    for b,s,ad,bd in zip(buy,sell,ask_depth,bid_depth,strict=True):
+        buy_int.append(None if b is None or ad in (None,0) else float(b)/float(ad)); sell_int.append(None if s is None or bd in (None,0) else float(s)/float(bd))
+    buy_abs=[]; sell_abs=[]
+    for bi,si,ret in zip(buy_int,sell_int,price_return,strict=True):
+        buy_abs.append(None if bi is None or ret is None else float(bi)*max(0.0,-float(ret))*100.0)
+        sell_abs.append(None if si is None or ret is None else float(si)*max(0.0,float(ret))*100.0)
+    absorption=[None if a is None and b is None else float((a or 0.0)-(b or 0.0)) for a,b in zip(buy_abs,sell_abs,strict=True)]
+    hmi=[]
+    for di,st,ab,wc in zip(depth_z,stress,absorption,wall_conc,strict=True):
+        vals=[v for v in (di,None if st is None else -float(st),ab,wc) if v is not None]
+        hmi.append(None if not vals else float(sum(vals)/len(vals)))
+    wasserstein=rolling_wasserstein(hmi,20,100)
+    return {"status":"available" if rows else "unavailable","records":rows,"timestamps":timestamps,"indicators":{
+        "depth_imbalance_pressure":{"depth_imbalance":depth_imb,"depth_imbalance_zscore":depth_z,"bid_ask_depth_ratio":ratios},
+        "spread_market_impact_stress":{"spread_bps":spreads,"market_impact_1btc_bps":impacts,"liquidity_stress_score":stress},
+        "liquidity_wall_concentration_vacuum":{"bid_wall_score":bid_wall,"ask_wall_score":ask_wall,"upside_vacuum_score":upside_vac,"downside_vacuum_score":downside_vac,"wall_concentration_score":wall_conc},
+        "whale_persistence_cancellation":{"whale_persistence_score":whale_persistence,"cancellation_activity":cancellation,"cancellation_activity_zscore":cancellation_z,"status":"available" if whale_order_history_available else "partial","reason":None if whale_order_history_available else "historical_whale_order_lifecycle_unavailable"},
+        "executed_liquidity_absorption":{"buy_absorption_score":buy_abs,"sell_absorption_score":sell_abs,"absorption_index":absorption},
+        "liquidity_regime_hmi":{"liquidity_hmi_score":hmi,"wasserstein_distance":wasserstein},
+    },"current":{"liquidity_regime":"balanced" if native_latest(hmi) is None or abs(float(native_latest(hmi)))<0.5 else ("robust" if float(native_latest(hmi))>0 else "stressed"),
+                         "depth_imbalance":native_latest(depth_imb),"liquidity_stress_score":native_latest(stress),"absorption_index":native_latest(absorption),"wasserstein_distance":native_latest(wasserstein)},
+            "recalculate_in_hmi":False}
 
 
 def _market_history(dataset: Mapping[str, Any], reference: int) -> dict[str, Any]:
@@ -520,6 +546,11 @@ def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, exist
     market_dataset = (_historical_market_join(prices_input_context, provider)
                       if isinstance(prices_input_context, Mapping) else provider["market_history"])
     history = _market_history(market_dataset, reference)
+    market_histories = {market: _market_history({"status": market_dataset.get("status", "unavailable"),
+                                                  "reason": market_dataset.get("reason"),
+                                                  "records": market_dataset.get("market_records", {}).get(market, market_dataset.get("records", []) if market == "spot" else []),
+                                                  "provenance": market_dataset.get("provenance", {})}, reference)
+                        for market in MARKETS}
     previous = deepcopy(existing_processing) if existing_processing is not None else None
     compatible_previous = (isinstance(previous, Mapping) and previous.get("family") == "liquidity_microstructure" and
                            previous.get("configuration") == configuration and previous.get("context") == input_copy["context"])
@@ -532,7 +563,14 @@ def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, exist
         whale, history = _preserve_granular(provider=provider, markets=markets, whale=whale, history=history, previous=previous)
         _refresh_aggregate_statuses(markets, whale)
         if isinstance(prices_input_context, Mapping):
-            history = _market_history(_historical_market_join(prices_input_context, provider), reference)
+            market_dataset = _historical_market_join(prices_input_context, provider)
+            history = _market_history(market_dataset, reference)
+            market_histories = {market: _market_history({"status": market_dataset.get("status", "unavailable"),
+                                                          "reason": market_dataset.get("reason"),
+                                                          "records": market_dataset.get("market_records", {}).get(market, []),
+                                                          "provenance": market_dataset.get("provenance", {})}, reference)
+                                for market in MARKETS}
+    liquidity_analysis = {market: _native_liquidity_analysis(market_histories[market].get("records", []), whale_order_history_available=False) for market in MARKETS}
     comparison = _comparison(markets)
     required = {f"markets.{market}.{feature}": markets[market][feature]["status"] for market in MARKETS
                 for feature in ("orderbook", "order_depth")}
@@ -548,7 +586,7 @@ def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, exist
               "reference_timestamp": reference, "execution_timestamp": execution, "configuration": configuration,
               "context": deepcopy(dict(input_copy["context"])),
               "source_selection": _source_selection(provider), "markets": markets, "whale_activity": whale,
-              "market_history": history, "comparison": comparison,
+              "market_history": history, "market_histories": market_histories, "liquidity_analysis": liquidity_analysis, "comparison": comparison,
               "features": build_liquidity_microstructure_features(markets=markets, whale_activity=whale,
                                                                    market_history=history, comparison=comparison),
               "quality": {"status": quality_status, "required_features": list(required),

@@ -49,9 +49,7 @@ def _run_onchain(input_contract: Mapping[str, Any], *, existing_processing, now_
 
 def _run_oi(input_contract: Mapping[str, Any], *, existing_processing, now_timestamp, family_arguments):
     del existing_processing, now_timestamp
-    if family_arguments:
-        raise ValueError("open_interest_and_funding Processing does not accept family arguments")
-    return process_open_interest_and_funding(input_contract)
+    return process_open_interest_and_funding(input_contract, **dict(family_arguments))
 
 
 def _run_volatility(input_contract: Mapping[str, Any], *, existing_processing, now_timestamp, family_arguments):

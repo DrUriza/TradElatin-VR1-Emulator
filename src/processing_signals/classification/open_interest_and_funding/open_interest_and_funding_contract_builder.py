@@ -336,7 +336,7 @@ def _build_charts(processing: Mapping[str, Any], classification: Mapping[str, An
     funding_candle = _ohlc_item("funding_ohlc", funding, "percent_points", funding_path)
     moving = _at(processing, f"{indicator_base}.moving_averages")
     smas = [_series_item(name, moving, (name,), "USD", "line", f"{indicator_base}.moving_averages")
-            for name in ("sma_20", "sma_50", "sma_100", "sma_200")]
+            for name in ("sma_20", "sma_50")]
     bollinger = _at(processing, f"{indicator_base}.bollinger_bands")
     bands = [_series_item(name, bollinger, (name,), "USD", "line", f"{indicator_base}.bollinger_bands")
              for name in ("middle", "upper", "lower")]

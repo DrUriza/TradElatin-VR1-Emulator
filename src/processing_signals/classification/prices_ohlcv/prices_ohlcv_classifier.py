@@ -648,16 +648,24 @@ def classify_technical_crosses(crosses: Mapping[str, Any]) -> dict[str, Any]:
                     signal = "neutral"
                     marker = "dot"
                 cross_id  = str(event.get("cross_id", "unknown_cross"))
-                output[market][timeframe].append({"timestamp": event.get("timestamp"), "event_id": cross_id, "event_type": "technical_cross",
-                                                   "signal": signal, "label": CROSS_LABELS.get(cross_id, cross_id.replace("_", " ").title()),
-                                                   "marker": marker,
-                                                   "color_token": signal, "source": {"market": market, "timeframe": timeframe},
-                                                   "calculation": {"first_series": event.get("first_series"), "second_series": event.get("second_series"),
-                                                                   "previous_difference": _finite(event.get("previous_difference")),
-                                                                   "current_difference": _finite(event.get("current_difference")),
-                                                                   "first_value": _finite(event.get("first_value")),
-                                                                   "second_value": _finite(event.get("second_value")),
-                                                                   "raw_direction": raw_direction}})
+                item = {"timestamp": event.get("timestamp"), "event_id": cross_id, "event_type": "technical_cross",
+                        "signal": signal, "label": CROSS_LABELS.get(cross_id, cross_id.replace("_", " ").title()),
+                        "marker": marker, "color_token": signal, "source": {"market": market, "timeframe": timeframe},
+                        "calculation": {"first_series": event.get("first_series"), "second_series": event.get("second_series"),
+                                        "previous_difference": _finite(event.get("previous_difference")),
+                                        "current_difference": _finite(event.get("current_difference")),
+                                        "first_value": _finite(event.get("first_value")),
+                                        "second_value": _finite(event.get("second_value")),
+                                        "previous_first_value": _finite(event.get("previous_first_value")),
+                                        "previous_second_value": _finite(event.get("previous_second_value")),
+                                        "interpolation_fraction": _finite(event.get("interpolation_fraction")),
+                                        "event_value_exact": _finite(event.get("event_value_exact")),
+                                        "raw_direction": raw_direction}}
+                if event.get("event_timestamp_exact") is not None:
+                    item["event_timestamp_exact"] = _finite(event.get("event_timestamp_exact"))
+                    item["event_value_exact"] = _finite(event.get("event_value_exact"))
+                    item["event_price"] = _finite(event.get("event_price", event.get("event_value_exact")))
+                output[market][timeframe].append(item)
     return output
 
 def classify_candlestick_patterns(patterns: Mapping[str, Any]) -> dict[str, Any]:

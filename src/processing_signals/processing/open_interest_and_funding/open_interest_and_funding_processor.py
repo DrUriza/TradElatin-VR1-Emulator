@@ -21,6 +21,7 @@ from processing_signals.processing.math.indicators.trend.moving_averages import 
 from processing_signals.processing.math.indicators.volatility.atr import atr
 from processing_signals.processing.math.indicators.volatility.bollinger_bands import bollinger_bands
 from processing_signals.processing.math.technical_cross_signals import detect_numeric_crosses
+from processing_signals.processing.math.native_analysis import (rolling_zscore, rolling_percentile, pct_change as native_pct_change, difference as native_difference, latest, interpolated_cross)
 from processing_signals.processing.open_interest_and_funding.open_interest_and_funding_feature_builder import OpenInterestAndFundingFeatureBuilder
 
 FAMILY            = "open_interest_and_funding"
@@ -257,22 +258,22 @@ def _regression_channel_series(records: Sequence[Mapping[str, Any]], bounds: Seq
 def _indicator_packages(records: Sequence[Mapping[str, Any]], bounds: Sequence[tuple[int, int]], gaps: Sequence[Mapping[str, Any]],
                         timeframe: str, source_status: str) -> dict[str, Any]:
     timestamps, source = [row["timestamp"] for row in records], _source("open_interest_ohlc", timeframe)
-    ma_names = ("ema_9", "ema_21", "ema_50", "sma_20", "sma_50", "sma_100", "sma_200", "wma_20", "wma_50")
+    ma_names = ("ema_9", "ema_21", "sma_20", "sma_50", "wma_20", "wma_50")
     def ma_calc(frame: pd.DataFrame) -> dict[str, pd.Series]:
         close = frame["close"]
         return {
-            "ema_9": ema(close, 9), "ema_21": ema(close, 21), "ema_50": ema(close, 50),
-            "sma_20": sma(close, 20), "sma_50": sma(close, 50), "sma_100": sma(close, 100), "sma_200": sma(close, 200),
+            "ema_9": ema(close, 9), "ema_21": ema(close, 21),
+            "sma_20": sma(close, 20), "sma_50": sma(close, 50),
             "wma_20": wma(close, 20), "wma_50": wma(close, 50),
         }
     ma = _segment_calculation(records, bounds, ma_names, ma_calc, 1)
-    warmups = {"ema_9": 9, "ema_21": 21, "ema_50": 50, "sma_20": 20, "sma_50": 50, "sma_100": 100, "sma_200": 200, "wma_20": 20, "wma_50": 50}
+    warmups = {"ema_9": 9, "ema_21": 21, "sma_20": 20, "sma_50": 50, "wma_20": 20, "wma_50": 50}
     for start, end in bounds:
         for name, period in warmups.items():
             for index in range(start, min(end, start + period - 1)):
                 ma[name][index] = None
     moving = _wrapper(timestamps=timestamps, series=ma, units={name: "USD" for name in ma_names}, source=source,
-        parameters={"ema_periods": [9, 21, 50], "sma_periods": [20, 50, 100, 200], "wma_periods": [20, 50]}, warmup=200,
+        parameters={"ema_periods": [9, 21], "sma_periods": [20, 50], "wma_periods": [20, 50]}, warmup=50,
         calculation="ema_sma_wma_on_open_interest_close", source_status=source_status, bounds=bounds, gaps=gaps)
 
     regression_values = _regression_channel_series(records, bounds, window=100, deviation_multiplier=2.0)
@@ -405,7 +406,9 @@ def _event(*, timeframe: str, event_type: str, pair: str, source_metric: str, cr
     return {"event_id": event_id, "event_type": event_type, "timestamp": cross["timestamp"], "timeframe": timeframe,
         "source_metric": source_metric, "first_series": first_series, "second_series": second_series, "threshold": threshold,
         "direction_numeric": cross["direction"], "previous_difference": _finite(cross["previous_difference"]),
-        "current_difference": _finite(cross["current_difference"]), "values": _json_safe(dict(values)), "parameters": copy.deepcopy(dict(parameters))}
+        "current_difference": _finite(cross["current_difference"]), "interpolation_fraction": _finite(cross.get("interpolation_fraction")),
+        "event_timestamp_exact": _finite(cross.get("event_timestamp_exact")), "event_value_exact": _finite(cross.get("event_value_exact")),
+        "values": _json_safe(dict(values)), "parameters": copy.deepcopy(dict(parameters))}
 
 
 def _events_for_timeframe(timeframe: str, oi_frame: Mapping[str, Any], funding_frame: Mapping[str, Any], indicators: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -413,12 +416,7 @@ def _events_for_timeframe(timeframe: str, oi_frame: Mapping[str, Any], funding_f
     bounds = [(item["segment_start_index"], item["segment_end_index"] + 1) for item in oi_frame["coverage"]["segments"]]
     timestamps = [row["timestamp"] for row in oi_frame["records"]]
     timestamp_indices = {timestamp: index for index, timestamp in enumerate(timestamps)}
-    ma_pairs = [
-        ("ema_9", "ema_21"), ("ema_9", "ema_50"), ("ema_21", "ema_50"),
-        ("sma_20", "sma_50"), ("sma_20", "sma_100"), ("sma_20", "sma_200"),
-        ("sma_50", "sma_100"), ("sma_50", "sma_200"), ("sma_100", "sma_200"),
-        ("wma_20", "wma_50"),
-    ]
+    ma_pairs = [("ema_9", "ema_21"), ("sma_20", "sma_50"), ("wma_20", "wma_50")]
     specifications = [
         *(("moving_average_cross", f"{first}_x_{second}", indicators["moving_averages"], first, second, None) for first, second in ma_pairs),
         ("channel_cross", "regression_middle_x_bollinger_middle", indicators["regression_channel"], "middle", "middle", None),
@@ -451,8 +449,20 @@ def _events_for_timeframe(timeframe: str, oi_frame: Mapping[str, Any], funding_f
                 event_second = "bollinger_middle" if event_type == "channel_cross" else second
                 if event_type == "channel_cross":
                     values = {"regression_middle": first_values[index], "bollinger_middle": second_values[index]}
+                if index > 0:
+                    exact = interpolated_cross(
+                        previous_timestamp=timestamps[index - 1], timestamp=timestamps[index],
+                        previous_first=first_values[index - 1], previous_second=second_values[index - 1],
+                        first=first_values[index], second=second_values[index],
+                    )
+                    cross = {**cross, **exact}
+                    values.update({key: value for key, value in exact.items() if key.endswith("value") or key in {"interpolation_fraction", "previous_difference", "current_difference"}})
                 item = _event(timeframe=timeframe, event_type=event_type, pair=pair, source_metric="open_interest_ohlc", cross=cross,
                     first_series=event_first, second_series=event_second, threshold=threshold, values=values, parameters=package["parameters"])
+                if cross.get("event_timestamp_exact") is not None:
+                    item["event_timestamp_exact"] = cross.get("event_timestamp_exact")
+                    item["event_value_exact"] = cross.get("event_value_exact")
+                    item["event_price"] = cross.get("event_value_exact")
                 output[item["event_id"]] = item
     funding_timestamps = [row["timestamp"] for row in funding_frame["records"]]
     funding_timestamp_indices = {timestamp: index for index, timestamp in enumerate(funding_timestamps)}
@@ -629,13 +639,76 @@ def _quality(series: Mapping[str, Any], indicators: Mapping[str, Any], snapshots
         "gaps_present": gaps_present, "warnings": snapshot_warnings + [f"optional_confirmation_invalid:{item}" for item in optional_invalid], "errors": []}
 
 
+
+def _native_oi_analysis(series: Mapping[str, Any], indicators: Mapping[str, Any], *, price_history_by_timeframe: Mapping[str, Sequence[Mapping[str, Any]]] | None = None) -> dict[str, Any]:
+    price_history = price_history_by_timeframe or {}
+    output: dict[str, Any] = {}
+    for timeframe in TIMEFRAMES:
+        oi_frame = series["open_interest_ohlc"]["timeframes"][timeframe]
+        funding_frame = series["funding_rate_ohlc"]["timeframes"][timeframe]
+        records = oi_frame.get("records", [])
+        timestamps = [int(row["timestamp"]) for row in records]
+        closes = [row.get("close") for row in records]
+        changes = native_pct_change(closes, 1, 100.0)
+        oi_roc = indicators["open_interest"]["timeframes"][timeframe].get("oi_roc", {}).get("series", {}).get("roc", [])
+        slope = rolling_zscore(changes, 20, 10)
+        acceleration = native_difference(slope)
+        oi_z = rolling_zscore(closes, 30, 10)
+        oi_pct = rolling_percentile(closes, 90, 20)
+
+        price_records = price_history.get(timeframe, [])
+        price_by_ts = {int(row["timestamp"]): row.get("close") for row in price_records if isinstance(row, Mapping) and row.get("timestamp") is not None}
+        price_closes = [price_by_ts.get(ts) for ts in timestamps]
+        price_returns = native_pct_change(price_closes, 1, 100.0)
+        price_z = rolling_zscore(price_returns, 30, 10)
+        oi_change_z = rolling_zscore(changes, 30, 10)
+        divergence = [None if a is None or b is None else float(a) - float(b) for a, b in zip(price_z, oi_change_z, strict=True)]
+        regime_score: list[float | None] = []
+        regime_state: list[str | None] = []
+        for pr, oc in zip(price_returns, changes, strict=True):
+            if pr is None or oc is None:
+                regime_score.append(None); regime_state.append(None); continue
+            if pr > 0 and oc > 0:
+                regime_score.append(1.0); regime_state.append("bullish_expansion")
+            elif pr < 0 and oc > 0:
+                regime_score.append(-1.0); regime_state.append("bearish_expansion")
+            elif pr > 0 and oc < 0:
+                regime_score.append(0.5); regime_state.append("short_covering")
+            elif pr < 0 and oc < 0:
+                regime_score.append(-0.5); regime_state.append("deleveraging")
+            else:
+                regime_score.append(0.0); regime_state.append("normal")
+
+        funding_by_ts = {int(row["timestamp"]): row.get("close") for row in funding_frame.get("records", [])}
+        funding_values = [funding_by_ts.get(ts) for ts in timestamps]
+        funding_z = rolling_zscore(funding_values, 30, 10)
+        crowding = [None if a is None or b is None else float(a) * 0.6 + float(b) * 0.4 for a, b in zip(oi_z, funding_z, strict=True)]
+        wasserstein = indicators["open_interest"]["timeframes"][timeframe].get("wasserstein_distance", {}).get("series", {}).get("distance", [])
+
+        output[timeframe] = {
+            "oi_dynamics": {"timestamps": timestamps, "series": {"oi_roc": list(oi_roc), "oi_slope_pct": slope, "oi_acceleration_pct": acceleration},
+                            "current": {"oi_dynamics": latest(oi_roc), "oi_slope_pct": latest(slope), "oi_acceleration_pct": latest(acceleration)}},
+            "oi_zscore_percentile": {"timestamps": timestamps, "series": {"oi_zscore": oi_z, "oi_percentile": oi_pct},
+                                     "current": {"oi_zscore_percentile": latest(oi_z), "oi_percentile": latest(oi_pct)}},
+            "price_oi_regime": {"timestamps": timestamps, "series": {"regime_score": regime_score},
+                                "current": {"price_oi_regime": latest(regime_score), "regime_state": next((v for v in reversed(regime_state) if v), None)}},
+            "price_oi_divergence": {"timestamps": timestamps, "series": {"price_return_z": price_z, "oi_change_z": oi_change_z, "divergence_score": divergence},
+                                    "current": {"price_oi_divergence": latest(divergence), "price_return_z": latest(price_z), "oi_change_z": latest(oi_change_z)}},
+            "funding_oi_crowding": {"timestamps": timestamps, "series": {"oi_zscore": oi_z, "funding_zscore": funding_z, "crowding_score": crowding},
+                                    "current": {"funding_oi_crowding": latest(crowding), "funding_zscore": latest(funding_z), "oi_zscore": latest(oi_z), "funding_rate": latest(funding_values)}},
+            "wasserstein_distance": {"timestamps": timestamps, "series": {"wasserstein_distance": list(wasserstein)},
+                                     "current": {"wasserstein_distance": latest(wasserstein)}},
+        }
+    return output
+
+
 class OpenInterestAndFundingProcessor:
     """Validate Input and deterministically calculate Processing v0.1."""
 
     def __init__(self, feature_builder: OpenInterestAndFundingFeatureBuilder | None = None) -> None:
         self.feature_builder = feature_builder or OpenInterestAndFundingFeatureBuilder()
 
-    def process(self, input_contract: Mapping[str, Any]) -> dict[str, Any]:
+    def process(self, input_contract: Mapping[str, Any], *, price_history_by_timeframe: Mapping[str, Sequence[Mapping[str, Any]]] | None = None) -> dict[str, Any]:
         source = _input_contract(input_contract)
         context, series, indicator_frames = copy.deepcopy(dict(source["context"])), {}, {}
         reference_timestamp = context["reference_timestamp"]
@@ -662,12 +735,14 @@ class OpenInterestAndFundingProcessor:
         confirmations = _confirmations(source.get("confirmations"))
         availability = _availability(series, indicators, snapshot_metrics, confirmations)
         quality = _quality(series, indicators, snapshots, confirmations, availability)
+        native_analysis = _native_oi_analysis(series, indicators, price_history_by_timeframe=price_history_by_timeframe)
         sections = {"mode": source.get("mode"), "context": context, "series": series, "indicators": indicators, "events": events,
-            "snapshots": snapshots, "confirmations": confirmations, "availability": availability, "quality": quality}
+            "snapshots": snapshots, "confirmations": confirmations, "availability": availability, "quality": quality,
+            "native_analysis": native_analysis}
         output = _json_safe(self.feature_builder.build(sections))
         json.dumps(output, ensure_ascii=False, allow_nan=False, sort_keys=False)
         return output
 
 
-def process_open_interest_and_funding(input_contract: Mapping[str, Any]) -> dict[str, Any]:
-    return OpenInterestAndFundingProcessor().process(input_contract)
+def process_open_interest_and_funding(input_contract: Mapping[str, Any], *, price_history_by_timeframe: Mapping[str, Sequence[Mapping[str, Any]]] | None = None) -> dict[str, Any]:
+    return OpenInterestAndFundingProcessor().process(input_contract, price_history_by_timeframe=price_history_by_timeframe)

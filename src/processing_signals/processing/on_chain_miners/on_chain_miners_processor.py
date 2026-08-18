@@ -5,6 +5,8 @@ import math
 from collections.abc import Mapping, Sequence
 from typing          import Any
 
+from processing_signals.processing.math.native_analysis import (rolling_zscore, rolling_mean, pct_change as native_pct_change, difference, rolling_wasserstein, latest, score_to_probability)
+
 from .on_chain_miners_feature_builder import build_on_chain_miners_features
 from .on_chain_miners_technical_analysis import build_on_chain_technical_analysis
 
@@ -279,6 +281,75 @@ def evaluate_on_chain_miners_processing_quality(*, series: Mapping[str, Any], fe
             "warnings": warnings, "errors": errors}
 
 
+
+def _records_map(metric: Mapping[str, Any]) -> dict[int, float | None]:
+    return {int(row["timestamp"]): row.get("value") for row in metric.get("records", []) if isinstance(row, Mapping) and row.get("timestamp") is not None}
+
+
+def _native_miner_analysis(series_map: Mapping[str, Any]) -> dict[str, Any]:
+    reserve_records = series_map.get("miner_reserve_btc", {}).get("records", [])
+    timestamps = [int(row["timestamp"]) for row in reserve_records]
+    def aligned_metric(name: str) -> list[float | None]:
+        lookup = _records_map(series_map.get(name, {}))
+        return [lookup.get(ts) for ts in timestamps]
+
+    reserve = aligned_metric("miner_reserve_btc")
+    mpi = aligned_metric("mpi")
+    outflow = aligned_metric("miner_outflow_total_btc")
+    revenue = aligned_metric("miner_revenue_total_usd")
+    hashrate = aligned_metric("hashrate_eh_s")
+    difficulty = aligned_metric("difficulty_t")
+    sopr = aligned_metric("sopr")
+
+    reserve_change = difference(reserve)
+    reserve_change_z = rolling_zscore(reserve_change, 30, 10)
+    reserve_roc_30 = native_pct_change(reserve, 30, 100.0)
+
+    mpi_z = rolling_zscore(mpi, 30, 10)
+    mte_z = rolling_zscore(outflow, 30, 10)
+    # Final MSP formula. Weights are explicit Processing configuration defaults.
+    weights = {"w1_mpi": 0.40, "w2_mte": 0.35, "w3_reserve_change": 0.25}
+    selling_pressure: list[float | None] = []
+    for zm, zte, zr in zip(mpi_z, mte_z, reserve_change_z, strict=True):
+        if zm is None and zte is None and zr is None:
+            selling_pressure.append(None)
+        else:
+            selling_pressure.append(weights["w1_mpi"] * float(zm or 0.0) + weights["w2_mte"] * float(zte or 0.0) - weights["w3_reserve_change"] * float(zr or 0.0))
+
+    revenue_ma365 = rolling_mean(revenue, 365, 180)
+    puell: list[float | None] = []
+    for value, avg in zip(revenue, revenue_ma365, strict=True):
+        puell.append(None if value is None or avg in (None, 0) else float(value) / float(avg))
+    revenue_stress = [-v if v is not None else None for v in rolling_zscore(revenue, 90, 30)]
+
+    hash_ma30 = rolling_mean(hashrate, 30, 15)
+    hash_ma60 = rolling_mean(hashrate, 60, 30)
+    hash_momentum = native_pct_change(hashrate, 30, 100.0)
+    hash_change_z = rolling_zscore(native_pct_change(hashrate, 1, 100.0), 30, 10)
+    diff_change_z = rolling_zscore(native_pct_change(difficulty, 1, 100.0), 30, 10)
+    network_stress = [None if h is None and d is None else float(-(h or 0.0) + (d or 0.0)) / 2.0 for h,d in zip(hash_change_z,diff_change_z,strict=True)]
+
+    sopr_stress = [None if v is None else max(-3.0, min(3.0, (1.0 - float(v)) * 10.0)) for v in sopr]
+    regime_score: list[float | None] = []
+    for sp, ns, ss, rz in zip(selling_pressure, network_stress, sopr_stress, reserve_change_z, strict=True):
+        vals = [v for v in (sp, ns, ss, None if rz is None else -float(rz)) if v is not None]
+        regime_score.append(None if not vals else float(sum(vals) / len(vals)))
+    wasserstein = rolling_wasserstein(regime_score, 20, 60)
+    capitulation = [score_to_probability(v, 1.0) for v in regime_score]
+    recovery = [None if p is None else 100.0 - float(p) for p in capitulation]
+
+    analyses = {
+        "miner_reserve_change_zscore": {"reserve_change_btc":reserve_change,"reserve_change_zscore":reserve_change_z,"reserve_roc_30d_pct":reserve_roc_30},
+        "miner_selling_pressure": {"mpi":mpi,"miner_to_exchange_zscore":mte_z,"selling_pressure_score":selling_pressure},
+        "puell_revenue_stress": {"puell_multiple":puell,"revenue_stress_score":revenue_stress},
+        "hashrate_momentum_hash_ribbon": {"hashrate_eh_s":hashrate,"hash_ma_30":hash_ma30,"hash_ma_60":hash_ma60,"hash_momentum_pct":hash_momentum},
+        "hashrate_difficulty_stress": {"hashrate_change_zscore":hash_change_z,"difficulty_change_zscore":diff_change_z,"network_stress_score":network_stress},
+        "miner_capitulation_recovery_regime": {"regime_score":regime_score,"capitulation_probability_pct":capitulation,"recovery_score_pct":recovery,"wasserstein_distance":wasserstein},
+    }
+    return {"analysis_id":"native_miner_analysis_vr1", "status":"available", "timestamps":timestamps,
+            "weights":{"miner_selling_pressure":weights}, "indicators":analyses, "recalculate_in_hmi":False}
+
+
 class OnChainMinersProcessor:
     def __init__(self, input_contract: Mapping[str, Any]) -> None:
         self.input_contract = input_contract
@@ -316,8 +387,9 @@ class OnChainMinersProcessor:
                                                                     input_series=self.input_contract.get("series", {}),
                                                                     input_collections=self.input_contract.get("collections", {}),
                                                                     include_screen_extensions=include_screen_extensions)
+        miner_analysis = _native_miner_analysis(series) if not errors else {"analysis_id":"native_miner_analysis_vr1","status":"invalid","timestamps":[],"indicators":{},"recalculate_in_hmi":False}
         output = {"family": ON_CHAIN_MINERS_FAMILY, "stage": "processing", "mode": mode, "context": output_context,
-                  "series": series, "features": features, "technical_analysis": technical_analysis, "quality": quality}
+                  "series": series, "features": features, "technical_analysis": technical_analysis, "miner_analysis": miner_analysis, "quality": quality}
         output, unsafe = _json_safe_copy(output)
         if unsafe:
             output["quality"].update({"status": "invalid", "data_as_of": None})

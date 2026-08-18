@@ -1,6 +1,5 @@
 """Processing contract assembly for ETF and exchange flows."""
 from __future__ import annotations
-
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -201,8 +200,77 @@ def _provenance(payload: Mapping[str, Any], input_contract: Mapping[str, Any], e
             "negative_observations_by_feature": negative_by_feature}}
 
 
+
+def _native_capital_flow_analysis(payload: Mapping[str, Any], *, price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    flows = list(payload.get("series", {}).get("etf_flow_daily", []))
+    timestamps = [int(row["timestamp"]) for row in flows]
+    flow_values = [row.get("flow_usd") for row in flows]
+    flow_z = rolling_zscore(flow_values, 30, 10)
+    flow_momentum_z = rolling_zscore(difference(flow_values), 20, 8)
+    signs = [None if value is None else (1.0 if float(value) > 0 else (-1.0 if float(value) < 0 else 0.0)) for value in flow_values]
+    persistence = rolling_mean(signs, 10, 5)
+
+    prices = price_history_daily or []
+    price_by_ts = {int(row["timestamp"]): row.get("close") for row in prices if isinstance(row, Mapping) and row.get("timestamp") is not None}
+    aligned_prices = [price_by_ts.get(ts) for ts in timestamps]
+    price_return_z = rolling_zscore(native_pct_change(aligned_prices, 1, 100.0), 30, 10)
+    divergence = [None if p is None or f is None else float(p) - float(f) for p, f in zip(price_return_z, flow_z, strict=True)]
+
+    def align_day(name: str, field: str) -> list[float | None]:
+        rows = payload.get("series", {}).get(name, {}).get("day", [])
+        lookup = {int(row["timestamp"]): row.get(field) for row in rows if isinstance(row, Mapping)}
+        return [lookup.get(ts) for ts in timestamps]
+
+    inflow = align_day("exchange_inflow", "inflow_total")
+    outflow = align_day("exchange_outflow", "outflow_total")
+    netflow = align_day("exchange_netflow", "netflow_total")
+    reserve = align_day("exchange_reserve", "reserve")
+    pressure: list[float | None] = []
+    for i, o in zip(inflow, outflow, strict=True):
+        if i is None or o is None or float(i) + float(o) == 0:
+            pressure.append(None)
+        else:
+            pressure.append((float(i) - float(o)) / (float(i) + float(o)))
+    netflow_z = rolling_zscore(netflow, 30, 10)
+    reserve_change = difference(reserve)
+    reserve_change_z = rolling_zscore(reserve_change, 30, 10)
+    reserve_roc = native_pct_change(reserve, 30, 100.0)
+    reserve_roc_z = rolling_zscore(reserve_roc, 30, 10)
+
+    capital_score: list[float | None] = []
+    for fz, nz, rz in zip(flow_z, netflow_z, reserve_change_z, strict=True):
+        vals = [v for v in (fz, nz, rz) if v is not None]
+        capital_score.append(None if not vals else float(( (fz or 0.0) - (nz or 0.0) - (rz or 0.0) ) / 3.0))
+    wasserstein = rolling_wasserstein(capital_score, 20, 60)
+
+    def package(indicator_id: str, series_map: Mapping[str, Sequence[Any]], *, section: str, label: str) -> dict[str, Any]:
+        current = {name: latest(values) for name, values in series_map.items()}
+        primary = next((v for v in current.values() if v is not None), None)
+        signal = "neutral" if primary is None or abs(float(primary)) < 0.25 else ("positive" if float(primary) > 0 else "negative")
+        return {"status": "available" if primary is not None else "partial", "data_mode": "runtime_processing",
+                "processing_contract_target": True, "real_market_calculation": True, "hmi_recalculate": False,
+                "unit": "score", "timestamps": timestamps, "series": {k:list(v) for k,v in series_map.items()},
+                "thresholds": [{"value":0.0,"role":"neutral"}],
+                "summary": {"section": section, "label": label, "display_value": None if primary is None else f"{primary:.3f}",
+                            "signal": signal, "signal_color": signal, "strength": 0.0 if primary is None else min(1.0,abs(float(primary))/2.0)},
+                "provenance": {"owner":"ETF Processing", "indicator_id":indicator_id}}
+
+    indicators = {
+        "etf_flow_momentum_persistence": package("etf_flow_momentum_persistence", {"flow_momentum_z":flow_momentum_z,"rolling_flow_z":flow_z,"persistence_score":persistence}, section="institutional", label="ETF FLOW MOMENTUM / PERSISTENCE"),
+        "etf_flow_zscore": package("etf_flow_zscore", {"zscore":flow_z}, section="institutional", label="ETF FLOW Z-SCORE"),
+        "btc_etf_flow_divergence": package("btc_etf_flow_divergence", {"btc_return_z":price_return_z,"etf_flow_z":flow_z,"divergence_score":divergence}, section="confirmation", label="BTC ↔ ETF FLOW DIVERGENCE"),
+        "exchange_flow_pressure": package("exchange_flow_pressure", {"pressure":pressure,"netflow_z":netflow_z}, section="exchange", label="EXCHANGE FLOW PRESSURE"),
+        "exchange_reserve_change": package("exchange_reserve_change", {"reserve_change_z":reserve_change_z,"reserve_roc_z":reserve_roc_z}, section="exchange", label="EXCHANGE RESERVE CHANGE"),
+        "capital_regime_wasserstein": package("capital_regime_wasserstein", {"capital_regime_score":capital_score,"wasserstein_distance":wasserstein}, section="regime", label="CAPITAL REGIME / WASSERSTEIN"),
+    }
+    return {"analysis_id":"capital_flow_analysis", "contract_family":"native_capital_flow", "status":"available",
+            "recalculate_in_hmi":False, "source_resolution":"1d", "indicators":indicators,
+            "supporting_series":{"timestamps":timestamps, "etf_flow_usd":flow_values, "exchange_netflow":netflow, "exchange_reserve":reserve}}
+
+
 def process_etf_exchange_flows(*, input_contract: Mapping[str, Any], generated_at: Any = None,
-                               exchange_scope: str | None = None) -> dict[str, Any]:
+                               exchange_scope: str | None = None,
+                               price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
     validate_etf_exchange_flows_input(input_contract)
     source = deepcopy(dict(input_contract))
     generated_timestamp = _timestamp(generated_at if generated_at is not None else source.get("generated_at"))
@@ -215,6 +283,7 @@ def process_etf_exchange_flows(*, input_contract: Mapping[str, Any], generated_a
         "is_demo": source.get("is_demo"), "generated_at": _iso(generated_timestamp), "data_as_of": quality["data_as_of"],
         "features": deepcopy(payload["features"]), "series": deepcopy(payload["series"]),
         "technical_analysis": deepcopy(payload.get("technical_analysis", {})),
+        "capital_flow_analysis": _native_capital_flow_analysis(payload, price_history_daily=price_history_daily),
         "series_metadata": deepcopy(payload.get("series_metadata", {})), "snapshots": deepcopy(payload["snapshots"]),
         "provenance": _provenance(payload, source, exchange_scope), "quality": quality}
     json.dumps(output, ensure_ascii=False, allow_nan=False, sort_keys=False)
@@ -222,10 +291,13 @@ def process_etf_exchange_flows(*, input_contract: Mapping[str, Any], generated_a
 
 
 def run_etf_exchange_flows_processing(*, input_contract: Mapping[str, Any], generated_at: Any = None,
-                                      exchange_scope: str | None = None) -> dict[str, Any]:
-    return process_etf_exchange_flows(input_contract=input_contract, generated_at=generated_at, exchange_scope=exchange_scope)
+                                      exchange_scope: str | None = None,
+                                      price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    return process_etf_exchange_flows(input_contract=input_contract, generated_at=generated_at, exchange_scope=exchange_scope, price_history_daily=price_history_daily)
 
 
 class EtfExchangeFlowsProcessor:
-    def process(self, *, input_contract: Mapping[str, Any], generated_at: Any = None, exchange_scope: str | None = None) -> dict[str, Any]:
-        return process_etf_exchange_flows(input_contract=input_contract, generated_at=generated_at, exchange_scope=exchange_scope)
+    def process(self, *, input_contract: Mapping[str, Any], generated_at: Any = None, exchange_scope: str | None = None,
+                price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+        return process_etf_exchange_flows(input_contract=input_contract, generated_at=generated_at, exchange_scope=exchange_scope, price_history_daily=price_history_daily)
+from processing_signals.processing.math.native_analysis import rolling_zscore, rolling_wasserstein, difference, pct_change as native_pct_change, rolling_mean, latest

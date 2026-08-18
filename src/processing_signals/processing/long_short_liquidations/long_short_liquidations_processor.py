@@ -7,6 +7,8 @@ import json
 import math
 from typing import Any
 
+from processing_signals.processing.math.native_analysis import rolling_zscore, rolling_percentile, difference, rolling_wasserstein, pct_change as native_pct_change, latest
+
 from .long_short_liquidations_feature_builder import (
     EVENT_INTENSITY_MIN_COMPLETE_BINS, EVENT_WINDOWS_SECONDS, MAP_BUCKET_WIDTH_BPS,
     MAP_CENTRAL_TOLERANCE_BPS, MAP_INTERPOLATION_ENABLED, MAP_PROXIMITY_DECAY_BPS,
@@ -375,7 +377,62 @@ def _invalid_output(reference_timestamp: int, config: Mapping[str, Any] | None, 
                         "partial_features": [], "unavailable_features": [], "warnings": [], "errors": errors}}
 
 
+
+def _native_liquidation_analysis(
+    realized_series: Sequence[Mapping[str, Any]], *,
+    price_history: Sequence[Mapping[str, Any]] | None = None,
+    positioning_history: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    rows = list(realized_series)
+    timestamps = [int(row["timestamp"]) for row in rows]
+    long_values = [row.get("long_liquidation_usd") for row in rows]
+    short_values = [row.get("short_liquidation_usd") for row in rows]
+    totals = [row.get("total_liquidation_usd") for row in rows]
+    total_musd = [None if v is None else float(v) / 1_000_000.0 for v in totals]
+    intensity_z = rolling_zscore(totals, 48, 24)
+    intensity_pct = rolling_percentile(totals, 168, 24)
+    imbalance: list[float | None] = []
+    for lv, sv in zip(long_values, short_values, strict=True):
+        if lv is None or sv is None or float(lv) + float(sv) == 0:
+            imbalance.append(None)
+        else:
+            imbalance.append((float(lv) - float(sv)) / (float(lv) + float(sv)))
+    cascade = difference(totals)
+    cascade_z = rolling_zscore(cascade, 48, 24)
+
+    price_lookup = {int(row["timestamp"]): row.get("close") for row in (price_history or []) if isinstance(row, Mapping) and row.get("timestamp") is not None}
+    price_values = [price_lookup.get(ts) for ts in timestamps]
+    price_return_pct = native_pct_change(price_values, 1, 100.0)
+    price_z = rolling_zscore(price_return_pct, 48, 24)
+    price_regime = [None if p is None or i is None or z is None else float(p) * 0.35 - float(i) * abs(float(z)) for p,i,z in zip(price_z,imbalance,intensity_z,strict=True)]
+
+    pos_lookup = {int(row["timestamp"]): row.get("long_short_ratio") for row in (positioning_history or []) if isinstance(row, Mapping) and row.get("timestamp") is not None}
+    top_position = [pos_lookup.get(ts) for ts in timestamps]
+    crowding_raw = [None if value is None or float(value) <= 0 else math.log(float(value)) for value in top_position]
+    crowding_score = rolling_zscore(crowding_raw, 48, 24)
+    pressure_score = [None if z is None or imb is None else float(z) * float(imb) for z,imb in zip(intensity_z,imbalance,strict=True)]
+    combined = [None if c is None and p is None else float((c or 0.0) + (p or 0.0)) / 2.0 for c,p in zip(crowding_score,pressure_score,strict=True)]
+    regime_score = [None if z is None or imb is None or cas is None else float(z) * 0.45 + float(imb) * 0.35 + float(cas) * 0.20 for z,imb,cas in zip(intensity_z,imbalance,cascade_z,strict=True)]
+    wasserstein = rolling_wasserstein(totals, 24, 168)
+
+    return {
+        "status":"available" if rows else "unavailable", "timestamps":timestamps,
+        "positioning": {"top_position_ratio":top_position, "top_account_ratio":[None]*len(timestamps), "global_account_ratio":[None]*len(timestamps)},
+        "indicators": {
+            "liquidation_intensity_zscore": {"intensity_zscore":intensity_z,"intensity_percentile":intensity_pct,"total_liquidations_musd":total_musd},
+            "long_short_liquidation_imbalance": {"liquidation_imbalance":imbalance,"long_liquidations_musd":[None if v is None else float(v)/1e6 for v in long_values],"short_liquidations_musd":[None if v is None else float(v)/1e6 for v in short_values]},
+            "cascade_acceleration": {"cascade_acceleration":cascade,"cascade_zscore":cascade_z,"total_liquidations_musd":total_musd},
+            "price_liquidation_regime": {"price_return_pct":price_return_pct,"price_liquidation_regime_score":price_regime},
+            "crowding_liquidation_pressure": {"top_position_ratio":top_position,"crowding_score":crowding_score,"liquidation_pressure_score":pressure_score,"crowding_liquidation_score":combined},
+            "liquidation_regime_hmi": {"liquidation_regime_score":regime_score,"wasserstein_distance":wasserstein},
+        },
+        "current": {"top_position_ratio":latest(top_position),"liquidation_regime_score":latest(regime_score),"wasserstein_distance":latest(wasserstein)},
+        "recalculate_in_hmi":False,
+    }
+
+
 def process_long_short_liquidations(input_contract: Mapping[str, Any], *, reference_price_context: Mapping[str, Any] | None = None,
+                                    price_history: Sequence[Mapping[str, Any]] | None = None, positioning_history: Sequence[Mapping[str, Any]] | None = None,
                                     config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     _json_safe(config, "config")
     validate_long_short_liquidations_input(input_contract)
@@ -536,6 +593,7 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
         "events": {"aggregate": aggregate_events, "by_exchange": by_exchange_events, "provenance": event_provenance},
         "maps": {"reference_price": reference_payload, "aggregated": aggregated_map, "by_exchange": by_exchange_maps,
                  "aligned_exchanges": aligned, "max_pain": _max_pain(cg["max_pain"], price)}, "pressure": pressure,
+        "liquidation_analysis": _native_liquidation_analysis(realized_series, price_history=price_history, positioning_history=positioning_history),
         "quality": {"status": quality_status, "required_features": PROCESSING_REQUIRED_FEATURES,
                     "optional_features": PROCESSING_OPTIONAL_FEATURES, "missing_features": missing, "invalid_features": invalid,
                     "partial_features": partial, "unavailable_features": unavailable, "warnings": warnings, "errors": []}}
@@ -546,8 +604,9 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
 
 class LongShortLiquidationsProcessor:
     def __init__(self, input_contract: Mapping[str, Any], *, reference_price_context: Mapping[str, Any] | None = None,
+                 price_history: Sequence[Mapping[str, Any]] | None = None, positioning_history: Sequence[Mapping[str, Any]] | None = None,
                  config: Mapping[str, Any] | None = None) -> None:
-        self.input_contract, self.reference_price_context, self.config = input_contract, reference_price_context, config
+        self.input_contract, self.reference_price_context, self.price_history, self.positioning_history, self.config = input_contract, reference_price_context, price_history, positioning_history, config
 
     def run(self) -> dict[str, Any]:
-        return process_long_short_liquidations(self.input_contract, reference_price_context=self.reference_price_context, config=self.config)
+        return process_long_short_liquidations(self.input_contract, reference_price_context=self.reference_price_context, price_history=self.price_history, positioning_history=self.positioning_history, config=self.config)
