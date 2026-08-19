@@ -121,7 +121,9 @@ def build_input_arguments(
             "fetcher": router.for_family("etf_exchange_flows"),
             "requested_mode": requested_mode,
             "existing_contract": previous.get("etf_exchange_flows"),
-            "include_secondary": True,
+            # Confirmations are worth paying during cold bootstrap, not on every
+            # one-minute runtime cycle.  ETF Input has its own hourly/daily TTLs.
+            "include_secondary": requested_mode == "bootstrap",
             "data_mode": data_mode,
             "is_demo": is_demo,
             "exchange_scope": "all_exchange",
@@ -136,8 +138,12 @@ def build_input_arguments(
             "execution_timestamp": refs["liquidity_microstructure"] + (5 if synthetic else 0),
             "data_mode": data_mode,
             "is_demo": is_demo,
-            "history_limit": 100,
-            "hourly_history_limit": 20_000 if requested_mode == "bootstrap" else 100,
+            # Liquidity uses native 1m for the live screen and a 1h bootstrap
+            # seed for the 730-hour analytical window.  5m/15m and depth 1%/5%
+            # are derived/obsolete for the final VR1 contract and are not paid.
+            "history_limit": 240,
+            "hourly_history_limit": 1000,
+            "footprint_limit": 240,
         },
         "long_short_liquidations": {
             "fetcher": router.for_family("long_short_liquidations"),
@@ -146,7 +152,8 @@ def build_input_arguments(
             "reference_timestamp": refs["long_short_liquidations"],
             "clock": lambda ref=refs["long_short_liquidations"]: ref + (5 if synthetic else 0),
             "exchange_pairs": pairs,
-            "history_hours": 72,
+            "history_hours": 730,
+            "include_confirmations": requested_mode == "bootstrap",
         },
         "on_chain_miners": {
             "fetcher": router.for_family("on_chain_miners"),
@@ -360,6 +367,9 @@ def run_all(
     if "etf_exchange_flows" in remaining and isinstance(prices_input, Mapping):
         daily = prices_input.get("markets", {}).get("spot", {}).get("timeframes", {}).get("1d", {})
         processing_arguments["etf_exchange_flows"] = {"price_history_daily": daily.get("records", []) if isinstance(daily, Mapping) else []}
+    if "volatility_market_regimes" in remaining and isinstance(prices_input, Mapping):
+        daily = prices_input.get("markets", {}).get("spot", {}).get("timeframes", {}).get("1d", {})
+        processing_arguments["volatility_market_regimes"] = {"price_history_daily": daily.get("records", []) if isinstance(daily, Mapping) else []}
     if "long_short_liquidations" in remaining:
         prices_context = processing.get("prices_ohlcv") or (existing_processing or {}).get("prices_ohlcv")
         if not isinstance(prices_context, Mapping):
@@ -370,14 +380,6 @@ def run_all(
             block = prices_input.get("markets", {}).get("spot", {}).get("timeframes", {}).get("1h", {})
             if isinstance(block, Mapping):
                 price_history = block.get("records", [])
-        vol_input = inputs.get("volatility_market_regimes") or (existing_inputs or {}).get("volatility_market_regimes")
-        positioning_history = []
-        if isinstance(vol_input, Mapping):
-            positioning_history = (
-                vol_input.get("providers", {}).get("coinglass", {}).get("top_position_ratio", {}).get("records", [])
-                or vol_input.get("top_position_ratio", {}).get("records", [])
-                or []
-            )
         processing_arguments["long_short_liquidations"] = {
             "reference_price_context": build_liquidations_reference_price_context(
                 prices_context,
@@ -385,13 +387,18 @@ def run_all(
                 synthetic_replay_alignment=synthetic,
             ),
             "price_history": price_history,
-            "positioning_history": positioning_history,
         }
     if "liquidity_microstructure" in remaining:
         prices_input = inputs.get("prices_ohlcv") or (existing_inputs or {}).get("prices_ohlcv")
         if not isinstance(prices_input, Mapping):
             raise ValueError("liquidity_microstructure requires normalized prices_ohlcv Input context")
-        processing_arguments["liquidity_microstructure"] = {"prices_input_context": prices_input}
+        cvd_processing = processing.get("cvd_volume_orderflow") or (existing_processing or {}).get("cvd_volume_orderflow")
+        processing_arguments["liquidity_microstructure"] = {
+            "prices_input_context": prices_input,
+            # Deep executed-flow history is already computed by CVD.  Liquidity
+            # consumes it instead of paying a second 730-hour footprint history.
+            "cvd_processing_context": cvd_processing if isinstance(cvd_processing, Mapping) else None,
+        }
     if remaining:
         remaining_now = max(SYNTHETIC_REFERENCE_TIMESTAMPS.values()) + 5 if synthetic else now_timestamp
         processing.update(run_processing_pipeline(
@@ -424,7 +431,7 @@ def run_all(
         "input": inputs,
         "processing": processing,
         "classification": classification,
-        "hmi_contract": contracts,
+        "hmi": contracts,
     }
     _strict_json(result)
     return result
@@ -452,7 +459,7 @@ def export_all_runtime_json(
         "input": root / "input",
         "processing": root / "processing",
         "classification": root / "classification",
-        "hmi_contract": root / "hmi_contract",
+        "hmi": root / "hmi",
     }
     for directory in stage_dirs.values():
         directory.mkdir(parents=True, exist_ok=True)
@@ -465,19 +472,19 @@ def export_all_runtime_json(
             _atomic_write_json(path, runtime_output[stage][family])
             written[stage][family] = str(path.relative_to(root))
         screen_name = SCREEN_FILENAMES[family]
-        screen_path = stage_dirs["hmi_contract"] / screen_name
-        _atomic_write_json(screen_path, runtime_output["hmi_contract"][family])
-        written["hmi_contract"][family] = str(screen_path.relative_to(root))
+        screen_path = stage_dirs["hmi"] / screen_name
+        _atomic_write_json(screen_path, runtime_output["hmi"][family])
+        written["hmi"][family] = str(screen_path.relative_to(root))
     for family in reused_families:
-        if family in written["hmi_contract"]:
+        if family in written["hmi"]:
             continue
         for stage in ("input", "processing", "classification"):
             path = stage_dirs[stage] / f"{family}.json"
             if path.is_file():
                 written[stage][family] = str(path.relative_to(root))
-        path = stage_dirs["hmi_contract"] / SCREEN_FILENAMES[family]
+        path = stage_dirs["hmi"] / SCREEN_FILENAMES[family]
         if path.is_file():
-            written["hmi_contract"][family] = str(path.relative_to(root))
+            written["hmi"][family] = str(path.relative_to(root))
 
     manifest = {
         "schema": {"id": "trad_elatin.runtime.run_manifest.v1", "version": "1.0.0"},
@@ -497,7 +504,7 @@ def export_all_runtime_json(
                 ),
                 "processing": runtime_output["processing"][family].get("quality", {}).get("status"),
                 "classification": runtime_output["classification"][family].get("quality", {}).get("status"),
-                "hmi_contract": _contract_quality(runtime_output["hmi_contract"][family]),
+                "hmi": _contract_quality(runtime_output["hmi"][family]),
             }
             for family in FAMILY_ORDER if family in runtime_output.get("input", {})
         },
@@ -550,17 +557,23 @@ def run_and_export_all(
                 if not processing_path.is_file():
                     raise RuntimeError(f"warm start Processing state is incomplete: {processing_path}")
                 previous_processing[family] = json.loads(processing_path.read_text(encoding="utf-8"))
-        references = Path(golden_root) if golden_root is not None else _repo_root() / "runtime" / "contracts" / "hmi"
+        references = Path(golden_root) if golden_root is not None else None
         overlay = EmulatorOverlay(runtime_overlay_root) if source == "emulator" else None
         pending_before = manager.pending_dirty_windows()
         changed = overlay is not None and manager.overlay_changed(overlay.version)
-        if not manager.cold_start and not changed and not pending_before:
-            output = {stage: {} for stage in ("input", "processing", "classification", "hmi_contract")}
+        missing_hmi = [
+            family for family in FAMILY_ORDER
+            if not (root / "hmi" / SCREEN_FILENAMES[family]).is_file()
+        ]
+        # SQLite state alone is not enough for a warm NOOP: publication state
+        # must also be complete. Missing HMI artifacts force regeneration.
+        if not manager.cold_start and not changed and not pending_before and not missing_hmi:
+            output = {stage: {} for stage in ("input", "processing", "classification", "hmi")}
             for family in FAMILY_ORDER:
                 for stage in ("input", "processing", "classification"):
                     output[stage][family] = json.loads((root / stage / f"{family}.json").read_text(encoding="utf-8"))
-                output["hmi_contract"][family] = json.loads((root / "hmi_contract" / SCREEN_FILENAMES[family]).read_text(encoding="utf-8"))
-            validation = validate_contracts_against_golden(output["hmi_contract"], golden_root=references)
+                output["hmi"][family] = json.loads((root / "hmi" / SCREEN_FILENAMES[family]).read_text(encoding="utf-8"))
+            validation = validate_contracts_against_golden(output["hmi"], golden_root=references)
             acquisition = manager.summary()
             previous_manifest_path = root / "run_manifest.json"
             previous_quality = (json.loads(previous_manifest_path.read_text(encoding="utf-8")).get("quality", {})
@@ -595,10 +608,10 @@ def run_and_export_all(
         pending = manager.pending_dirty_windows()
         windows = plan_dirty_windows(pending, reference_timestamp=int(effective_reference or max(SYNTHETIC_REFERENCE_TIMESTAMPS.values())))
         plan = recompute_plan(windows)
-        combined = dict(output["hmi_contract"])
+        combined = dict(output["hmi"])
         reused = tuple(family for family in FAMILY_ORDER if family not in affected)
         for family in reused:
-            combined[family] = json.loads((root / "hmi_contract" / SCREEN_FILENAMES[family]).read_text(encoding="utf-8"))
+            combined[family] = json.loads((root / "hmi" / SCREEN_FILENAMES[family]).read_text(encoding="utf-8"))
         validation = validate_contracts_against_golden(combined, golden_root=references)
         if validation["status"] != "passed":
             raise RuntimeError(f"VR1 contract validation failed: {validation}")

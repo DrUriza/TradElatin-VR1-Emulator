@@ -27,7 +27,7 @@ def arguments(**extra):
 
 
 def test_etf_export_default_path_is_canonical():
-    assert DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH.as_posix() == "runtime/contracts/hmi_contract/etf_exchange_flows_screen.json"
+    assert DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH.as_posix() == "runtime/contracts/hmi/etf_exchange_flows_screen.json"
 
 
 def test_etf_vertical_remains_in_memory_by_default(tmp_path, monkeypatch):
@@ -56,7 +56,7 @@ def test_etf_export_writes_only_screen_and_does_not_mutate_vertical(tmp_path):
         vertical_output=output, output_path=tmp_path / "screen.json")
     assert json.loads(destination.read_text(encoding="utf-8")) == output["screen"]
     assert output == before
-    assert not ({"input", "processing", "classification"} & set(json.loads(destination.read_text())))
+    assert not ({"input", "processing", "classification"} & set(json.loads(destination.read_text(encoding="utf-8"))))
 
 
 @pytest.mark.parametrize("field", ("schema", "screen", "stage", "version", "quality"))

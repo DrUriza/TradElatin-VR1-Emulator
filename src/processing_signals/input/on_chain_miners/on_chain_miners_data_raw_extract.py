@@ -15,9 +15,9 @@ COINGLASS_PROVIDER       = "coinglass"
 VALID_MODES              = {"bootstrap", "incremental", "recovery"}
 CORE_METRIC_IDS          = ("miner_reserve", "sopr", "hashrate", "difficulty", "miner_net_position_change", "mpi")
 SCREEN_EXTENSION_METRIC_IDS = ("miner_entities", "miner_outflow_by_pool", "miner_outflow_total", "miners_unspent_supply", "utxo_age_distribution",
-                               "miner_revenue_total_usd", "miner_block_reward_revenue_usd", "miner_revenue_from_fees", "nupl")
+                               "miner_revenue_total_usd", "miner_revenue_from_fees", "nupl")
 TIME_SERIES_EXTENSION_IDS   = ("miner_outflow_total", "miners_unspent_supply", "utxo_age_distribution", "miner_revenue_total_usd",
-                               "miner_block_reward_revenue_usd", "miner_revenue_from_fees", "nupl")
+                               "miner_revenue_from_fees", "nupl")
 COLLECTION_EXTENSION_IDS    = ("miner_entities", "miner_outflow_by_pool")
 UTXO_AGE_BANDS = ("0d_1d", "1d_1w", "1w_1m", "1m_3m", "3m_6m", "6m_12m", "12m_18m", "18m_2y", "2y_3y", "3y_5y", "5y_7y", "7y_10y", "10y_inf")
 DEFAULT_INCLUDE_SCREEN_EXTENSIONS = True
@@ -61,8 +61,6 @@ ENDPOINTS = {
                               "raw_shape": "cryptoquant_status_result_data", "required": True},
     "miner_revenue_total_usd": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "revenue_sum", "path": "/v1/metrics/mining/revenue_sum",
                                 "source_field": "v", "raw_shape": "glassnode_list_t_v_scalar", "required": True},
-    "miner_block_reward_revenue_usd": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "volume_mined_sum", "path": "/v1/metrics/mining/volume_mined_sum",
-                                       "source_field": "v", "raw_shape": "glassnode_list_t_v_scalar", "required": True},
     "miner_revenue_from_fees": {"provider": GLASSNODE_PROVIDER, "endpoint_id": "revenue_from_fees", "path": "/v1/metrics/mining/revenue_from_fees",
                                 "source_field": "v", "raw_shape": "glassnode_list_t_v_scalar", "required": True},
     "nupl": {"provider": COINGLASS_PROVIDER, "endpoint_id": "bitcoin_nupl", "path": "/api/index/bitcoin-net-unrealized-profit-loss", "source_field": "net_unpnl",
@@ -168,16 +166,31 @@ def _build_request(metric_id: str, start: int, end: int, limit: int, asset: str 
         params = build_glassnode_daily_params(asset=asset, from_timestamp=start, to_timestamp=end,
                                               native_currency=metric_id in {"miner_reserve", "miners_unspent_supply"},
                                               interval=str(endpoint.get("interval", "24h")))
-        if metric_id in {"miner_revenue_total_usd", "miner_block_reward_revenue_usd"}:
+        if metric_id == "miner_revenue_total_usd":
             params["c"] = "USD"
     else:
         params = {}
     return {"metric_id": metric_id, "provider": endpoint["provider"], "endpoint_id": endpoint["endpoint_id"], "path": endpoint["path"],
             "from_timestamp": start, "to_timestamp": end, "limit": limit, "params": params, "required": endpoint["required"]}
 
+def _source_bucket(timestamp: int, endpoint: Mapping[str, Any]) -> int:
+    interval = str(endpoint.get("interval", "24h"))
+    seconds = 3_600 if interval == "1h" else SECONDS_PER_DAY
+    return timestamp - timestamp % seconds
+
+
+def _metric_due(*, metric_id: str, reference_timestamp: int, existing_contract: Mapping[str, Any]) -> bool:
+    endpoint = ENDPOINTS[metric_id]
+    last = _existing_pool_last_timestamp(existing_contract) if metric_id == "miner_outflow_by_pool" else _last_existing_timestamp(existing_contract, metric_id)
+    if last is None:
+        return True
+    return int(last) < _source_bucket(reference_timestamp, endpoint)
+
+
 def build_on_chain_miners_fetch_plan(*, mode: str, reference_timestamp: int, existing_contract: Mapping[str, Any] | None = None,
                                      recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_enrichment: bool = False,
-                                     include_screen_extensions: bool = DEFAULT_INCLUDE_SCREEN_EXTENSIONS) -> list[dict[str, Any]]:
+                                     include_screen_extensions: bool = DEFAULT_INCLUDE_SCREEN_EXTENSIONS,
+                                     refresh_catalog: bool = False) -> list[dict[str, Any]]:
     if mode not in VALID_MODES:
         raise ValueError(f"Unsupported on_chain_miners input mode: {mode}")
     reference_day = _utc_day(reference_timestamp)
@@ -219,7 +232,18 @@ def build_on_chain_miners_fetch_plan(*, mode: str, reference_timestamp: int, exi
             requests.append(request)
         return requests
 
+    persisted_symbols = _persisted_active_miner_symbols(existing_contract) if mode == "incremental" else []
     for metric_id in metric_ids:
+        # The miner entity catalog is effectively static. Reuse the persisted validated
+        # symbols during normal incremental cycles and refresh it only explicitly.
+        if mode == "incremental" and metric_id == "miner_entities" and persisted_symbols and not refresh_catalog:
+            continue
+        # Provider cadence gate: do not pay repeatedly for a source bucket that is
+        # already persisted. Hourly Glassnode primitives refresh once per hour; all
+        # daily metrics and drilldowns refresh once per UTC day.
+        if mode == "incremental" and metric_id != "miner_entities" and not _metric_due(
+                metric_id=metric_id, reference_timestamp=reference_timestamp, existing_contract=existing_contract):
+            continue
         last = (_existing_pool_last_timestamp(existing_contract) if metric_id == "miner_outflow_by_pool" else _last_existing_timestamp(existing_contract, metric_id)) if mode == "incremental" else None
         if last is None:
             extra_warmup_days = 6 if metric_id == "sopr" else 0
@@ -321,12 +345,13 @@ class OnChainMinersRawExtractor:
     def run(self, *, mode: str, reference_timestamp: int, existing_contract: Mapping[str, Any] | None = None,
             recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_enrichment: bool = False,
             include_screen_extensions: bool = DEFAULT_INCLUDE_SCREEN_EXTENSIONS,
+            refresh_catalog: bool = False,
             execution_timestamp: int | None = None) -> dict[str, Any]:
         reference_timestamp = _valid_timestamp(reference_timestamp, "reference_timestamp")
         execution_timestamp = _valid_timestamp(int(time.time()) if execution_timestamp is None else execution_timestamp, "execution_timestamp")
         plan = self.build_fetch_plan(mode=mode, reference_timestamp=reference_timestamp, existing_contract=existing_contract,
                                      recovery_requests=recovery_requests, include_enrichment=include_enrichment,
-                                     include_screen_extensions=include_screen_extensions)
+                                     include_screen_extensions=include_screen_extensions, refresh_catalog=refresh_catalog)
         raw: dict[str, Any] = {}
         entity_payload = None
         for request in plan:
@@ -349,8 +374,10 @@ def extract_on_chain_miners_raw(*, fetcher: OnChainMinersFetcher, mode: str, ref
                                 existing_contract: Mapping[str, Any] | None = None, recovery_requests: Sequence[Mapping[str, Any]] | None = None,
                                 data_mode: str = "live", is_demo: bool = False, include_enrichment: bool = False,
                                 include_screen_extensions: bool = DEFAULT_INCLUDE_SCREEN_EXTENSIONS,
+                                refresh_catalog: bool = False,
                                 execution_timestamp: int | None = None) -> dict[str, Any]:
     extractor = OnChainMinersRawExtractor(fetcher=fetcher, asset=asset, data_mode=data_mode, is_demo=is_demo)
     return extractor.run(mode=mode, reference_timestamp=reference_timestamp, existing_contract=existing_contract,
                          recovery_requests=recovery_requests, include_enrichment=include_enrichment,
-                         include_screen_extensions=include_screen_extensions, execution_timestamp=execution_timestamp)
+                         include_screen_extensions=include_screen_extensions, refresh_catalog=refresh_catalog,
+                         execution_timestamp=execution_timestamp)

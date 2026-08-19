@@ -11,11 +11,11 @@ import json
 import math
 from typing import Any
 
-from .liquidity_microstructure_sp_v1_2_adapter import align_liquidity_microstructure_to_sp_v1_2
+from .liquidity_microstructure_sp_v1_4_adapter import align_liquidity_microstructure_to_sp_v1_4
 
 FAMILY = SCREEN_ID = "liquidity_microstructure"
 SCREEN_SCHEMA = "trad_elatin.liquidity_microstructure.screen.v1"
-SCREEN_VERSION = "1.2.0"
+SCREEN_VERSION = "1.4.0"
 SCREEN_ROUTE = "/liquidity"
 SCREEN_TITLE = "LIQUIDITY MICROSTRUCTURE"
 SCREEN_SUBTITLE = "Order-book depth, whale orders, large trades & liquidity context"
@@ -28,9 +28,9 @@ DISPLAY_DEPTH_BASIS = "base_quantity"
 REFERENCE_DEPTH_RANGE_PERCENT = 10
 DISPLAY_POINT_LIMIT = 220
 ORDERBOOK_TABLE_LIMIT = 50
-LARGE_TRADE_TABLE_LIMIT = 120
+LARGE_TRADE_TABLE_LIMIT = 20
 KPI_IDS = ("bid_depth", "ask_depth", "spread", "liquidity_imbalance", "mid_price", "impact_1_btc")
-CHART_IDS = ("order_depth", "whale_liquidity_profile", "executed_liquidity_profile", "large_trades_flow", "whale_activity", "market_history")
+CHART_IDS = ("order_depth", "whale_liquidity_profile", "executed_liquidity_profile", "executed_operations", "whale_activity", "market_history")
 TABLE_IDS = ("orderbook_snapshot", "whale_orders", "large_trades")
 WIDGET_IDS = ("observed_liquidity", "large_trade_pressure", "whale_activity_state", "market_context", "spot_perpetual_comparison", "source_status")
 DRILLDOWN_IDS = ("orderbook_details", "market_impact_details", "large_trades_details", "whale_activity_details", "market_history_details", "cross_market_details")
@@ -230,8 +230,6 @@ def build_liquidity_microstructure_screen_contract(bundle: Mapping[str, Any], *,
     tables["orderbook_snapshot"]["columns"].extend(["side", "band"])
     tables["orderbook_snapshot"]["metadata"]["provenance"] = {"provider": "coinglass", "source_path": ob_path}
     trades = p["markets"][selected_market]["large_trades"]; c_trades = c["markets"][selected_market]["large_trades"]
-    windows = [{"window": window, **deepcopy(row), "status": trades["status"], "reason": trades.get("reason")} for window, row in trades.get("windows", {}).items()]
-    charts["large_trades_flow"] = _component("large_trades_flow", "LARGE TRADES", trades["status"], [f"{market_path}.large_trades.windows"], chart_id="large_trades_flow", chart_type="overlapping_window_flow", selector_behavior="selected_market_and_timeframe", data_as_of=trades.get("coverage", {}).get("observed_last_timestamp"), series=["buy_volume_usd", "sell_volume_usd", "net_flow_usd"], items=windows, metadata={"window_semantics": "overlapping_lookback_windows", "selected_window": selected_timeframe, **deepcopy(trades.get("coverage", {}))})
     events = sorted((deepcopy(row) for row in trades.get("large_trade_events", []) if row.get("meets_configured_threshold") is True), key=lambda row: row["timestamp"], reverse=True)
     tables["large_trades"] = _component("large_trades", "LARGE TRADES — RECENT EVENTS", trades["status"], [f"{market_path}.large_trades.large_trade_events"], table_id="large_trades", columns=list(events[0]) if events else [], rows=events[:large_trade_table_limit], bids=[], asks=[], summary={}, metadata={"events_available": len(events), "events_returned": min(len(events), large_trade_table_limit), "events_truncated": len(events) > large_trade_table_limit, **deepcopy(trades.get("coverage", {}))})
     profiles = p["features"]["profiles"][selected_market][selected_timeframe]
@@ -314,7 +312,7 @@ def build_liquidity_microstructure_screen_contract(bundle: Mapping[str, Any], *,
                       "records_available": len(history.get("records", [])), "fabricated_records": 0}, "hmi_recalculation": False},
               "availability": availability,
               "quality": {"status": quality_status, "contract_complete": True, "data_complete": not partial and not unavailable, "processing_status": p["quality"]["status"], "classification_status": c["quality"]["status"], "availability": deepcopy(availability["summary"]), "missing_required_components": unavailable, "partial_components": partial, "unavailable_components": unavailable, "invalid_components": invalid, "warnings": [], "errors": [], "data_as_of": data_as_of}}
-    output = align_liquidity_microstructure_to_sp_v1_2(output, p, c, runtime)
+    output = align_liquidity_microstructure_to_sp_v1_4(output, p, c, runtime)
     _validate_json(output); json.dumps(output, ensure_ascii=False, allow_nan=False)
     return output
 

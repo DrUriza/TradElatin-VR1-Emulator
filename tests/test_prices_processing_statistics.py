@@ -30,7 +30,7 @@ def _records(count=120, step=60):
 
 def _markets():
     seconds = (60, 300, 900, 3600, 14400, 86400)
-    return {market: {"timeframes": {tf: {"records": _records(step=step)} for tf, step in zip(TIMEFRAME_ORDER, seconds, strict=True)}} for market in ("general", "spot", "futures")}
+    return {market: {"timeframes": {tf: {"records": _records(step=step)} for tf, step in zip(TIMEFRAME_ORDER, seconds, strict=True)}} for market in ("spot", "spot", "futures")}
 
 
 def test_returns_descriptive_and_zscore_are_mathematically_consistent():
@@ -75,7 +75,7 @@ def test_sharpe_uses_timeframe_annualization():
 
 def test_all_markets_and_timeframes_have_serializable_statistical_packages():
     result = calculate_all_prices_statistics(markets=_markets())
-    assert set(result) == {"spot", "futures", "general"}
+    assert set(result) == {"spot", "futures", "spot"}
     for market in result.values():
         assert tuple(market) == TIMEFRAME_ORDER
         for package in market.values():
@@ -87,7 +87,7 @@ def test_all_markets_and_timeframes_have_serializable_statistical_packages():
 
 def test_bias_components_are_numeric_neutral_and_tsi_reports_real_parameters():
     records    = _records()
-    package    = calculate_prices_indicator_package(records=records, market_type="general", timeframe="1h")
+    package    = calculate_prices_indicator_package(records=records, market_type="spot", timeframe="1h")
     components = build_indicator_bias_components(indicator_package=package, close=records[-1]["close"])
     assert package["tsi"]["parameters"] == {"slow_period": 25, "fast_period": 13}
     assert all(value is None or isinstance(value, float) for value in components["values"].values())

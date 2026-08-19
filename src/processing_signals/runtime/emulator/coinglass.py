@@ -65,6 +65,22 @@ def fetch(store: FixtureStore, family: str, *, endpoint_id: str, path: str,
         raise ValueError(f"unsupported CoinGlass liquidity endpoint: {endpoint_id}")
 
     if family == "long_short_liquidations":
+        if endpoint_id in {"top_position_long_short_ratio", "top_account_long_short_ratio", "global_account_long_short_ratio"}:
+            folder = {
+                "top_position_long_short_ratio": "top_position_long_short_ratio",
+                "top_account_long_short_ratio": "top_account_long_short_ratio",
+                "global_account_long_short_ratio": "global_account_long_short_ratio",
+            }[endpoint_id]
+            by_time: dict[int, dict[str, Any]] = {}
+            for file in store.glob("coinglass", family, f"{folder}/1h/page_*_raw.json"):
+                payload = store.load("coinglass", family, *file.relative_to(root).parts)
+                for row in payload.get("data", []):
+                    by_time[int(row["time"])] = row
+            rows = [by_time[key] for key in sorted(by_time)]
+            rows = filter_scalar_records(rows, start=params.get("start_time"), end=params.get("end_time"),
+                                         time_key="time", time_is_ms=True,
+                                         limit=int(params.get("limit", len(rows))), newest=False)
+            return {"code": "0", "msg": "success", "data": rows}
         if endpoint_id == "supported_exchange_pairs":
             return store.load("coinglass", family, "supported_exchange_pairs", "raw.json")
         if endpoint_id == "aggregated_liquidation_history":
@@ -103,20 +119,6 @@ def fetch(store: FixtureStore, family: str, *, endpoint_id: str, path: str,
         if endpoint_id in {"open_interest_exchange_list", "funding_rate_exchange_list", "options_info"}:
             return store.load("coinglass", family, endpoint_id, "raw.json")
         raise ValueError(f"unsupported CoinGlass open-interest endpoint: {endpoint_id}")
-
-    if family == "volatility_market_regimes":
-        if endpoint_id != "top_position_long_short_ratio":
-            raise ValueError(f"unsupported CoinGlass volatility endpoint: {endpoint_id}")
-        by_time: dict[int, dict[str, Any]] = {}
-        for file in store.glob("coinglass", family, "top_position_long_short_ratio/1h/page_*_raw.json"):
-            payload = store.load("coinglass", family, *file.relative_to(root).parts)
-            for row in payload.get("data", []):
-                by_time[int(row["time"])] = row
-        rows = [by_time[key] for key in sorted(by_time)]
-        rows = filter_scalar_records(rows, start=params.get("start_time"), end=params.get("end_time"),
-                                     time_key="time", time_is_ms=True,
-                                     limit=int(params.get("limit", len(rows))), newest=False)
-        return {"code": "0", "msg": "success", "data": rows}
 
     if family == "cvd_volume_orderflow":
         if endpoint_id in {"spot_aggregated_cvd", "futures_aggregated_cvd"}:

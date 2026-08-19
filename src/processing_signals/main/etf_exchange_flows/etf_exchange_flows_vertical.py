@@ -13,7 +13,7 @@ from processing_signals.input.input_pipeline import run_input_pipeline
 from processing_signals.main.screen_contract_export import export_etf_exchange_flows_screen_json
 from processing_signals.processing.processing_pipeline import run_processing_pipeline
 
-DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH = Path("runtime/contracts/hmi_contract/etf_exchange_flows_screen.json")
+DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH = Path("runtime/contracts/hmi/etf_exchange_flows_screen.json")
 
 
 def run_etf_exchange_flows_vertical(

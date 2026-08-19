@@ -51,7 +51,7 @@ TIMEFRAME_SECONDS = {
 }
 
 TIMEFRAME_ORDER = tuple(TIMEFRAME_SECONDS)
-CALCULATION_MARKETS = ("spot", "futures", "general")
+CALCULATION_MARKETS = ("spot", "futures")
 
 RESAMPLING_RULES = {
     "5m": {"source_timeframe": "1m", "expected_source_records": 5},
@@ -420,7 +420,9 @@ def calculate_prices_indicator_package(
 
     sr = support_resistance_levels(high.tolist(), low.tolist(), close.tolist(), lookback=cfg["support_resistance_lookback"], levels=3)
     package["support_resistance"] = {
-        "indicator_id": "support_resistance", "parameters": {"lookback": cfg["support_resistance_lookback"], "levels": 3},
+        "indicator_id": "support_resistance",
+        "parameters": {"lookback": cfg["support_resistance_lookback"], "levels": 3,
+                       "mode": sr.get("method", "swing_clusters"), "fallback_used": bool(sr.get("fallback_used", False))},
         "current": {"support": sr["support"], "resistance": sr["resistance"]},
         "source": _source_metadata(market_type, timeframe),
         "quality": {"status": "ok" if sr["support"] or sr["resistance"] else "insufficient_data"},
@@ -859,12 +861,6 @@ def update_prices_timeframes(
         )
         for market_name in ("spot", "futures")
     }
-    # Prices-only HMI rule: the contractual ``general`` market is the
-    # canonical Spot price.  Futures remains available internally for basis
-    # and confirmation, but it never contributes numerically to ``general``.
-    output["general"] = deepcopy(output["spot"])
-    output["general"]["market_type"] = "general"
-    output["general"]["canonical_source_market"] = "spot"
     return output
 
 
@@ -917,7 +913,7 @@ def apply_cvd_volume_sides(markets: dict[str, Any], cvd_processing_context: Mapp
     for timeframe in TIMEFRAME_ORDER:
         cvd_records = spot.get("timeframes", {}).get(timeframe, {}).get("records", [])
         lookup = {int(row["timestamp"]): row for row in cvd_records if isinstance(row, Mapping) and row.get("timestamp") is not None}
-        for market_name in ("spot", "general"):
+        for market_name in ("spot",):
             records = markets.get(market_name, {}).get("timeframes", {}).get(timeframe, {}).get("records", [])
             for row in records:
                 source = lookup.get(int(row.get("timestamp", -1)))

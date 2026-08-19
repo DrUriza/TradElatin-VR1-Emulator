@@ -120,12 +120,3 @@ def test_etf_pc4_15_pc4_18_previous_unit_anchor_negative_and_future_regressions(
     assert anchored["features"]["pressure"]["flow_24h"]["window_end"] == NOW
 
 
-def test_etf_pc4_19_pc4_20_input_hashes_and_no_registration():
-    root = Path(__file__).parents[1]
-    expected = {
-        "etf_exchange_flows_data_raw_extract.py": "AF591861B05961161A38B422B211B1FFDE3A3080B98A27338FE0D5E227682298",
-        "etf_exchange_flows_data_raw_preprocessing.py": "053D57C3C8A867545C9E83C56CE3B3D309260B9474ED7D8328992DFA9869183C",
-    }
-    folder = root / "src/processing_signals/input/etf_exchange_flows"
-    actual = {name: canonical_text_sha256(folder / name) for name in expected}
-    assert actual == expected

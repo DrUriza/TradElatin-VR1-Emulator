@@ -28,7 +28,6 @@ PROCESSING_RECALCULATION_POLICY = "full_available_history"
 _MODES = {"bootstrap", "incremental", "recovery"}
 _STATUSES = {"available", "partial", "unavailable", "invalid"}
 _SOURCES = (
-    ("coinglass.top_position_ratio", "coinglass", "top_position_ratio"),
     ("glassnode.realized_volatility", "glassnode", "realized_volatility"),
     ("glassnode.dvol", "glassnode", "dvol"),
 )
@@ -70,7 +69,6 @@ def validate_volatility_market_regimes_input(contract: Any) -> None:
     if not isinstance(contract.get("dimensions"), Mapping) or not isinstance(contract.get("providers"), Mapping):
         raise ValueError("input_structure_invalid")
     fields = {
-        "coinglass.top_position_ratio": ("long_percent", "short_percent", "long_short_ratio"),
         "glassnode.realized_volatility": ("value_percent",),
         "glassnode.dvol": ("open", "high", "low", "close"),
     }
@@ -108,28 +106,6 @@ def _history(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "first_available_timestamp": records[0]["timestamp"] if records else None,
         "last_available_timestamp": records[-1]["timestamp"] if records else None,
         "source_data_as_of": records[-1]["timestamp"] if records else None,
-    }
-
-
-def build_positioning_series(source: Mapping[str, Any]) -> dict[str, Any]:
-    records = []
-    for raw in source["records"]:
-        long_percent = _number(raw["long_percent"], "long_percent")
-        short_percent = _number(raw["short_percent"], "short_percent")
-        records.append({
-            "timestamp": _timestamp(raw["timestamp"], "timestamp"),
-            "long_percent": long_percent,
-            "short_percent": short_percent,
-            "long_short_ratio": _number(raw["long_short_ratio"], "long_short_ratio"),
-            "net_long_percentage_points": long_percent - short_percent,
-        })
-    status = "unavailable" if not records else ("available" if source["status"] == "available" else "partial")
-    reason = source.get("reason") if status != "available" else None
-    return {
-        "status": status, "reason": reason, "interval": "1h", "interval_seconds": BASE_INTERVAL_SECONDS,
-        "unit": "ratio", "records": records, "current": deepcopy(records[-1]) if records else None,
-        **_history(records),
-        "source": {"provider": "coinglass", "endpoint_id": "top_position_long_short_ratio", "exchange": "Binance", "symbol": "BTCUSDT"},
     }
 
 
@@ -198,7 +174,19 @@ def build_volatility_spread_series(realized: Mapping[str, Any], dvol: Mapping[st
 
 
 def build_realized_volatility_technical_analysis(realized: Mapping[str, Any]) -> dict[str, Any]:
-    """Precompute TA from complete UTC-day OHLC bars of realized volatility."""
+    """Compatibility entry point; generic volatility TA is retired by policy."""
+    return {
+        "status": "unavailable",
+        "reason": "retired_by_volatility_native_analytics_policy",
+        "candles": [],
+        "indicators": {},
+        "regression_channel": {},
+        "cross_candidates": [],
+        "recalculate_in_hmi": False,
+    }
+
+    # Historical implementation retained below only as audit context; it is
+    # unreachable and is not part of the runtime processing path.
     days: dict[int, list[tuple[int, float]]] = {}
     for row in realized.get("records", []):
         timestamp = int(row["timestamp"])
@@ -297,47 +285,23 @@ def _daily_last(records: Sequence[Mapping[str, Any]]) -> dict[int, list[Mapping[
     return grouped
 
 
-def build_daily_regime_basis(positioning: Mapping[str, Any], realized: Mapping[str, Any],
-                             dvol: Mapping[str, Any], spread: Mapping[str, Any]) -> dict[str, Any]:
-    pos_days = _daily_last(positioning.get("records", []))
+def build_daily_regime_basis(realized: Mapping[str, Any], dvol: Mapping[str, Any], spread: Mapping[str, Any]) -> dict[str, Any]:
     rv_days = _daily_last(realized.get("records", []))
     dvol_days = _daily_last(dvol.get("records", []))
     spread_days = _daily_last(spread.get("records", []))
     records: list[dict[str, Any]] = []
-    for day in sorted(set(pos_days) | set(rv_days)):
-        pos_rows = pos_days.get(day, [])
-        rv_rows = rv_days.get(day, [])
-        dvol_rows = dvol_days.get(day, [])
-        spread_rows = spread_days.get(day, [])
-        pos = pos_rows[-1] if pos_rows else None
-        rv = rv_rows[-1] if rv_rows else None
-        dv = dvol_rows[-1] if dvol_rows else None
-        spr = spread_rows[-1] if spread_rows else None
-        asofs = [row["timestamp"] for row in (pos, rv, dv, spr) if row]
-        if rv and pos:
-            status, reason = "available", None
-        elif rv:
-            status, reason = "partial", "positioning_context_unavailable"
-        elif pos:
-            status, reason = "partial", "realized_volatility_unavailable"
-        else:
-            status, reason = "unavailable", "no_daily_data"
+    for day in sorted(set(rv_days) | set(dvol_days)):
+        rv_rows = rv_days.get(day, []); dvol_rows = dvol_days.get(day, []); spread_rows = spread_days.get(day, [])
+        rv = rv_rows[-1] if rv_rows else None; dv = dvol_rows[-1] if dvol_rows else None; spr = spread_rows[-1] if spread_rows else None
+        asofs = [row["timestamp"] for row in (rv, dv, spr) if row]
+        status, reason = (("available", None) if rv else ("partial", "realized_volatility_unavailable") if dv else ("unavailable", "no_daily_data"))
         records.append({
-            "timestamp": day,
-            "data_as_of": max(asofs) if asofs else None,
+            "timestamp": day, "data_as_of": max(asofs) if asofs else None,
             "realized_data_as_of": rv["timestamp"] if rv else None,
-            "positioning_data_as_of": pos["timestamp"] if pos else None,
             "realized_volatility_percent": rv["realized_volatility_percent"] if rv else None,
-            "dvol": dv["close"] if dv else None,
-            "spread_7d": spr["spread_7d"] if spr else None,
-            "long_percent": pos["long_percent"] if pos else None,
-            "short_percent": pos["short_percent"] if pos else None,
-            "long_short_ratio": pos["long_short_ratio"] if pos else None,
-            "net_long_percentage_points": pos["net_long_percentage_points"] if pos else None,
-            "coverage": {"realized_hourly_records": len(rv_rows), "dvol_hourly_records": len(dvol_rows),
-                         "positioning_hourly_records": len(pos_rows)},
-            "status": status,
-            "reason": reason,
+            "dvol": dv["close"] if dv else None, "spread_7d": spr["spread_7d"] if spr else None,
+            "coverage": {"realized_hourly_records": len(rv_rows), "dvol_hourly_records": len(dvol_rows)},
+            "status": status, "reason": reason,
         })
     values = [row["realized_volatility_percent"] for row in records]
     stats = rolling_mean_std(values, window=ZSCORE_WINDOW_DAYS, min_valid=ZSCORE_MIN_VALID_RECORDS, ddof=ZSCORE_DDOF)
@@ -345,26 +309,124 @@ def build_daily_regime_basis(positioning: Mapping[str, Any], realized: Mapping[s
     ranks = rolling_percentile_ranks(values, window=PERCENTILE_WINDOW_DAYS, min_valid=PERCENTILE_MIN_VALID_RECORDS)
     warnings: set[str] = set()
     for row, (mean, std), zscore, rank in zip(records, stats, zscores, ranks):
-        row["realized_rolling_mean_30d"] = mean
-        row["realized_rolling_std_30d"] = std
-        row["realized_z_score_30d"] = zscore
-        row["realized_percentile_rank_90d"] = rank
-        if std == 0:
-            warnings.add("zero_variance_window")
+        row["realized_rolling_mean_30d"] = mean; row["realized_rolling_std_30d"] = std
+        row["realized_z_score_30d"] = zscore; row["realized_percentile_rank_90d"] = rank
+        if std == 0: warnings.add("zero_variance_window")
     current = next((deepcopy(row) for row in reversed(records) if row["realized_percentile_rank_90d"] is not None), None)
-    if not records:
-        status, reason = "unavailable", "no_daily_data"
-    elif current is None:
-        status, reason = "partial", "classification_warmup_incomplete"
-    elif any(row["status"] != "available" for row in records):
-        status, reason = "partial", "daily_history_partial"
-    else:
-        status, reason = "available", None
-    return {
-        "status": status, "reason": reason, "aggregation": DAILY_AGGREGATION,
-        "records": records, "current": current, "warnings": sorted(warnings), **_history(records),
-    }
+    if not records: status, reason = "unavailable", "no_daily_data"
+    elif current is None: status, reason = "partial", "classification_warmup_incomplete"
+    elif any(row["status"] != "available" for row in records): status, reason = "partial", "daily_history_partial"
+    else: status, reason = "available", None
+    return {"status": status, "reason": reason, "aggregation": DAILY_AGGREGATION,
+            "records": records, "current": current, "warnings": sorted(warnings), **_history(records)}
 
+
+
+def build_volatility_native_analytics(realized: Mapping[str, Any], dvol: Mapping[str, Any], price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Precompute Screen-B native volatility analytics from normalized primitive series.
+
+    The current emulator has RV and DVOL primitives only. Options-surface fields are
+    deterministic demo proxies and are explicitly marked non-real-market until the
+    Glassnode options primitives are wired into Input. HMI never recalculates them.
+    """
+    def daily_last(records: Sequence[Mapping[str, Any]], field: str) -> dict[int, float]:
+        out: dict[int, float] = {}
+        for row in records:
+            ts = row.get("timestamp"); value = row.get(field)
+            if type(ts) is int and isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(float(value)):
+                out[int(ts) - int(ts) % DAY_SECONDS] = float(value)
+        return out
+    rv_provider = daily_last(realized.get("records", []), "realized_volatility_percent")
+    dv = daily_last(dvol.get("records", []), "close")
+    local_rv7: dict[int, float] = {}
+    local_rv30: dict[int, float] = {}
+    if price_history_daily:
+        rows=[]
+        for row in price_history_daily:
+            ts=row.get("timestamp") if isinstance(row, Mapping) else None
+            close=row.get("close") if isinstance(row, Mapping) else None
+            open_value=row.get("open") if isinstance(row, Mapping) else None
+            if type(ts) is int and isinstance(close, Real) and isinstance(open_value, Real) and not isinstance(close,bool) and not isinstance(open_value,bool) and float(close)>0 and float(open_value)>0:
+                rows.append((int(ts)-int(ts)%DAY_SECONDS,float(open_value),float(close)))
+        rows.sort()
+        daily_returns=[]
+        previous_close=None
+        for ts,open_value,close in rows:
+            base=previous_close if previous_close and previous_close>0 else open_value
+            daily_returns.append((ts, math.log(close/base)))
+            previous_close=close
+        for window_days,target in ((7,local_rv7),(30,local_rv30)):
+            for i,(ts,_) in enumerate(daily_returns):
+                sample=[r for _,r in daily_returns[max(0,i+1-window_days):i+1]]
+                if len(sample)==1:
+                    annualized=abs(sample[0])*math.sqrt(365)*100.0
+                else:
+                    mean=sum(sample)/len(sample)
+                    var=sum((r-mean)**2 for r in sample)/(len(sample)-1)
+                    annualized=math.sqrt(max(var,0.0))*math.sqrt(365)*100.0
+                target[ts]=annualized
+    rv7_map = dict(rv_provider)
+    rv7_map.update(local_rv7)
+    timestamps = sorted(set(rv7_map) & set(dv))[-730:]
+    rv7 = [rv7_map[t] for t in timestamps]
+    dvol_values = [dv[t] for t in timestamps]
+    def rolling(values: list[float], window: int) -> list[float]:
+        return [sum(values[max(0, i + 1 - window):i + 1]) / len(values[max(0, i + 1 - window):i + 1]) for i in range(len(values))]
+    def zscores(values: list[float], window: int = 30) -> list[float]:
+        result=[]
+        for i,value in enumerate(values):
+            sample=values[max(0,i+1-window):i+1]; mean=sum(sample)/len(sample)
+            variance=sum((x-mean)**2 for x in sample)/len(sample); sd=math.sqrt(variance)
+            result.append(0.0 if sd == 0 else (value-mean)/sd)
+        return result
+    def percentiles(values: list[float], window: int = 90) -> list[float]:
+        result=[]
+        for i,value in enumerate(values):
+            sample=values[max(0,i+1-window):i+1]
+            result.append(100.0 * sum(x <= value for x in sample) / len(sample))
+        return result
+    def wasserstein(values: list[float], window: int = 30) -> list[float]:
+        result=[]
+        for i in range(len(values)):
+            if i+1 < window*2:
+                result.append(0.0); continue
+            a=sorted(values[i+1-window*2:i+1-window]); b=sorted(values[i+1-window:i+1])
+            scale=max(abs(sum(a)/len(a)),1e-9)
+            result.append(sum(abs(x-y) for x,y in zip(a,b, strict=True))/len(a)/scale)
+        return result
+    fallback=rolling(rv7,30)
+    rv30=[local_rv30.get(t, fallback[i]) for i,t in enumerate(timestamps)] if local_rv30 else fallback
+    iv1m=dvol_values[:]
+    iv1w=[x*0.98 for x in dvol_values]; iv3m=[x*1.04 for x in dvol_values]; iv6m=[x*1.07 for x in dvol_values]
+    vrp=[i-r for i,r in zip(iv1m,rv30, strict=True)]
+    term_slope=[b-a for a,b in zip(iv1m,iv6m, strict=True)]
+    term_curvature=[c-2*b+a for a,b,c in zip(iv1w,iv1m,iv3m, strict=True)]
+    momentum=[0.0]+[dvol_values[i]-dvol_values[i-1] for i in range(1,len(dvol_values))]
+    upside=[dvol_values[i]+max(0.0,momentum[i])*0.35 for i in range(len(dvol_values))]
+    downside=[dvol_values[i]+max(0.0,-momentum[i])*0.35 for i in range(len(dvol_values))]
+    skew=[dn-up for dn,up in zip(downside,upside, strict=True)]
+    vol_of_vol=[0.0]+[abs(dvol_values[i]-dvol_values[i-1]) for i in range(1,len(dvol_values))]
+    acceleration=[0.0,0.0]+[(rv7[i]-rv7[i-1])-(rv7[i-1]-rv7[i-2]) for i in range(2,len(rv7))]
+    wd=wasserstein(rv7); transition=[min(100.0,100.0*x) for x in wd]
+    return {
+        "status": "available" if timestamps else "unavailable", "reason": None if timestamps else "native_volatility_history_unavailable",
+        "timestamps": timestamps, "records": len(timestamps), "hmi_recalculate": False,
+        "processing_contract_target": True, "real_market_calculation": False,
+        "charts": {
+            "realized_volatility": {"rv_7d": rv7, "rv_30d": rv30},
+            "implied_volatility": {"dvol": dvol_values, "iv_1m": iv1m},
+            "implied_vs_realized": {"iv_1m": iv1m, "rv_30d": rv30, "vrp": vrp},
+            "term_structure": {"iv_1w": iv1w, "iv_1m": iv1m, "iv_3m": iv3m, "iv_6m": iv6m},
+        },
+        "indicators": {
+            "volatility_zscore_percentile": {"rv_zscore": zscores(rv7), "rv_percentile": percentiles(rv7)},
+            "volatility_risk_premium": {"vrp": vrp, "vrp_zscore": zscores(vrp)},
+            "term_structure_slope": {"term_slope": term_slope, "term_curvature": term_curvature},
+            "volatility_skew_tail_risk": {"skew_25d": skew, "upside_iv": upside, "downside_iv": downside},
+            "vol_of_vol_acceleration": {"vol_of_vol": vol_of_vol, "rv_acceleration": acceleration},
+            "regime_shift_wasserstein": {"wasserstein_distance": wd, "transition_probability": transition},
+        },
+    }
 
 def _source_availability(sources: Mapping[str, Any]) -> dict[str, Any]:
     return {key: {"status": value["status"], "reason": value.get("reason"),
@@ -373,7 +435,7 @@ def _source_availability(sources: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def evaluate_volatility_market_regimes_processing_quality(features: Mapping[str, Any], sources: Mapping[str, Any], errors: Sequence[str] = ()) -> dict[str, Any]:
-    required = ("positioning", "realized_volatility", "dvol", "volatility_spread", "daily_regime_basis", "technical_analysis")
+    required = ("realized_volatility", "dvol", "volatility_spread", "daily_regime_basis", "volatility_native_analytics")
     statuses = {name: features[name]["status"] for name in required}
     source_bad = any(item["status"] != "available" for item in sources.values())
     if errors or "invalid" in statuses.values():
@@ -401,7 +463,7 @@ def _context(contract: Mapping[str, Any]) -> dict[str, Any]:
         "asset": dimensions.get("asset"), "symbol": dimensions.get("symbol"),
         "exchange": dimensions.get("exchange"), "base_interval": dimensions.get("interval"),
         "units": {"realized_volatility": "percent", "dvol": "volatility_index", "spread": "volatility_points",
-                  "positioning_ratio": "ratio", "positioning_percent": "percent", "percentile_rank": "decimal"},
+                  "percentile_rank": "decimal"},
         "parameters": {"zscore_window_days": ZSCORE_WINDOW_DAYS, "zscore_min_valid_records": ZSCORE_MIN_VALID_RECORDS,
                        "zscore_ddof": ZSCORE_DDOF, "percentile_window_days": PERCENTILE_WINDOW_DAYS,
                        "percentile_min_valid_records": PERCENTILE_MIN_VALID_RECORDS, "daily_aggregation": DAILY_AGGREGATION},
@@ -413,9 +475,8 @@ def _invalid_output(contract: Any, error: str) -> dict[str, Any]:
     safe = contract if isinstance(contract, Mapping) else {}
     source = {key: {"status": "invalid", "reason": "input_contract_invalid", "source_data_as_of": None} for key, _, _ in _SOURCES}
     features = {name: {"status": "invalid", "reason": "input_contract_invalid", "records": [], "current": None}
-                for name in ("positioning", "realized_volatility", "dvol", "volatility_spread", "daily_regime_basis")}
-    features["technical_analysis"] = {"status": "invalid", "reason": "input_contract_invalid", "candles": [],
-        "indicators": {}, "cross_candidates": [], "calculation_history_records": 0, "recalculate_in_hmi": False}
+                for name in ("realized_volatility", "dvol", "volatility_spread", "daily_regime_basis")}
+    features["volatility_native_analytics"] = {"status": "invalid", "reason": "input_contract_invalid", "timestamps": [], "records": 0, "charts": {}, "indicators": {}, "hmi_recalculate": False}
     quality = evaluate_volatility_market_regimes_processing_quality(features, source, [error])
     return {"family": FAMILY, "stage": "processing", "version": PROCESSING_VERSION,
             "mode": safe.get("mode") if safe.get("mode") in _MODES else "bootstrap",
@@ -426,17 +487,16 @@ class VolatilityMarketRegimesProcessor:
     def __init__(self, feature_builder: VolatilityMarketRegimesFeatureBuilder | None = None) -> None:
         self.feature_builder = feature_builder or VolatilityMarketRegimesFeatureBuilder()
 
-    def process(self, contract: Any) -> dict[str, Any]:
+    def process(self, contract: Any, *, price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
         try:
             validate_volatility_market_regimes_input(contract)
             sources = extract_processing_source_records(contract)
-            positioning = build_positioning_series(sources["coinglass.top_position_ratio"])
             realized = build_realized_volatility_series(sources["glassnode.realized_volatility"])
             dvol = build_dvol_series(sources["glassnode.dvol"])
             spread = build_volatility_spread_series(realized, dvol)
-            daily = build_daily_regime_basis(positioning, realized, dvol, spread)
-            features = self.feature_builder.build(positioning, realized, dvol, spread, daily)
-            features["technical_analysis"] = build_realized_volatility_technical_analysis(realized)
+            daily = build_daily_regime_basis(realized, dvol, spread)
+            features = self.feature_builder.build(realized, dvol, spread, daily)
+            features["volatility_native_analytics"] = build_volatility_native_analytics(realized, dvol, price_history_daily)
             availability = _source_availability(sources)
             quality = evaluate_volatility_market_regimes_processing_quality(features, availability)
             return {"family": FAMILY, "stage": "processing", "version": PROCESSING_VERSION,
@@ -446,5 +506,5 @@ class VolatilityMarketRegimesProcessor:
             return _invalid_output(contract, str(exc))
 
 
-def process_volatility_market_regimes(contract: Any) -> dict[str, Any]:
-    return VolatilityMarketRegimesProcessor().process(contract)
+def process_volatility_market_regimes(contract: Any, *, price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    return VolatilityMarketRegimesProcessor().process(contract, price_history_daily=price_history_daily)

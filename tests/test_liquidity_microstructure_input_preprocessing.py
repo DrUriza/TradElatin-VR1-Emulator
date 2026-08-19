@@ -8,12 +8,13 @@ def test_normalizes_all_datasets_and_strict_json():
     output = run_liquidity_microstructure_input(fetcher=valid_fetcher, reference_timestamp=1_700_000_000)
     provider = output["providers"]["coinglass"]
     assert provider["orderbook"]["spot"]["records"][0]["timestamp"] == 1_700_000_000
-    assert {row["range_percent"] for row in provider["order_depth"]["spot"]["records"]} == {1, 5, 10}
+    assert {row["range_percent"] for row in provider["order_depth"]["spot"]["records"]} == {10}
     assert provider["whale_activity"]["records"][0]["whale_index_value"] == -0.25
     assert provider["market_history"]["status"] == "unavailable"
     assert provider["market_history"]["reason"] == "no_data"
     assert provider["market_history"]["records"] == []
-    assert provider["large_trades"]["spot"]["reason"] == "stream_warmup_in_progress"
+    assert provider["large_trades"]["spot"]["status"] == "available"
+    assert provider["large_trades"]["spot"]["events"]
     json.dumps(output, allow_nan=False)
 
 

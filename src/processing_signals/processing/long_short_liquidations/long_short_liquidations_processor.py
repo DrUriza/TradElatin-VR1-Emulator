@@ -381,7 +381,7 @@ def _invalid_output(reference_timestamp: int, config: Mapping[str, Any] | None, 
 def _native_liquidation_analysis(
     realized_series: Sequence[Mapping[str, Any]], *,
     price_history: Sequence[Mapping[str, Any]] | None = None,
-    positioning_history: Sequence[Mapping[str, Any]] | None = None,
+    positioning: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     rows = list(realized_series)
     timestamps = [int(row["timestamp"]) for row in rows]
@@ -406,8 +406,14 @@ def _native_liquidation_analysis(
     price_z = rolling_zscore(price_return_pct, 48, 24)
     price_regime = [None if p is None or i is None or z is None else float(p) * 0.35 - float(i) * abs(float(z)) for p,i,z in zip(price_z,imbalance,intensity_z,strict=True)]
 
-    pos_lookup = {int(row["timestamp"]): row.get("long_short_ratio") for row in (positioning_history or []) if isinstance(row, Mapping) and row.get("timestamp") is not None}
-    top_position = [pos_lookup.get(ts) for ts in timestamps]
+    positioning = positioning or {}
+    def ratio_series(name: str) -> list[float | None]:
+        lookup = {int(row["timestamp"]): row.get("long_short_ratio") for row in positioning.get(name, ())
+                  if isinstance(row, Mapping) and row.get("timestamp") is not None}
+        return [lookup.get(ts) for ts in timestamps]
+    top_position = ratio_series("top_position_ratio")
+    top_account = ratio_series("top_account_ratio")
+    global_account = ratio_series("global_account_ratio")
     crowding_raw = [None if value is None or float(value) <= 0 else math.log(float(value)) for value in top_position]
     crowding_score = rolling_zscore(crowding_raw, 48, 24)
     pressure_score = [None if z is None or imb is None else float(z) * float(imb) for z,imb in zip(intensity_z,imbalance,strict=True)]
@@ -417,7 +423,7 @@ def _native_liquidation_analysis(
 
     return {
         "status":"available" if rows else "unavailable", "timestamps":timestamps,
-        "positioning": {"top_position_ratio":top_position, "top_account_ratio":[None]*len(timestamps), "global_account_ratio":[None]*len(timestamps)},
+        "positioning": {"top_position_ratio":top_position, "top_account_ratio":top_account, "global_account_ratio":global_account},
         "indicators": {
             "liquidation_intensity_zscore": {"intensity_zscore":intensity_z,"intensity_percentile":intensity_pct,"total_liquidations_musd":total_musd},
             "long_short_liquidation_imbalance": {"liquidation_imbalance":imbalance,"long_liquidations_musd":[None if v is None else float(v)/1e6 for v in long_values],"short_liquidations_musd":[None if v is None else float(v)/1e6 for v in short_values]},
@@ -426,13 +432,15 @@ def _native_liquidation_analysis(
             "crowding_liquidation_pressure": {"top_position_ratio":top_position,"crowding_score":crowding_score,"liquidation_pressure_score":pressure_score,"crowding_liquidation_score":combined},
             "liquidation_regime_hmi": {"liquidation_regime_score":regime_score,"wasserstein_distance":wasserstein},
         },
-        "current": {"top_position_ratio":latest(top_position),"liquidation_regime_score":latest(regime_score),"wasserstein_distance":latest(wasserstein)},
+        "current": {"top_position_ratio":latest(top_position), "top_account_ratio":latest(top_account),
+                    "global_account_ratio":latest(global_account), "liquidation_regime_score":latest(regime_score),
+                    "wasserstein_distance":latest(wasserstein)},
         "recalculate_in_hmi":False,
     }
 
 
 def process_long_short_liquidations(input_contract: Mapping[str, Any], *, reference_price_context: Mapping[str, Any] | None = None,
-                                    price_history: Sequence[Mapping[str, Any]] | None = None, positioning_history: Sequence[Mapping[str, Any]] | None = None,
+                                    price_history: Sequence[Mapping[str, Any]] | None = None,
                                     config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     _json_safe(config, "config")
     validate_long_short_liquidations_input(input_contract)
@@ -593,7 +601,11 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
         "events": {"aggregate": aggregate_events, "by_exchange": by_exchange_events, "provenance": event_provenance},
         "maps": {"reference_price": reference_payload, "aggregated": aggregated_map, "by_exchange": by_exchange_maps,
                  "aligned_exchanges": aligned, "max_pain": _max_pain(cg["max_pain"], price)}, "pressure": pressure,
-        "liquidation_analysis": _native_liquidation_analysis(realized_series, price_history=price_history, positioning_history=positioning_history),
+        "liquidation_analysis": _native_liquidation_analysis(realized_series, price_history=price_history, positioning={
+            "top_position_ratio": cg.get("top_position_ratio", {}).get("records", []),
+            "top_account_ratio": cg.get("top_account_ratio", {}).get("records", []),
+            "global_account_ratio": cg.get("global_account_ratio", {}).get("records", []),
+        }),
         "quality": {"status": quality_status, "required_features": PROCESSING_REQUIRED_FEATURES,
                     "optional_features": PROCESSING_OPTIONAL_FEATURES, "missing_features": missing, "invalid_features": invalid,
                     "partial_features": partial, "unavailable_features": unavailable, "warnings": warnings, "errors": []}}
@@ -604,9 +616,9 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
 
 class LongShortLiquidationsProcessor:
     def __init__(self, input_contract: Mapping[str, Any], *, reference_price_context: Mapping[str, Any] | None = None,
-                 price_history: Sequence[Mapping[str, Any]] | None = None, positioning_history: Sequence[Mapping[str, Any]] | None = None,
+                 price_history: Sequence[Mapping[str, Any]] | None = None,
                  config: Mapping[str, Any] | None = None) -> None:
-        self.input_contract, self.reference_price_context, self.price_history, self.positioning_history, self.config = input_contract, reference_price_context, price_history, positioning_history, config
+        self.input_contract, self.reference_price_context, self.price_history, self.config = input_contract, reference_price_context, price_history, config
 
     def run(self) -> dict[str, Any]:
-        return process_long_short_liquidations(self.input_contract, reference_price_context=self.reference_price_context, price_history=self.price_history, positioning_history=self.positioning_history, config=self.config)
+        return process_long_short_liquidations(self.input_contract, reference_price_context=self.reference_price_context, price_history=self.price_history, config=self.config)

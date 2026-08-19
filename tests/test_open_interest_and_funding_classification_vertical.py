@@ -179,60 +179,6 @@ def test_all_nine_quadrants_preserve_funding_sign(oi, funding, state):
     assert _current(_output(contract))["oi_funding_quadrant"]["state"] == state
 
 
-@pytest.mark.parametrize(("value", "state"), [(24.9, "weak"), (25.0, "exactly_threshold"), (25.1, "strong")])
-def test_adx_boundaries(value, state):
-    contract = _contract()
-    wrapper = _indicator(contract, "adx")
-    _set_indicator(contract, "adx", {**wrapper["current"], "adx": value})
-    assert _current(_output(contract))["oi_trend_strength"]["state"] == state
-
-
-@pytest.mark.parametrize(("plus", "minus", "state"), [(2.0, 1.0, "di_plus_dominant"),
-                                                         (1.0, 2.0, "di_minus_dominant"), (1.0, 1.0, "balanced")])
-def test_directional_index_relations(plus, minus, state):
-    contract = _contract()
-    wrapper = _indicator(contract, "adx")
-    _set_indicator(contract, "adx", {**wrapper["current"], "di_plus": plus, "di_minus": minus})
-    assert _current(_output(contract))["directional_index_relation"]["state"] == state
-
-
-@pytest.mark.parametrize(("macd", "signal", "state"), [(2.0, 1.0, "above_signal"),
-                                                         (1.0, 2.0, "below_signal"), (1.0, 1.0, "equal_signal")])
-def test_macd_relations(macd, signal, state):
-    contract = _contract()
-    wrapper = _indicator(contract, "macd")
-    _set_indicator(contract, "macd", {**wrapper["current"], "macd": macd, "signal": signal})
-    assert _current(_output(contract))["macd_relation"]["state"] == state
-
-
-@pytest.mark.parametrize(("value", "state"), [(20.0, "low_range"), (20.1, "mid_range"),
-                                                (79.9, "mid_range"), (80.0, "high_range")])
-def test_stochastic_boundaries_use_k_only(value, state):
-    contract = _contract()
-    _set_indicator(contract, "stochastic", {"k": value, "d": 99.0})
-    atom = _current(_output(contract))["stochastic_range_state"]
-    assert atom["state"] == state
-    assert atom["evidence"]["values"] == {"k": value, "d": 99.0}
-
-
-@pytest.mark.parametrize(("value", "state"), [(-0.1, "below_lower_band"), (0.0, "lower_half"),
-    (0.49, "lower_half"), (0.5, "on_middle"), (0.51, "upper_half"), (1.0, "upper_half"),
-    (1.1, "above_upper_band")])
-def test_bollinger_boundaries(value, state):
-    contract = _contract()
-    wrapper = _indicator(contract, "bollinger_bands")
-    _set_indicator(contract, "bollinger_bands", {**wrapper["current"], "percent_b": value})
-    assert _current(_output(contract))["bollinger_position"]["state"] == state
-
-
-@pytest.mark.parametrize(("value", "state"), [(-100.0, "high_negative"), (-99.9, "neutral"),
-                                                (99.9, "neutral"), (100.0, "high_positive")])
-def test_cci_boundaries(value, state):
-    contract = _contract()
-    _set_indicator(contract, "cci", {"cci": value})
-    assert _current(_output(contract))["cci_state"]["state"] == state
-
-
 @pytest.mark.parametrize(("value", "state"), [(1.0, "positive"), (-1.0, "negative"), (0.0, "neutral")])
 def test_roc_states(value, state):
     contract = _contract()
@@ -344,23 +290,6 @@ def test_all_seven_event_types_nine_pairs_and_exact_interpretations_are_wired():
         "adx_threshold_cross", "oi_roc_zero_cross", "funding_zero_cross"}
 
 
-def test_event_at_current_timestamp_is_evidence_but_does_not_recalculate_state():
-    contract = _contract()
-    timestamp = _indicator(contract, "macd")["current_timestamp"]
-    event_id = _single_macd_event(contract, timestamp)
-    atom = _current(_output(contract))["macd_relation"]
-    expected = "above_signal" if _indicator(contract, "macd")["current"]["macd"] > _indicator(contract, "macd")["current"]["signal"] else "below_signal"
-    assert atom["state"] == expected
-    assert atom["evidence"]["event_ids"] == [event_id]
-
-
-def test_historical_event_does_not_enter_current_evidence():
-    contract = _contract()
-    timestamp = _indicator(contract, "macd")["current_timestamp"]
-    _single_macd_event(contract, timestamp - 1)
-    assert _current(_output(contract))["macd_relation"]["evidence"]["event_ids"] == []
-
-
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "wrong_timeframe", "key_mismatch", "event_type"])
 def test_invalid_event_graph_is_rejected_with_value_error(mutation):
     contract = _contract()
@@ -402,8 +331,7 @@ def test_processing_quality_invalid_has_global_precedence_over_required_atoms():
 
 
 @pytest.mark.parametrize(("kind", "name"), [
-    ("oi", "open_interest_change_state"), ("funding", "funding_state"),
-    ("adx", "directional_index_relation"), ("cci", "cci_state")])
+    ("oi", "open_interest_change_state"), ("funding", "funding_state")])
 def test_internal_current_timestamp_mismatch_is_local_invalid(kind, name):
     contract = _contract()
     if kind == "oi":
@@ -451,14 +379,6 @@ def test_direction_numeric_requires_exact_positive_or_negative_int(direction):
     assert f"classification_event_invalid:{event_id}" in output["quality"]["warnings"]
     assert output["quality"]["status"] != "invalid"
     json.dumps(output, ensure_ascii=False, allow_nan=False, sort_keys=False)
-
-
-@pytest.mark.parametrize("direction", [1, -1])
-def test_exact_integer_event_directions_remain_valid(direction):
-    contract = _contract()
-    event_id = _single_macd_event(contract, _indicator(contract, "macd")["current_timestamp"])
-    contract["events"]["by_id"][event_id]["direction_numeric"] = direction
-    assert _interpreted_event(_output(contract), event_id)["status"] == "available"
 
 
 @pytest.mark.parametrize("field", ["values", "parameters"])

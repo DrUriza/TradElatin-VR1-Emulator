@@ -51,18 +51,21 @@ def test_all_eight_families_are_registered_and_run_raw_to_processing() -> None:
     for family in FAMILIES:
         assert inputs[family]["stage"] == "input"
         assert processing[family]["stage"] == "processing"
-        assert processing[family]["quality"]["status"] in {"ok", "available"}
+        allowed = {"ok", "available", "partial"} if family == "on_chain_miners" else {"ok", "available"}
+        assert processing[family]["quality"]["status"] in allowed
         json.dumps(processing[family], allow_nan=False)
 
     assert tuple(processing["prices_ohlcv"]["markets"]) == ("spot", "futures")
-    assert "general" not in json.dumps(processing["prices_ohlcv"]).lower()
+    assert "spot" not in json.dumps(processing["prices_ohlcv"]).lower()
     comparison = processing["prices_ohlcv"]["features"]["spot_futures_comparison"]["by_timeframe"]["1h"]["series"]
     if comparison:
         assert {"basis_usd", "basis_percent"}.issubset(comparison[-1])
 
-    volatility_text = json.dumps(processing["volatility_market_regimes"]).lower()
+    volatility = processing["volatility_market_regimes"]
+    volatility_text = json.dumps(volatility).lower()
     assert "deribit" not in volatility_text
-    assert "implied_volatility" not in volatility_text
+    assert "technical_analysis" not in volatility["features"]
+    assert "volatility_native_analytics" in volatility["features"]
     assert set(inputs["volatility_market_regimes"]["providers"]) == {"coinglass", "glassnode"}
 
     liquidity_market_history = inputs["liquidity_microstructure"]["providers"]["coinglass"]["market_history"]

@@ -27,6 +27,9 @@ from .long_short_liquidations_data_raw_extract import (
     GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID,
     GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID,
     GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID,
+    COINGLASS_TOP_POSITION_ENDPOINT_ID,
+    COINGLASS_TOP_ACCOUNT_ENDPOINT_ID,
+    COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID,
     LONG_SHORT_LIQUIDATIONS_FAMILY,
     VALID_MODES,
     LongShortLiquidationsRawExtractor,
@@ -167,6 +170,27 @@ def normalize_coinglass_aggregated_history_record(record: Mapping[str, Any]) -> 
     return {"timestamp": milliseconds_to_seconds(record.get("time")),
             "long_liquidation_usd": _finite(record.get("aggregated_long_liquidation_usd"), nonnegative=True),
             "short_liquidation_usd": _finite(record.get("aggregated_short_liquidation_usd"), nonnegative=True)}
+
+
+def normalize_coinglass_positioning_record(record: Mapping[str, Any], *, kind: str) -> dict[str, Any]:
+    prefixes = {
+        "top_position": "top_position",
+        "top_account": "top_account",
+        "global_account": "global_account",
+    }
+    prefix = prefixes[kind]
+    long_percent = _finite(record.get(f"{prefix}_long_percent"), nonnegative=True)
+    short_percent = _finite(record.get(f"{prefix}_short_percent"), nonnegative=True)
+    ratio = _finite(record.get(f"{prefix}_long_short_ratio"), positive=True)
+    if long_percent > 100 or short_percent > 100 or abs(long_percent + short_percent - 100.0) > 0.5:
+        raise ValueError("inconsistent_positioning_percentages")
+    expected = long_percent / short_percent if short_percent else None
+    if expected is None or abs(expected - ratio) > 0.05:
+        raise ValueError("inconsistent_positioning_ratio")
+    return {
+        "timestamp": milliseconds_to_seconds(record.get("time")),
+        "long_percent": long_percent, "short_percent": short_percent, "long_short_ratio": ratio,
+    }
 
 
 def normalize_coinglass_exchange_snapshot_record(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -585,6 +609,9 @@ def _request_dataset_path(request: Mapping[str, Any]) -> str:
         "liquidation_exchange_list": "coinglass.exchange_snapshot",
         "aggregated_liquidation_map": "coinglass.aggregated_map",
         "liquidation_max_pain": "coinglass.max_pain",
+        COINGLASS_TOP_POSITION_ENDPOINT_ID: "coinglass.top_position_ratio",
+        COINGLASS_TOP_ACCOUNT_ENDPOINT_ID: "coinglass.top_account_ratio",
+        COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID: "coinglass.global_account_ratio",
         GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID: "glassnode.long_liquidations",
         GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID: "glassnode.short_liquidations",
         GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID: "glassnode.total_liquidations",
@@ -623,7 +650,9 @@ def determine_required_datasets(
                          "coinglass.aggregated_map"})
     required_endpoints = {"aggregated_liquidation_history", "liquidation_exchange_list",
                           "aggregated_liquidation_map", "pair_liquidation_history",
-                          "liquidation_order_events", "pair_liquidation_map"}
+                          "liquidation_order_events", "pair_liquidation_map",
+                          COINGLASS_TOP_POSITION_ENDPOINT_ID, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID,
+                          COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID}
     for request in raw_requests:
         endpoint = request["endpoint_id"]
         if endpoint in required_endpoints or (mode == "bootstrap" and endpoint == "supported_exchange_pairs"):
@@ -660,6 +689,18 @@ class LongShortLiquidationsInputPreprocessor:
         history = _dataset(select("coinglass", "aggregated_liquidation_history"), raw,
                            unwrap_coinglass_list_response, normalize_coinglass_aggregated_history_record,
                            existing=coinglass_old.get("aggregated_history"), interval="1h")
+        top_position_ratio = _dataset(select("coinglass", COINGLASS_TOP_POSITION_ENDPOINT_ID), raw,
+                                      unwrap_coinglass_list_response,
+                                      lambda row: normalize_coinglass_positioning_record(row, kind="top_position"),
+                                      existing=coinglass_old.get("top_position_ratio"), interval="1h")
+        top_account_ratio = _dataset(select("coinglass", COINGLASS_TOP_ACCOUNT_ENDPOINT_ID), raw,
+                                     unwrap_coinglass_list_response,
+                                     lambda row: normalize_coinglass_positioning_record(row, kind="top_account"),
+                                     existing=coinglass_old.get("top_account_ratio"), interval="1h")
+        global_account_ratio = _dataset(select("coinglass", COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID), raw,
+                                        unwrap_coinglass_list_response,
+                                        lambda row: normalize_coinglass_positioning_record(row, kind="global_account"),
+                                        existing=coinglass_old.get("global_account_ratio"), interval="1h")
         exchange_requests = select("coinglass", "liquidation_exchange_list")
         exchange_snapshot = _snapshot(exchange_requests, raw,
                                       unwrap_coinglass_list_response, normalize_coinglass_exchange_snapshot_record,
@@ -738,6 +779,8 @@ class LongShortLiquidationsInputPreprocessor:
             glassnode[output_key] = dataset
         providers = {"coinglass": {"supported_exchange_pairs": supported,
                                      "aggregated_history": history, "exchange_snapshot": exchange_snapshot,
+                                     "top_position_ratio": top_position_ratio, "top_account_ratio": top_account_ratio,
+                                     "global_account_ratio": global_account_ratio,
                                      "pair_history": pair_history, "events": events,
                                      "aggregated_map": aggregated_map, "pair_maps": pair_maps,
                                      "max_pain": max_pain},
@@ -887,7 +930,7 @@ def run_long_short_liquidations_input(
     min_event_usd: int | float = DEFAULT_MIN_EVENT_USD, map_range: str = DEFAULT_MAP_RANGE,
     exchange_range: str = DEFAULT_EXCHANGE_RANGE, max_pain_range: str = DEFAULT_MAX_PAIN_RANGE,
     minimum_event_window_seconds: int = 60, event_cursors: Mapping[str, int] | None = None,
-    refresh_discovery: bool = False, debug_raw: bool = False,
+    refresh_discovery: bool = False, include_confirmations: bool = True, debug_raw: bool = False,
 ) -> dict[str, Any]:
     preprocessor = LongShortLiquidationsInputPreprocessor(existing_contract=existing_contract)
     mode = preprocessor.determine_mode(requested_mode=requested_mode, recovery_requests=recovery_requests)
@@ -908,6 +951,15 @@ def run_long_short_liquidations_input(
                 timestamp = records[-1].get("timestamp") if isinstance(records[-1], Mapping) else None
                 if isinstance(timestamp, int) and not isinstance(timestamp, bool):
                     event_cursors[exchange] = timestamp
+    reuse_hourly = False
+    if mode == "incremental" and isinstance(existing_contract, Mapping):
+        previous_ref = existing_contract.get("reference_timestamp")
+        reference_now = int(clock()) if reference_timestamp is None and clock is not None else reference_timestamp
+        if reference_now is None:
+            reference_now = int(__import__("time").time())
+        if type(previous_ref) is int and previous_ref // 3600 == int(reference_now) // 3600:
+            reuse_hourly = True
     raw = extractor.run(mode=mode, recovery_requests=recovery_requests, event_cursors=event_cursors,
-                        refresh_discovery=refresh_discovery)
+                        refresh_discovery=refresh_discovery, include_confirmations=include_confirmations,
+                        reuse_hourly=reuse_hourly)
     return preprocessor.preprocess_raw(raw, debug_raw=debug_raw)

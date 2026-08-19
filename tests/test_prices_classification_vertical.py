@@ -28,7 +28,7 @@ from processing_signals.classification.prices_ohlcv.prices_ohlcv_classifier impo
 )
 
 TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
-MARKETS = ("spot", "futures", "general")
+MARKETS = ("spot", "futures", "spot")
 
 
 def _indicator_package(sign: float = 1.0) -> dict:
@@ -76,14 +76,14 @@ def make_processing_output() -> dict:
     patterns = {m: {tf: [] for tf in TIMEFRAMES} for m in MARKETS}
     crosses["spot"]["1h"] = [{"timestamp": 1, "cross_id": "ema_9_above_ema_21", "direction": 1}]
     patterns["spot"]["1h"] = [{"timestamp": 1, "pattern_id": "hammer", "direction": 1, "confidence": 0.82}]
-    crosses["general"]["1h"] = deepcopy(crosses["spot"]["1h"])
-    patterns["general"]["1h"] = deepcopy(patterns["spot"]["1h"])
+    crosses["spot"]["1h"] = deepcopy(crosses["spot"]["1h"])
+    patterns["spot"]["1h"] = deepcopy(patterns["spot"]["1h"])
     records = [{"timestamp": 1, "open": 99, "high": 102, "low": 98, "close": 101, "volume_usd": 1}]
     main = {m: {"timeframes": {tf: {"records": deepcopy(records), "unavailable_records": []} for tf in TIMEFRAMES}} for m in MARKETS}
     return {
         "family": "prices_ohlcv", "stage": "processing", "mode": "bootstrap", "markets": {},
         "features": {
-            "market_selector": {"default_market": "general", "selected_market": "general", "available_markets": ["general"], "timeframes": list(TIMEFRAMES)},
+            "market_selector": {"default_market": "spot", "selected_market": "spot", "available_markets": ["spot"], "timeframes": list(TIMEFRAMES)},
             "main_ohlcv": main, "indicators": indicators, "bias_components": biases,
             "statistical_performance": {"markets": statistics}, "technical_crosses": crosses,
             "candlestick_patterns": patterns,
@@ -154,13 +154,13 @@ def test_statistical_unavailable_values_preserve_units():
     assert classify_sharpe(1.0)["confidence"] == 0.50
 
 
-def test_public_classifier_includes_general_and_is_complete():
+def test_public_classifier_includes_spot_and_is_complete():
     output = run_prices_ohlcv_classification(make_processing_output())
     assert output["quality"]["status"] == "ok"
     assert set(output["indicator_signals"]) == set(MARKETS)
     assert set(output["statistical_signals"]) == set(MARKETS)
     assert set(output["technical_bias"]) == set(MARKETS)
-    assert "general" in output["indicator_signals"]
+    assert "spot" in output["indicator_signals"]
     assert output["statistical_signals"]["spot"]["1h"]["metadata"]["performance_basis"] == "market_returns"
     assert output["indicator_signals"]["spot"]["1h"]["tsi"]["parameters"] == {"slow_period": 25, "fast_period": 13}
 

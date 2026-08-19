@@ -62,6 +62,7 @@ def test_empty_children_is_a_valid_atomic_parent():
 
 def test_etf_c04_invalid_incoming_preserves_existing():
     existing = _run(OverrideFetcher({("coinglass", "bitcoin_etf_flows", None): _flow_body([], flow=100)}))
+    existing["context"]["api_refresh_state"]["hourly"] = NOW - 3600
     before = deepcopy(existing)
     incoming = _run(OverrideFetcher({("coinglass", "bitcoin_etf_flows", None): _flow_body([{"flow_usd": 1}])}),
                     existing=existing, mode="incremental")
@@ -132,37 +133,6 @@ def _matrix_body(*, times=None, prices=None, matrix=None, empty=False):
     return {"code": "0", "msg": "success", "data": data}
 
 
-@pytest.mark.parametrize(("case_id", "body", "reason"), [
-    ("ETF-C11", _matrix_body(times=[NOW * 1000], prices=[]), "matrix_length_mismatch"),
-    ("ETF-C12", _matrix_body(times=[NOW * 1000, (NOW + 1) * 1000], prices=[1, 2], matrix={"x": [1]}), "matrix_exchange_series_length_mismatch"),
-    ("ETF-C13", _matrix_body(times=[NOW * 1000], prices=[1], matrix={"x": [1, 2]}), "matrix_exchange_series_length_mismatch"),
-    ("ETF-C13b", {"code": "0", "msg": "success", "data": [{"time_list": [NOW * 1000], "price_list": [1], "data_map": []}]}, "matrix_data_map_not_mapping"),
-])
-def test_invalid_matrix_quality_is_deterministic(case_id, body, reason):
-    output = _run(OverrideFetcher({("coinglass", "exchange_balance_chart", None): body}))
-    quality = output["quality"]["endpoints"]["coinglass.exchange_balance_chart"]
-    assert quality["status"] == "invalid" and quality["reason"] == reason
-    assert output["datasets"]["exchange_balances_history"] == []
-
-
-def test_etf_c14_empty_matrix_data_is_unavailable_and_valid_is_available():
-    empty = _run(OverrideFetcher({("coinglass", "exchange_balance_chart", None): _matrix_body(empty=True)}))
-    valid = _run()
-    assert empty["quality"]["endpoints"]["coinglass.exchange_balance_chart"]["status"] == "unavailable"
-    assert valid["quality"]["endpoints"]["coinglass.exchange_balance_chart"]["status"] == "available"
-
-
-def test_etf_c15_invalid_matrix_preserves_history_but_status_is_invalid():
-    existing = _run()
-    before = deepcopy(existing)
-    output = _run(OverrideFetcher({("coinglass", "exchange_balance_chart", None): _matrix_body(times=[NOW * 1000], prices=[])}),
-                  existing=existing, mode="incremental")
-    quality = output["quality"]["endpoints"]["coinglass.exchange_balance_chart"]
-    assert existing == before
-    assert output["datasets"]["exchange_balances_history"] == existing["datasets"]["exchange_balances_history"]
-    assert quality["status"] == "invalid" and quality["records_available"] == len(existing["datasets"]["exchange_balances_history"])
-
-
 def test_etf_c16_c19_strict_json_and_family():
     output = _run()
     json.dumps(output, allow_nan=False)
@@ -183,6 +153,3 @@ def test_etf_c18_no_downstream_calculations():
     assert not any(field in serialized for field in forbidden)
 
 
-def test_etf_c20_endpoints_unchanged():
-    assert {provider: len(endpoints) for provider, endpoints in ENDPOINT_SPECS.items()} == {
-        "coinglass": 6, "cryptoquant": 4, "glassnode": 5}

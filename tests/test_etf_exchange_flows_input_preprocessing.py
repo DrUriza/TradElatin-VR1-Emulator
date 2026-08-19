@@ -17,7 +17,7 @@ def test_all_primary_schemas_normalize_without_cross_endpoint_fields():
     assert datasets["etf_fund_flows_daily"][0]["ticker"] == "GBTC"
     assert datasets["etf_funds_snapshot"][0]["aum_usd"] == 100.5
     assert datasets["etf_premium_discount_daily"][0]["premium_discount_percent"] == -1
-    assert datasets["exchange_balances_history"][0]["exchange_name"] == "coinbase"
+    assert datasets["exchange_balances_history"] == []  # retired CoinGlass balance chart is not polled
     assert set(datasets["exchange_inflow"]["hour"][0]) >= {"inflow_total", "inflow_top10", "inflow_mean"}
     assert "outflow_total" not in datasets["exchange_inflow"]["hour"][0]
     json.dumps(output, allow_nan=False)
@@ -26,7 +26,7 @@ def test_all_primary_schemas_normalize_without_cross_endpoint_fields():
 def test_null_is_preserved_and_structured_glassnode_value_is_preserved():
     output = _run(include_secondary=True)
     assert output["datasets"]["exchange_inflow"]["day"][0]["inflow_total"] is None
-    record = output["datasets"]["secondary_sources"]["glassnode"]["exchange_balance"]["1h"][0]
+    record = output["datasets"]["secondary_sources"]["glassnode"]["exchange_balance"]["24h"][0]
     assert record["value"] is None and record["value_raw"] == {"nested": 1}
     assert any("structured_glassnode_value" in warning for warning in output["quality"]["warnings"])
 

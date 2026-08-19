@@ -224,7 +224,7 @@ def test_processing_smoke(case):
         assert (source, reference, config) == before if case != 44 else json.dumps(output, allow_nan=False)
     elif case in {45, 46}:
         text = json.dumps(process_long_short_liquidations(_contract())).lower()
-        assert ("bullish" not in text and "bearish" not in text) if case == 45 else "hmi" not in text
+        assert ("bullish" not in text and "bearish" not in text) if case == 45 else "hmi_recalculate" not in text
     elif case == 47:
         source = _contract()
         source["providers"]["coinglass"]["aggregated_history"] = _dataset("unavailable", reason="not_requested")

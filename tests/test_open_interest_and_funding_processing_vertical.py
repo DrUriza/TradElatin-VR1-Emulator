@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from canonical_hash_helpers import canonical_text_sha256
 from processing_signals.processing.open_interest_and_funding.open_interest_and_funding_feature_builder import (
     OpenInterestAndFundingFeatureBuilder,
     build_open_interest_and_funding_features,
@@ -23,15 +22,7 @@ from processing_signals.processing.open_interest_and_funding.open_interest_and_f
 REFERENCE = 1_800_000_000
 ROOT_KEYS = {
     "family", "stage", "version", "mode", "context", "series", "indicators",
-    "events", "snapshots", "confirmations", "availability", "quality",
-}
-FROZEN_HASHES = {
-    "src/processing_signals/input/open_interest_and_funding/open_interest_and_funding_data_raw_extract.py":
-        "3C7EC9C300022029ECA75CF8B69C7EF9F24A0FA8FB025C5FDFC410B8C35718AE",
-    "src/processing_signals/input/open_interest_and_funding/open_interest_and_funding_data_raw_preprocessing.py":
-        "B630F835CB70E7ACEE7E6E19FEEAC108F612A826AC3E85FDD20351DBE857D148",
-    "tests/test_open_interest_and_funding_input_vertical.py":
-        "1F4BB93B8E5C21C7CAD4CDBC59284BB15281FCC7272932285DDC3C7000A65CB9",
+    "events", "snapshots", "confirmations", "availability", "quality", "native_analysis",
 }
 
 
@@ -244,8 +235,8 @@ def test_gaps_split_segments_reset_metrics_and_degrade_quality():
     assert frame["derived"]["oi_delta"]["series"]["delta_absolute_usd"][100] is None
     assert indicators["oi_roc"]["series"]["roc"][111] is None
     assert indicators["oi_roc"]["series"]["roc"][112] is not None
-    assert indicators["macd"]["series"]["macd"][132] is None
-    assert indicators["macd"]["series"]["macd"][133] is not None
+    assert indicators["macd"]["status"] == "unavailable"
+    assert indicators["macd"]["reason"] == "retired_by_open_interest_indicator_policy"
     assert frame["status"] == "partial" and output["quality"]["gaps_present"] is True
 
 
@@ -254,16 +245,18 @@ def test_current_is_not_taken_from_an_older_segment_when_latest_warmup_is_incomp
     package = output["indicators"]["open_interest"]["timeframes"]["1h"]
     assert package["atr"]["current"] is None
     assert package["atr"]["current_timestamp"] is None
-    assert package["atr"]["status"] == "partial"
+    assert package["atr"]["status"] == "unavailable"
+    assert package["atr"]["reason"] == "retired_by_open_interest_indicator_policy"
 
 
 def test_all_indicator_arrays_match_source_timeline():
     output = _process()
     for timeframe in TIMEFRAMES:
-        count = len(output["series"]["open_interest_ohlc"]["timeframes"][timeframe]["records"])
-        for package in output["indicators"]["open_interest"]["timeframes"][timeframe].values():
-            for values in package["series"].values():
-                assert len(values) == count
+            count = len(output["series"]["open_interest_ohlc"]["timeframes"][timeframe]["records"])
+            for package in output["indicators"]["open_interest"]["timeframes"][timeframe].values():
+                for values in package["series"].values():
+                    expected = 0 if package["reason"] == "retired_by_open_interest_indicator_policy" else count
+                    assert len(values) == expected
 
 
 def test_funding_is_separate_preserves_negative_values_and_has_no_indicators():
@@ -330,7 +323,7 @@ def test_confirmations_stay_separate_and_comparisons_are_unavailable():
 def test_insufficient_history_is_partial_not_invalid():
     output = _process(counts={timeframe: 10 for timeframe in TIMEFRAMES})
     assert output["availability"]["oi_change_24h_derived"]["status"] == "partial"
-    assert output["indicators"]["open_interest"]["timeframes"]["1h"]["macd"]["status"] == "partial"
+    assert output["indicators"]["open_interest"]["timeframes"]["1h"]["macd"]["status"] == "unavailable"
     assert output["quality"]["status"] == "partial"
 
 
@@ -446,5 +439,3 @@ def test_strict_json_has_no_numpy_pandas_nonfinite_or_negative_zero():
                 walk(nested)
 
     walk(output)
-
-

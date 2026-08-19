@@ -48,16 +48,17 @@ def test_all_pipeline_registries_use_one_canonical_eight_family_order() -> None:
     assert tuple(SCREEN_FILENAMES) == CANONICAL_FAMILY_ORDER
 
 
-def test_only_canonical_hmi_contract_publication_path_is_configured() -> None:
+def test_only_canonical_hmi_publication_path_is_configured() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    assert not (repo_root / "runtime" / "contracts" / "hmi").exists()
-    assert "runtime/contracts/hmi_contract/" in CVD_VOLUME_ORDERFLOW_OUTPUT_PATH.as_posix()
-    assert "runtime/contracts/hmi_contract/" in DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH.as_posix()
+    assert (repo_root / "runtime" / "contracts" / "hmi").is_dir()
+    assert not (repo_root / "runtime" / "contracts" / "hmi_contract").exists()
+    assert "runtime/contracts/hmi/" in CVD_VOLUME_ORDERFLOW_OUTPUT_PATH.as_posix()
+    assert "runtime/contracts/hmi/" in DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH.as_posix()
 
 
-def test_runtime_hmi_contracts_have_no_retired_provider_or_pending_fixture_labels() -> None:
+def test_runtime_hmis_have_no_retired_provider_or_pending_fixture_labels() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    hmi_root = repo_root / "runtime" / "contracts" / "hmi_contract"
+    hmi_root = repo_root / "runtime" / "contracts" / "hmi"
     assert hmi_root.is_dir()
     assert len(list(hmi_root.glob("*.json"))) == 8
     retired_tokens = (
@@ -115,7 +116,7 @@ def _resolve_trace_tokens(current, tokens) -> bool:
 
 def _trace_resolves(path: str, documents: dict[str, dict]) -> bool:
     stage = None
-    for candidate in ("input", "processing", "classification", "hmi_contract"):
+    for candidate in ("input", "processing", "classification", "hmi"):
         prefix = f"{candidate}."
         if path.startswith(prefix):
             stage = candidate
@@ -124,7 +125,7 @@ def _trace_resolves(path: str, documents: dict[str, dict]) -> bool:
     tokens = path.split(".") if path else []
     roots = [documents[stage]] if stage else [
         documents["processing"], documents["classification"],
-        documents["input"], documents["hmi_contract"],
+        documents["input"], documents["hmi"],
     ]
     return any(_resolve_trace_tokens(root, tokens) for root in roots)
 
@@ -139,11 +140,11 @@ def test_runtime_hmi_source_paths_resolve_to_persisted_stage_contracts() -> None
             "input": json.loads((contracts / "input" / f"{family}.json").read_text(encoding="utf-8")),
             "processing": json.loads((contracts / "processing" / f"{family}.json").read_text(encoding="utf-8")),
             "classification": json.loads((contracts / "classification" / f"{family}.json").read_text(encoding="utf-8")),
-            "hmi_contract": json.loads((contracts / "hmi_contract" / screen_name).read_text(encoding="utf-8")),
+            "hmi": json.loads((contracts / "hmi" / screen_name).read_text(encoding="utf-8")),
         }
         unresolved = [
             (location, path)
-            for location, path in _trace_values(documents["hmi_contract"])
+            for location, path in _trace_values(documents["hmi"])
             if not _trace_resolves(path, documents)
         ]
         assert not unresolved, f"Unresolved trace paths for {family}: {unresolved[:10]}"

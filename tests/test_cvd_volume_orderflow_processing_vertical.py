@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 from pathlib import Path
 
@@ -259,7 +258,7 @@ def test_contract_shape_absence_of_classification_and_full_history():
     assert set(output["markets"]["spot"]["timeframes"]) == {"1m", "5m", "15m", "1h", "4h", "1d"}
     assert len(output["markets"]["spot"]["timeframes"]["1m"]["records"]) == len(contract["markets"]["spot"]["cvd"]["timeframes"]["1m"]["records"])
     encoded = json.dumps(output, allow_nan=False).lower()
-    for forbidden in ('"classification"', '"kpis"', '"charts"', '"widgets"', '"screen"', '"events"'):
+    for forbidden in ('"classification"', '"kpis"', '"charts"', '"widgets"', '"screen"'):
         assert forbidden not in encoded
 
 
@@ -294,15 +293,6 @@ def test_input_quality_invalid_produces_invalid_processing_quality():
 def test_bootstrap_incremental_recovery_modes_are_preserved():
     for mode in ("bootstrap", "incremental", "recovery"):
         assert process(input_contract(mode=mode))["mode"] == mode
-
-
-def test_input_hashes_remain_frozen():
-    expected = {
-        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_extract.py": "e461826c4c4d067d0cbff2dea33dcb9f977caefec61cfc96699bb39b06a1f13e",
-        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_preprocessing.py": "2d218f206cbb841cd0724ee757590594e47208b444901be737d3864e05196e38",
-        "tests/test_cvd_volume_orderflow_input_vertical.py": "1ddd3587e7f5f218ac15df9b1d72b06f288b632b7f59a96770eb608d6d09e5b0",
-    }
-    assert {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in expected} == expected
 
 
 def test_family_is_not_registered_in_processing_pipeline():

@@ -4,7 +4,7 @@
   "reference_timestamp": 1740000000,
   "configuration": {},
   "source_processing_status": {
-    "status": "partial",
+    "status": "available",
     "warnings": [
       "provider_timestamp_not_supplied"
     ],
@@ -13,12 +13,12 @@
   "classifications": {
     "pressure": {
       "source_path": "pressure.score",
-      "value": 26.598031578584997,
+      "value": 33.48895157865747,
       "classification": "moderate_pressure",
       "strength": null,
-      "status": "partial",
-      "reason": "partial_source_feature",
-      "confidence": 0.455796,
+      "status": "available",
+      "reason": "classified_within_threshold_band",
+      "confidence": 0.871646,
       "thresholds": {
         "low": [
           0,
@@ -40,8 +40,8 @@
       "evidence": {},
       "provenance": {
         "source_path": "pressure.score",
-        "source_status": "partial",
-        "source_reason": "components_unavailable",
+        "source_status": "available",
+        "source_reason": null,
         "source_provenance": {
           "component_source_paths": {
             "realized_intensity": "realized.windows.1h",
@@ -249,12 +249,12 @@
     "events": {
       "15m": {
         "source_path": "pressure.components.event_intensity",
-        "value": null,
-        "classification": null,
+        "value": 0.6105263157894737,
+        "classification": "elevated_event_activity",
         "strength": null,
-        "status": "unavailable",
-        "reason": "unavailable_source_feature",
-        "confidence": 0.0,
+        "status": "available",
+        "reason": "classified_within_threshold_band",
+        "confidence": 0.953684,
         "thresholds": {
           "subdued": [
             0,
@@ -279,9 +279,9 @@
         },
         "evidence": {
           "baseline_metadata": {
-            "value": null,
-            "status": "unavailable",
-            "reason": "insufficient_complete_event_bins",
+            "value": 0.6105263157894737,
+            "status": "available",
+            "reason": null,
             "current_window": {
               "start": 1739999100,
               "end": 1740000000,
@@ -291,16 +291,15 @@
             "baseline": {
               "window_seconds": 86400,
               "bin_seconds": 900,
-              "eligible_bin_count": 2,
+              "eligible_bin_count": 95,
               "minimum_required": 32
             }
-          },
-          "source_reason": "insufficient_complete_event_bins"
+          }
         },
         "provenance": {
           "source_path": "pressure.components.event_intensity",
-          "source_status": "unavailable",
-          "source_reason": "insufficient_complete_event_bins",
+          "source_status": "available",
+          "source_reason": null,
           "source_provenance": {},
           "classification_method": "normalized_event_percentile_bands_v1",
           "classification_version": "0.1",
@@ -507,12 +506,12 @@
     "confirmations": {
       "cryptoquant": {
         "source_path": "realized.confirmations.cryptoquant",
-        "value": 0.9931594100094506,
+        "value": 0.9930484191643817,
         "classification": "provider_aligned",
         "strength": null,
         "status": "available",
         "reason": "classified_within_threshold_band",
-        "confidence": 0.095983,
+        "confidence": 0.09721,
         "thresholds": {
           "aligned_correlation": 0.7,
           "aligned_mape": 0.25,
@@ -520,10 +519,10 @@
           "divergent_mape": 0.5
         },
         "evidence": {
-          "pearson_correlation": 0.9931594100094506,
-          "median_absolute_percentage_error": 0.016774318553553897,
-          "aligned_point_count": 72.0,
-          "coverage_ratio": 0.09863013698630137,
+          "pearson_correlation": 0.9930484191643817,
+          "median_absolute_percentage_error": 0.01744059623287944,
+          "aligned_point_count": 73.0,
+          "coverage_ratio": 0.1,
           "required_metric_statuses": {
             "pearson_correlation": {
               "status": "available",
@@ -661,7 +660,7 @@
     }
   },
   "quality": {
-    "status": "partial",
+    "status": "available",
     "required_classifications": [
       "realized_side_regime_1h",
       "realized_side_regime_24h",
@@ -684,11 +683,8 @@
     ],
     "missing_classifications": [],
     "invalid_classifications": [],
-    "partial_classifications": [
-      "pressure_regime"
-    ],
+    "partial_classifications": [],
     "unavailable_classifications": [
-      "event_activity_regime_15m",
       "event_activity_regime_1h",
       "estimated_long_concentration_regime",
       "composite_regime"

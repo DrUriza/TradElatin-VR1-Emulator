@@ -760,8 +760,9 @@ def build_reserve_age_context(miners_series: Mapping[str, Any], utxo_source: Map
 
 
 def build_miner_revenue_series(source: Mapping[str, Any], *, metric_id: str) -> dict[str, Any]:
-    endpoint_id = "revenue_sum" if metric_id == "miner_revenue_total_usd" else "volume_mined_sum"
-    return _simple_extension_series(source, metric_id=metric_id, unit="USD/day", provider="glassnode", endpoint_id=endpoint_id)
+    if metric_id != "miner_revenue_total_usd":
+        raise ValueError("only miner_revenue_total_usd is a provider revenue series; block/fee revenue are derived")
+    return _simple_extension_series(source, metric_id=metric_id, unit="USD/day", provider="glassnode", endpoint_id="revenue_sum")
 
 
 def _derived_revenue_series(metric_id: str, unit: str, feature: Mapping[str, Any], field: str) -> dict[str, Any]:
@@ -812,13 +813,18 @@ def _revenue_source_errors(source: Mapping[str, Any], metric_id: str, *, unit: s
     return _stable_unique(errors)
 
 
-def build_miner_revenue_breakdown(total_source: Mapping[str, Any], block_source: Mapping[str, Any], fee_source: Mapping[str, Any],
+def build_miner_revenue_breakdown(total_source: Mapping[str, Any], fee_source: Mapping[str, Any],
                                   *, input_data_as_of: int | None = None) -> dict[str, Any]:
-    sources = {"miner_revenue_total_usd": total_source, "miner_block_reward_revenue_usd": block_source, "miner_revenue_from_fees": fee_source}
+    """Derive fee and block-reward revenue from Glassnode total revenue + fee share.
+
+    Glassnode ``revenue_from_fees`` is the share of miner revenue attributable
+    to fees.  ``volume_mined_sum`` is therefore not required to reconstruct the
+    revenue breakdown and is not polled by the normal Screen contract.
+    """
+    sources = {"miner_revenue_total_usd": total_source, "miner_revenue_from_fees": fee_source}
     warnings = [f"input_series_warning:{metric_id}:{message}" for metric_id, source in sources.items() for message in source.get("warnings", [])]
     errors = [f"input_series_error:{metric_id}:{message}" for metric_id, source in sources.items() for message in source.get("errors", [])]
     errors.extend(_revenue_source_errors(total_source, "miner_revenue_total_usd", unit="USD/day", provider="glassnode", endpoint_id="revenue_sum"))
-    errors.extend(_revenue_source_errors(block_source, "miner_block_reward_revenue_usd", unit="USD/day", provider="glassnode", endpoint_id="volume_mined_sum"))
     errors.extend(_revenue_source_errors(fee_source, "miner_revenue_from_fees", unit="provider_native_percentage", provider="glassnode",
                                          endpoint_id="revenue_from_fees"))
     statuses = [str(source.get("status", "invalid")) for source in sources.values()]
@@ -829,44 +835,34 @@ def build_miner_revenue_breakdown(total_source: Mapping[str, Any], block_source:
         status = "unavailable"
         records = []
     else:
-        maps = [{record["timestamp"]: record for record in source.get("records", [])} for source in sources.values()]
-        common = sorted(set(maps[0]) & set(maps[1]) & set(maps[2]))
-        union = set(maps[0]) | set(maps[1]) | set(maps[2])
-        if set(common) != union:
+        total_map = {record["timestamp"]: record for record in total_source.get("records", [])}
+        fee_map = {record["timestamp"]: record for record in fee_source.get("records", [])}
+        common = sorted(set(total_map) & set(fee_map))
+        if set(common) != (set(total_map) | set(fee_map)):
             warnings.append("revenue_timestamp_alignment_incomplete")
         records = []
         invalid = False
         for timestamp in common:
             try:
-                total = _finite(maps[0][timestamp]["value"])
-                block = _finite(maps[1][timestamp]["value"])
-                provider_value = _finite(maps[2][timestamp]["value"])
-                if min(total, block, provider_value) < 0:
+                total = _finite(total_map[timestamp]["value"])
+                provider_value = _finite(fee_map[timestamp]["value"])
+                if total < 0 or provider_value < 0:
                     raise ValueError("revenue_values_must_be_non_negative")
-                if block > total and not math.isclose(total, block, rel_tol=REVENUE_RELATIVE_TOLERANCE, abs_tol=REVENUE_ABSOLUTE_TOLERANCE_USD):
-                    raise ValueError("block_reward_revenue_exceeds_total_revenue")
-                fee = 0.0 if block > total else _finite(total - block)
-                derived = None if total == 0 else _finite(fee / total)
-                record_warnings: list[str] = []
-                if derived is None:
-                    record_warnings.append("fee_share_unavailable_zero_total_revenue")
-                candidates = [("ratio", provider_value)] if 0 <= provider_value <= 1 else []
-                if 0 <= provider_value / 100 <= 1:
-                    candidates.append(("percent", provider_value / 100))
-                if derived is None or not candidates:
-                    scale, provider_ratio, difference = "unresolved", None, None
-                    record_warnings.append("provider_fee_scale_unresolved")
-                else:
-                    scale, provider_ratio = min(candidates, key=lambda item: (abs(item[1] - derived), 0 if item[0] == "ratio" else 1))
-                    difference = _finite(abs(provider_ratio - derived))
-                    if difference > FEE_SHARE_CONSISTENCY_TOLERANCE:
-                        record_warnings.append("provider_fee_share_inconsistent_with_derived")
-                records.append({"timestamp": timestamp, "total_revenue_usd": total, "block_reward_revenue_usd": block, "fee_revenue_usd": fee,
-                                "derived_fee_share_ratio": derived, "derived_fee_share_percent": None if derived is None else _finite(derived * 100),
-                                "provider_fee_value": provider_value, "provider_fee_scale": scale, "provider_fee_ratio": provider_ratio,
-                                "provider_fee_difference_ratio": difference, "unit": "USD/day",
-                                "status": "partial" if record_warnings else "available", "warnings": record_warnings, "errors": []})
-                warnings.extend(record_warnings)
+                # Glassnode fixtures and live endpoint commonly expose this as a
+                # percentage. Accept a ratio too so the contract remains robust.
+                provider_ratio = provider_value if 0 <= provider_value <= 1 else provider_value / 100.0
+                if not 0 <= provider_ratio <= 1:
+                    raise ValueError("provider_fee_share_out_of_range")
+                fee = _finite(total * provider_ratio)
+                block = _finite(total - fee)
+                records.append({"timestamp": timestamp, "total_revenue_usd": total,
+                                "block_reward_revenue_usd": block, "fee_revenue_usd": fee,
+                                "derived_fee_share_ratio": provider_ratio,
+                                "derived_fee_share_percent": _finite(provider_ratio * 100.0),
+                                "provider_fee_value": provider_value,
+                                "provider_fee_scale": "ratio" if provider_value <= 1 else "percent",
+                                "provider_fee_ratio": provider_ratio, "provider_fee_difference_ratio": 0.0,
+                                "unit": "USD/day", "status": "available", "warnings": [], "errors": []})
             except (KeyError, TypeError, ValueError) as exc:
                 invalid = True
                 errors.append(str(exc))
@@ -885,9 +881,9 @@ def build_miner_revenue_breakdown(total_source: Mapping[str, Any], block_source:
                                                                 "reason": "source_feature_invalid" if status == "invalid" else "no_common_revenue_timestamp"})
     return {"feature_id": "miner_revenue_breakdown", "status": status, "records": records, "current": current,
             "warnings": _stable_unique(warnings), "errors": _stable_unique(errors),
-            "metadata": {"alignment": "exact_timestamp_intersection", "fee_revenue_formula": "total_revenue_usd_minus_block_reward_revenue_usd",
-                         "provider_fee_scale_policy": "closest_to_derived_ratio", "consistency_tolerance_ratio": FEE_SHARE_CONSISTENCY_TOLERANCE,
-                         "data_as_of": current.get("timestamp") if current.get("status") in {"available", "partial"} else None}}
+            "metadata": {"alignment": "exact_timestamp_intersection", "fee_revenue_formula": "total_revenue_usd_times_provider_fee_share",
+                         "block_reward_formula": "total_revenue_usd_minus_fee_revenue_usd",
+                         "provider_fee_scale_policy": "ratio_or_percent", "data_as_of": current.get("timestamp") if current.get("status") in {"available", "partial"} else None}}
 
 
 def build_on_chain_miners_features(input_series: Mapping[str, Any], input_collections: Mapping[str, Any] | None = None,
@@ -953,9 +949,9 @@ def build_on_chain_miners_features(input_series: Mapping[str, Any], input_collec
         miners_unspent = build_miners_unspent_supply_series(input_series["miners_unspent_supply"])
         reserve_age = build_reserve_age_context(miners_unspent, input_series["utxo_age_distribution"])
         total_revenue = build_miner_revenue_series(input_series["miner_revenue_total_usd"], metric_id="miner_revenue_total_usd")
-        block_revenue = build_miner_revenue_series(input_series["miner_block_reward_revenue_usd"], metric_id="miner_block_reward_revenue_usd")
-        revenue = build_miner_revenue_breakdown(input_series["miner_revenue_total_usd"], input_series["miner_block_reward_revenue_usd"],
-                                                input_series["miner_revenue_from_fees"], input_data_as_of=input_data_as_of)
+        revenue = build_miner_revenue_breakdown(input_series["miner_revenue_total_usd"], input_series["miner_revenue_from_fees"],
+                                                input_data_as_of=input_data_as_of)
+        block_revenue = _derived_revenue_series("miner_block_reward_revenue_usd", "USD/day", revenue, "block_reward_revenue_usd")
         nupl = build_nupl_series(input_series["nupl"])
         direct_outflow = _copy_direct_value_series(input_series["miner_outflow_total"], metric_id="miner_outflow_total_btc",
                                                   unit="BTC/day", source_metric_id="miner_outflow_total")

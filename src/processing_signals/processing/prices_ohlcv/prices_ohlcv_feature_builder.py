@@ -5,7 +5,7 @@ from typing import Any, Mapping
 
 
 TIMEFRAME_ORDER = ("1m", "5m", "15m", "1h", "4h", "1d")
-MARKET_ORDER    = ("spot", "futures", "general")
+MARKET_ORDER    = ("spot", "futures")
 
 
 def build_market_series_features(market: Mapping[str, Any]) -> dict[str, Any]:
@@ -32,16 +32,15 @@ def build_main_ohlcv_features(markets: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def build_market_selector_features(markets: Mapping[str, Any]) -> dict[str, Any]:
-    # Prices-only presentation contract: HMI exposes one canonical market,
-    # ``general``, whose data is an exact alias of Spot.  Spot/Futures remain
-    # in Processing for internal comparison and confirmation.
-    available = ["general"] if any(
-        markets.get("general", {}).get("timeframes", {}).get(timeframe, {}).get("records")
+    # The current Prices HMI defaults to the real Spot market. Futures remains
+    # in Processing for basis and confirmation.
+    available = ["spot"] if any(
+        markets.get("spot", {}).get("timeframes", {}).get(timeframe, {}).get("records")
         for timeframe in TIMEFRAME_ORDER
     ) else []
     return {
-        "default_market": "general",
-        "selected_market": "general",
+        "default_market": "spot",
+        "selected_market": "spot",
         "available_markets": available,
         "timeframes": list(TIMEFRAME_ORDER),
         "default_timeframe": "1h",
@@ -116,7 +115,7 @@ def build_performance_features(results: Mapping[str, Any]) -> dict[str, Any]:
 
 def build_statistical_performance_features(results: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        "default_market": "general", "default_metrics_timeframe": "1h",
+        "default_market": "spot", "default_metrics_timeframe": "1h",
         "markets": {market: {timeframe: deepcopy(results.get(market, {}).get(timeframe, {})) for timeframe in TIMEFRAME_ORDER} for market in MARKET_ORDER},
         "statistics": build_statistical_features(results), "risk": build_risk_features(results),
         "performance": build_performance_features(results),

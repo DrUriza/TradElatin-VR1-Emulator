@@ -319,7 +319,78 @@ def _timeframe_payload(raw_payload: Mapping[str, Any] | None, existing: Mapping[
         "gaps": gaps, "stale": bool(request_error and records), "reason": reason if status != "available" else None}
 
 
+def _resample_ohlc_payload(source: Mapping[str, Any], existing: Mapping[str, Any] | None, metric_id: str,
+                           source_timeframe: str, target_timeframe: str, reference_timestamp: int) -> dict[str, Any]:
+    """Build complete higher-timeframe OHLC locally from persisted lower-timeframe bars.
+
+    Provider-native 15m history is retained from bootstrap. Incremental calls update
+    the current hierarchy without paying for 5m/15m/1h/4h/1d separately.
+    """
+    source_records = [copy.deepcopy(dict(row)) for row in source.get("records", []) if isinstance(row, Mapping)]
+    existing_records = copy.deepcopy(existing.get("records", [])) if isinstance(existing, Mapping) else []
+    source_seconds, target_seconds = TIMEFRAME_SECONDS[source_timeframe], TIMEFRAME_SECONDS[target_timeframe]
+    if target_seconds % source_seconds != 0 or target_seconds <= source_seconds:
+        raise ValueError("invalid_resample_timeframe")
+    factor = target_seconds // source_seconds
+    last_existing = max((row.get("timestamp") for row in existing_records if isinstance(row, Mapping) and type(row.get("timestamp")) is int), default=None)
+    phase = (last_existing % target_seconds) if last_existing is not None else (source_records[0]["timestamp"] % target_seconds if source_records else 0)
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    for row in source_records:
+        stamp = row.get("timestamp")
+        if type(stamp) is not int:
+            continue
+        bucket = phase + ((stamp - phase) // target_seconds) * target_seconds
+        buckets.setdefault(bucket, []).append(row)
+    incoming: list[dict[str, Any]] = []
+    for bucket in sorted(buckets):
+        if last_existing is not None and bucket < last_existing:
+            continue
+        rows = sorted(buckets[bucket], key=lambda row: row["timestamp"])
+        expected = [bucket + offset * source_seconds for offset in range(factor)]
+        if len(rows) != factor or [row["timestamp"] for row in rows] != expected:
+            continue
+        incoming.append({
+            "timestamp": bucket,
+            "open": rows[0]["open"],
+            "high": max(row["high"] for row in rows),
+            "low": min(row["low"] for row in rows),
+            "close": rows[-1]["close"],
+        })
+    records = upsert_records_by_timestamp(existing_records, incoming)
+    gaps = detect_internal_gaps(records, target_seconds)
+    source_status = source.get("status")
+    if records and not gaps and source_status in {"available", "partial"}:
+        status, reason = ("available", None) if source_status == "available" else ("partial", "source_partial")
+    elif records:
+        status, reason = "partial", "partial_response"
+    else:
+        status, reason = "unavailable", "insufficient_complete_source_bucket"
+    endpoint = "aggregated_open_interest_ohlc" if metric_id == "open_interest_ohlc" else "oi_weighted_funding_rate_ohlc"
+    unit = "USD" if metric_id == "open_interest_ohlc" else "percent_points"
+    return {
+        "status": status, "provider": "coinglass", "endpoint_id": endpoint, "timeframe": target_timeframe, "unit": unit,
+        "representation": "percentage_points" if metric_id == "funding_rate_ohlc" else None,
+        "incoming_records": incoming, "records": records, "invalid_records": [], "warnings": [],
+        "records_available": len(records), "incoming_valid_count": len(incoming), "incoming_invalid_count": 0,
+        "first_timestamp": records[0]["timestamp"] if records else None, "last_timestamp": records[-1]["timestamp"] if records else None,
+        "expected_interval_seconds": target_seconds, "gaps": gaps, "stale": bool(source.get("stale")),
+        "reason": reason if status != "available" else None,
+        "construction": {"method": "local_ohlc_resample", "source_timeframe": source_timeframe, "paid_request": False},
+    }
+
+
 def _snapshot_payload(raw_payload: Mapping[str, Any] | None, existing: Mapping[str, Any] | None, kind: str) -> dict[str, Any]:
+    # A missing payload can be intentional during an incremental cycle: optional
+    # secondary snapshots are refreshed on a slower cadence. Reuse the persisted
+    # normalized snapshot instead of turning a planned cache hit into a failure.
+    if raw_payload is None and isinstance(existing, Mapping):
+        cached = copy.deepcopy(dict(existing))
+        cached["stale"] = True
+        warnings = list(cached.get("warnings", []))
+        if "not_refreshed_this_cycle" not in warnings:
+            warnings.append("not_refreshed_this_cycle")
+        cached["warnings"] = warnings
+        return cached
     existing_records = copy.deepcopy(existing.get("records", [])) if isinstance(existing, Mapping) else []
     failed, structural, reason, rows = False, False, None, []
     if not isinstance(raw_payload, Mapping) or raw_payload.get("status") == "error":
@@ -369,6 +440,18 @@ def _normalize_snapshot_rows(rows: Sequence[Any], normalizer: Any) -> tuple[list
 
 def _confirmation_payload(raw_payload: Mapping[str, Any] | None, existing: Mapping[str, Any] | None, metric_id: str,
                           reference_timestamp: int) -> dict[str, Any]:
+    # Confirmation providers are deliberately slower-cadence sources. If this
+    # cycle did not request them, preserve the persisted series and mark it stale
+    # rather than reporting a provider error that never happened.
+    if raw_payload is None and isinstance(existing, Mapping):
+        cached = copy.deepcopy(dict(existing))
+        cached["incoming_records"] = []
+        cached["stale"] = True
+        warnings = list(cached.get("warnings", []))
+        if "not_refreshed_this_cycle" not in warnings:
+            warnings.append("not_refreshed_this_cycle")
+        cached["warnings"] = warnings
+        return cached
     existing_records = copy.deepcopy(existing.get("records", [])) if isinstance(existing, Mapping) else []
     metadata = CONFIRMATION_METADATA[metric_id]
     provider = metadata["provider"]
@@ -406,11 +489,29 @@ def preprocess_open_interest_and_funding_raw(raw_contract: Mapping[str, Any], *,
     series = {}
     for metric, endpoint, unit in (("open_interest_ohlc", "aggregated_open_interest_ohlc", "USD"),
                                    ("funding_rate_ohlc", "oi_weighted_funding_rate_ohlc", "percent_points")):
-        timeframes = {}
+        timeframes: dict[str, Any] = {}
         raw_frames = raw.get("series", {}).get(metric, {}).get("timeframes", {})
         old_frames = existing.get("series", {}).get(metric, {}).get("timeframes", {}) if existing else {}
-        for timeframe in SCREEN_TIMEFRAMES:
-            timeframes[timeframe] = _timeframe_payload(raw_frames.get(timeframe), old_frames.get(timeframe), metric, timeframe, context["reference_timestamp"])
+        # 1m is the recurring paid source. Bootstrap also loads provider-native
+        # 15m to seed deep history efficiently.
+        timeframes["1m"] = _timeframe_payload(raw_frames.get("1m"), old_frames.get("1m"), metric, "1m", context["reference_timestamp"])
+        if raw_frames.get("15m") is not None:
+            timeframes["15m"] = _timeframe_payload(raw_frames.get("15m"), old_frames.get("15m"), metric, "15m", context["reference_timestamp"])
+        else:
+            timeframes["15m"] = _resample_ohlc_payload(timeframes["1m"], old_frames.get("15m"), metric, "1m", "15m", context["reference_timestamp"])
+        # Prefer an explicit recovery response when present; otherwise build the
+        # remaining display timeframes locally from the canonical base source.
+        if raw_frames.get("5m") is not None:
+            timeframes["5m"] = _timeframe_payload(raw_frames.get("5m"), old_frames.get("5m"), metric, "5m", context["reference_timestamp"])
+        else:
+            timeframes["5m"] = _resample_ohlc_payload(timeframes["1m"], old_frames.get("5m"), metric, "1m", "5m", context["reference_timestamp"])
+        for timeframe in ("1h", "4h", "1d"):
+            if raw_frames.get(timeframe) is not None:
+                timeframes[timeframe] = _timeframe_payload(raw_frames.get(timeframe), old_frames.get(timeframe), metric, timeframe, context["reference_timestamp"])
+            else:
+                timeframes[timeframe] = _resample_ohlc_payload(timeframes["15m"], old_frames.get(timeframe), metric, "15m", timeframe, context["reference_timestamp"])
+        # Preserve the public ordering expected by Processing/HMI consumers.
+        timeframes = {timeframe: timeframes[timeframe] for timeframe in SCREEN_TIMEFRAMES}
         series[metric] = {"provider": "coinglass", "endpoint_id": endpoint, "unit": unit, "timeframes": timeframes}
         if metric == "funding_rate_ohlc":
             series[metric].update(representation="percentage_points", aggregation="open_interest_weighted")
@@ -473,11 +574,11 @@ class OpenInterestAndFundingInputPreprocessor:
 
     def run(self, *, reference_timestamp: int, requested_mode: str | None = None, recovery_requests: Sequence[Mapping[str, Any]] | None = None,
             include_snapshots: bool = True, include_confirmations: bool = True, data_mode: str = "live", is_demo: bool = False,
-            execution_timestamp: int | None = None) -> dict[str, Any]:
+            execution_timestamp: int | None = None, refresh_secondary: bool = False) -> dict[str, Any]:
         mode = self.determine_mode(requested_mode=requested_mode, recovery_requests=recovery_requests)
         raw = self.raw_extractor.extract(mode=mode, reference_timestamp=reference_timestamp, existing_state=self.existing_state,
             recovery_requests=recovery_requests, include_snapshots=include_snapshots, include_confirmations=include_confirmations,
-            data_mode=data_mode, is_demo=is_demo, execution_timestamp=execution_timestamp)
+            data_mode=data_mode, is_demo=is_demo, execution_timestamp=execution_timestamp, refresh_secondary=refresh_secondary)
         return self.preprocess_raw(raw)
 
 
@@ -485,8 +586,8 @@ def run_open_interest_and_funding_input(*, fetcher: OpenInterestAndFundingFetche
                                         requested_mode: str | None = None, recovery_requests: Sequence[Mapping[str, Any]] | None = None,
                                         existing_state: Mapping[str, Any] | None = None, include_snapshots: bool = True,
                                         include_confirmations: bool = True, data_mode: str = "live", is_demo: bool = False,
-                                        execution_timestamp: int | None = None) -> dict[str, Any]:
+                                        execution_timestamp: int | None = None, refresh_secondary: bool = False) -> dict[str, Any]:
     return OpenInterestAndFundingInputPreprocessor(OpenInterestAndFundingRawExtractor(fetcher), existing_state).run(
         reference_timestamp=reference_timestamp, requested_mode=requested_mode, recovery_requests=recovery_requests,
         include_snapshots=include_snapshots, include_confirmations=include_confirmations, data_mode=data_mode,
-        is_demo=is_demo, execution_timestamp=execution_timestamp)
+        is_demo=is_demo, execution_timestamp=execution_timestamp, refresh_secondary=refresh_secondary)

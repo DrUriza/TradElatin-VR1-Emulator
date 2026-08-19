@@ -50,15 +50,28 @@ def small_input(**overrides):
     return run_cvd_volume_orderflow_input(**options)
 
 
-def test_fetch_plan_contains_four_primary_requests_for_bootstrap_and_incremental():
-    for mode in ("bootstrap", "incremental"):
-        plan = build_cvd_volume_orderflow_fetch_plan(mode=mode, reference_timestamp=REFERENCE, include_footprint=False,
-            include_cryptoquant_confirmation=False, include_glassnode_confirmation=False)
-        assert [(item["market"], item["timeframe"]) for item in plan] == [
-            ("spot", "1m"), ("spot", "15m"), ("futures", "1m"), ("futures", "15m")]
-        assert [item["logical_request_id"] for item in plan] == [
-            "coinglass:spot:aggregated_cvd:1m", "coinglass:spot:aggregated_cvd:15m",
-            "coinglass:futures:aggregated_cvd:1m", "coinglass:futures:aggregated_cvd:15m"]
+def test_fetch_plan_bootstrap_keeps_1m_15m_but_incremental_pays_only_1m():
+    bootstrap = build_cvd_volume_orderflow_fetch_plan(mode="bootstrap", reference_timestamp=REFERENCE, include_footprint=False,
+        include_cryptoquant_confirmation=False, include_glassnode_confirmation=False)
+    assert [(item["market"], item["timeframe"]) for item in bootstrap] == [
+        ("spot", "1m"), ("spot", "15m"), ("futures", "1m"), ("futures", "15m")]
+    incremental = build_cvd_volume_orderflow_fetch_plan(mode="incremental", reference_timestamp=REFERENCE, include_footprint=False,
+        include_cryptoquant_confirmation=False, include_glassnode_confirmation=False)
+    assert [(item["market"], item["timeframe"]) for item in incremental] == [("spot", "1m"), ("futures", "1m")]
+
+
+def test_incremental_skips_secondary_sources_unless_explicitly_refreshed():
+    regular = build_cvd_volume_orderflow_fetch_plan(mode="incremental", reference_timestamp=REFERENCE)
+    assert len(regular) == 2
+    assert {item["dataset"] for item in regular} == {"aggregated_cvd"}
+
+    refreshed = build_cvd_volume_orderflow_fetch_plan(
+        mode="incremental", reference_timestamp=REFERENCE, refresh_secondary=True
+    )
+    assert len(refreshed) == 13
+    assert sum(item["dataset"] == "footprint" for item in refreshed) == 6
+    assert sum(item["provider"] == "cryptoquant" for item in refreshed) == 1
+    assert sum(item["provider"] == "glassnode" for item in refreshed) == 4
 
 
 def test_required_history_and_provider_params_are_frozen():
@@ -192,6 +205,25 @@ def test_bootstrap_shape_readiness_quality_and_no_downstream_fields():
     encoded = json.dumps(result, allow_nan=False)
     for forbidden in ("delta_usd", '"cvd_usd"', "buy_sell_ratio", "vwap", "imbalance", "flow_efficiency", "candlestick"):
         assert forbidden not in encoded
+
+
+def test_incremental_derives_complete_15m_bucket_from_persisted_1m_without_15m_request():
+    existing = small_input()
+    last_15m = existing["markets"]["spot"]["cvd"]["timeframes"]["15m"]["records"][-1]["timestamp"]
+    bucket = last_15m + 900
+
+    def incremental_fetcher(*, provider, endpoint_id, path, params):
+        if provider == "coinglass" and endpoint_id in {"spot_aggregated_cvd", "futures_aggregated_cvd"}:
+            return {"code": "0", "data": [cvd_row(bucket + i * 60, buy=10+i, sell=5+i) for i in range(15)]}
+        return response_for(provider, endpoint_id, params)
+
+    result = run_cvd_volume_orderflow_input(fetcher=incremental_fetcher, reference_timestamp=bucket + 14 * 60,
+        requested_mode="incremental", existing_input=existing, target_display_records=1, warmup_records=0,
+        include_footprint=False, include_cryptoquant_confirmation=False, include_glassnode_confirmation=False)
+    frame = result["markets"]["spot"]["cvd"]["timeframes"]["15m"]
+    assert frame["records"][-1]["timestamp"] == bucket
+    assert frame["provenance"]["construction"] == "local_resample_from_1m"
+    assert frame["provenance"]["paid_request"] is False
 
 
 def test_incremental_replaces_timestamp_and_preserves_older_history():

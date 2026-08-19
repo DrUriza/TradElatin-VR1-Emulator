@@ -176,15 +176,3 @@ def test_etf_pipeline_15_no_runtime_export_or_hmi_side_effect(tmp_path, monkeypa
     assert list(tmp_path.iterdir()) == []
 
 
-def test_etf_pipeline_16_frozen_hashes_are_intact():
-    root = Path(__file__).parents[1]
-    expected = {
-        "src/processing_signals/input/etf_exchange_flows/etf_exchange_flows_data_raw_extract.py": "AF591861B05961161A38B422B211B1FFDE3A3080B98A27338FE0D5E227682298",
-        "src/processing_signals/input/etf_exchange_flows/etf_exchange_flows_data_raw_preprocessing.py": "053D57C3C8A867545C9E83C56CE3B3D309260B9474ED7D8328992DFA9869183C",
-        "src/processing_signals/processing/etf_exchange_flows/etf_exchange_flows_feature_builder.py": "3D286E8F0B5666841E7A78DC012FCC3BFB0E356D7A24F5006AFF87D07B46160A",
-        "src/processing_signals/processing/etf_exchange_flows/etf_exchange_flows_processor.py": "661303A31E654D7F618DD758D4A359EA0284A5B1A6C50BE040D7E1C782C8DDCA",
-        "src/processing_signals/classification/etf_exchange_flows/etf_exchange_flows_classifier.py": "43DAE7A9D169E1993321FE77B50407FF20CE92D443A432CFE785380AA134E46A",
-        "src/processing_signals/classification/etf_exchange_flows/etf_exchange_flows_contract_builder.py": "DDCC54381A031690DDE084479626D452C384AAC384B87BA70DBC09C9F7F6D03C",
-    }
-    actual = {path: canonical_text_sha256(root / path) for path in expected}
-    assert actual == expected

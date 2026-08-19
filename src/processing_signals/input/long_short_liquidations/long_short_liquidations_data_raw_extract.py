@@ -16,7 +16,7 @@ GLASSNODE_PROVIDER = "glassnode"
 VALID_MODES = {"bootstrap", "incremental", "recovery"}
 DEFAULT_ASSET = "BTC"
 DEFAULT_INTERVAL = "1h"
-DEFAULT_HISTORY_HOURS = 72
+DEFAULT_HISTORY_HOURS = 730
 DEFAULT_INCREMENTAL_OVERLAP_H = 6
 DEFAULT_EVENT_LOOKBACK_H = 24
 DEFAULT_EVENT_OVERLAP_MINUTES = 15
@@ -30,6 +30,9 @@ GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID = "glassnode_long_liquidations"
 GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID = "glassnode_short_liquidations"
 GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID = "glassnode_total_liquidations"
 GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID = "glassnode_long_liquidation_dominance"
+COINGLASS_TOP_POSITION_ENDPOINT_ID = "top_position_long_short_ratio"
+COINGLASS_TOP_ACCOUNT_ENDPOINT_ID = "top_account_long_short_ratio"
+COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID = "global_account_long_short_ratio"
 
 RawFetcher = Callable[..., Any]
 Clock = Callable[[], int | float]
@@ -43,6 +46,9 @@ ENDPOINT_MANIFEST: dict[tuple[str, str], str] = {
     (COINGLASS_PROVIDER, "aggregated_liquidation_map"): "/api/futures/liquidation/aggregated-map",
     (COINGLASS_PROVIDER, "pair_liquidation_map"): "/api/futures/liquidation/map",
     (COINGLASS_PROVIDER, "liquidation_max_pain"): "/api/futures/liquidation/max-pain",
+    (COINGLASS_PROVIDER, COINGLASS_TOP_POSITION_ENDPOINT_ID): "/api/futures/top-long-short-position-ratio/history",
+    (COINGLASS_PROVIDER, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID): "/api/futures/top-long-short-account-ratio/history",
+    (COINGLASS_PROVIDER, COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID): "/api/futures/global-long-short-account-ratio/history",
     (CRYPTOQUANT_PROVIDER, "cryptoquant_liquidations"): "/btc/market-data/liquidations",
     (GLASSNODE_PROVIDER, GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID): "/v1/metrics/derivatives/futures_liquidated_volume_long_sum",
     (GLASSNODE_PROVIDER, GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID): "/v1/metrics/derivatives/futures_liquidated_volume_short_sum",
@@ -75,6 +81,15 @@ ENDPOINT_REQUEST_SCHEMAS: dict[tuple[str, str], dict[str, Any]] = {
         "dimensions": ("exchange", "asset", "symbol"),
     },
     (COINGLASS_PROVIDER, "liquidation_max_pain"): {"params": ("range",), "dimensions": ()},
+    (COINGLASS_PROVIDER, COINGLASS_TOP_POSITION_ENDPOINT_ID): {
+        "params": ("exchange", "symbol", "interval", "limit", "start_time", "end_time"), "dimensions": ("exchange", "asset", "symbol"),
+    },
+    (COINGLASS_PROVIDER, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID): {
+        "params": ("exchange", "symbol", "interval", "limit", "start_time", "end_time"), "dimensions": ("exchange", "asset", "symbol"),
+    },
+    (COINGLASS_PROVIDER, COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID): {
+        "params": ("exchange", "symbol", "interval", "limit", "start_time", "end_time"), "dimensions": ("exchange", "asset", "symbol"),
+    },
     (CRYPTOQUANT_PROVIDER, "cryptoquant_liquidations"): {
         "params": ("exchange", "symbol", "window", "from", "to", "limit", "format"),
         "dimensions": ("exchange", "asset", "symbol"),
@@ -181,7 +196,7 @@ def validate_request_contract(request: Mapping[str, Any], *, require_dimensions:
         raise ValueError("invalid_request_time_range")
     if "s" in schema["params"] and params["s"] > params["u"]:
         raise ValueError("invalid_request_time_range")
-    if endpoint_id in {"aggregated_liquidation_history", "pair_liquidation_history"} and params["interval"] not in _COINGLASS_INTERVALS:
+    if endpoint_id in {"aggregated_liquidation_history", "pair_liquidation_history", COINGLASS_TOP_POSITION_ENDPOINT_ID, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID, COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID} and params["interval"] not in _COINGLASS_INTERVALS:
         raise ValueError("invalid_request_param:interval")
     if endpoint_id == "liquidation_exchange_list" and params["range"] not in _EXCHANGE_RANGES:
         raise ValueError("invalid_request_param:range")
@@ -270,6 +285,8 @@ def build_long_short_liquidations_fetch_plan(
     max_pain_range: str = DEFAULT_MAX_PAIN_RANGE,
     recovery_requests: Sequence[Mapping[str, Any]] | None = None,
     refresh_discovery: bool = False,
+    include_confirmations: bool = True,
+    reuse_hourly: bool = False,
 ) -> list[dict[str, Any]]:
     """Build the deterministic endpoint plan without performing I/O."""
     if mode not in VALID_MODES:
@@ -312,31 +329,30 @@ def build_long_short_liquidations_fetch_plan(
     start, end = _window(reference_timestamp, history_window)
     limit = max(1, history_window)
     plan: list[dict[str, Any]] = []
-    if mode == "bootstrap" or refresh_discovery:
+    # Discovery and slow-changing views are bootstrap/hourly concerns. Event
+    # liquidation orders remain the only per-cycle REST primitive.
+    if (mode == "bootstrap" or refresh_discovery) and not reuse_hourly:
         plan.append(_request(COINGLASS_PROVIDER, "supported_exchange_pairs", {}, "all",
                              {"exchange": None, "asset": asset, "symbol": None}))
-    plan.append(_request(COINGLASS_PROVIDER, "aggregated_liquidation_history", {
-        "exchange_list": ",".join(exchanges), "symbol": asset, "interval": DEFAULT_INTERVAL,
-        "limit": limit, "start_time": start * 1000, "end_time": end * 1000,
-    }, f"{asset}:{DEFAULT_INTERVAL}:{start}:{end}",
-        {"exchange": None, "asset": asset, "symbol": asset}))
-    plan.append(_request(COINGLASS_PROVIDER, "liquidation_exchange_list", {
-        "symbol": asset, "range": exchange_range,
-    }, f"{asset}:{exchange_range}", {"exchange": None, "asset": asset, "symbol": asset}))
+    if not reuse_hourly:
+        plan.append(_request(COINGLASS_PROVIDER, "aggregated_liquidation_history", {
+            "exchange_list": ",".join(exchanges), "symbol": asset, "interval": DEFAULT_INTERVAL,
+            "limit": limit, "start_time": start * 1000, "end_time": end * 1000,
+        }, f"{asset}:{DEFAULT_INTERVAL}:{start}:{end}",
+            {"exchange": None, "asset": asset, "symbol": asset}))
+        positioning_limit = min(1000, max(1, history_window))
+        for endpoint_id in (COINGLASS_TOP_POSITION_ENDPOINT_ID, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID, COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID):
+            plan.append(_request(COINGLASS_PROVIDER, endpoint_id, {
+                "exchange": "Binance", "symbol": "BTCUSDT", "interval": DEFAULT_INTERVAL,
+                "limit": positioning_limit, "start_time": start * 1000, "end_time": end * 1000,
+            }, f"Binance:BTCUSDT:{DEFAULT_INTERVAL}:{start}:{end}",
+                {"exchange": "Binance", "asset": asset, "symbol": "BTCUSDT"}))
+        plan.append(_request(COINGLASS_PROVIDER, "liquidation_exchange_list", {
+            "symbol": asset, "range": exchange_range,
+        }, f"{asset}:{exchange_range}", {"exchange": None, "asset": asset, "symbol": asset}))
+
+    # High-frequency realized liquidation events: one stream/window per exchange.
     for exchange in exchanges:
-        pair = pairs.get(exchange)
-        if pair:
-            plan.append(_request(COINGLASS_PROVIDER, "pair_liquidation_history", {
-                "exchange": exchange, "symbol": pair, "interval": DEFAULT_INTERVAL,
-                "limit": limit, "start_time": start * 1000, "end_time": end * 1000,
-            }, f"{exchange}:{pair}:{start}:{end}",
-                {"exchange": exchange, "asset": asset, "symbol": pair}))
-        else:
-            plan.append({
-                **_request(COINGLASS_PROVIDER, "pair_liquidation_history", {}, f"{exchange}:skipped",
-                           {"exchange": exchange, "asset": asset, "symbol": None}),
-                "skip_reason": "pair_symbol_not_configured",
-            })
         cursor = (event_cursors or {}).get(exchange)
         if cursor is not None:
             event_start = cursor - event_overlap_minutes * 60
@@ -350,53 +366,46 @@ def build_long_short_liquidations_fetch_plan(
             "start_time": event_start * 1000, "end_time": end * 1000,
         }, f"{exchange}:{event_start}:{end}",
             {"exchange": exchange, "asset": asset, "symbol": asset}))
-    plan.append(_request(COINGLASS_PROVIDER, "aggregated_liquidation_map", {
-        "symbol": asset, "range": map_range,
-    }, f"{asset}:{map_range}", {"exchange": None, "asset": asset, "symbol": asset}))
-    for exchange in exchanges:
-        pair = pairs.get(exchange)
-        if pair:
-            plan.append(_request(COINGLASS_PROVIDER, "pair_liquidation_map", {
-                "exchange": exchange, "symbol": pair, "range": map_range,
-            }, f"{exchange}:{pair}:{map_range}",
-                {"exchange": exchange, "asset": asset, "symbol": pair}))
-        else:
-            plan.append({
-                **_request(COINGLASS_PROVIDER, "pair_liquidation_map", {}, f"{exchange}:skipped",
-                           {"exchange": exchange, "asset": asset, "symbol": None}),
-                "skip_reason": "pair_symbol_not_configured",
-            })
-    plan.append(_request(COINGLASS_PROVIDER, "liquidation_max_pain", {
-        "range": max_pain_range,
-    }, max_pain_range, {"exchange": None, "asset": asset, "symbol": asset}))
-    cq_common = {
-        "window": "hour",
-        "from": datetime.fromtimestamp(start, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "to": datetime.fromtimestamp(end, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "limit": limit, "format": "json",
-    }
-    plan.append(_request(CRYPTOQUANT_PROVIDER, "cryptoquant_liquidations", {
-        "exchange": "all_exchange", "symbol": "all_symbol", **cq_common,
-    }, f"aggregate:{start}:{end}",
-        {"exchange": "all_exchange", "asset": asset, "symbol": "all_symbol"}))
-    for exchange in cq_exchanges:
-        if exchange not in DEFAULT_CRYPTOQUANT_EXCHANGES:
-            continue
+
+    if not reuse_hourly:
+        plan.append(_request(COINGLASS_PROVIDER, "aggregated_liquidation_map", {
+            "symbol": asset, "range": map_range,
+        }, f"{asset}:{map_range}", {"exchange": None, "asset": asset, "symbol": asset}))
+        # Screen A only renders the Binance leverage map and Hyperliquid map.
+        for exchange in ("Binance", "Hyperliquid"):
+            pair = pairs.get(exchange)
+            if pair:
+                plan.append(_request(COINGLASS_PROVIDER, "pair_liquidation_map", {
+                    "exchange": exchange, "symbol": pair, "range": map_range,
+                }, f"{exchange}:{pair}:{map_range}",
+                    {"exchange": exchange, "asset": asset, "symbol": pair}))
+        # Max pain is a bootstrap/secondary diagnostic, not a recurrent Screen primitive.
+        if mode == "bootstrap":
+            plan.append(_request(COINGLASS_PROVIDER, "liquidation_max_pain", {
+                "range": max_pain_range,
+            }, max_pain_range, {"exchange": None, "asset": asset, "symbol": asset}))
+    if include_confirmations:
+        cq_common = {
+            "window": "hour",
+            "from": datetime.fromtimestamp(start, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": datetime.fromtimestamp(end, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": limit, "format": "json",
+        }
         plan.append(_request(CRYPTOQUANT_PROVIDER, "cryptoquant_liquidations", {
-            "exchange": exchange, "symbol": "btc_usdt", **cq_common,
-        }, f"{exchange}:{start}:{end}",
-            {"exchange": exchange, "asset": asset, "symbol": "btc_usdt"}))
-    for endpoint_id in (
-        GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID,
-        GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID,
-        GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID,
-        GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID,
-    ):
-        params = {"a": asset, "s": start, "u": end, "i": DEFAULT_INTERVAL, "f": "json", "timestamp_format": "unix"}
-        if endpoint_id != GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID:
-            params["c"] = "USD"
-        plan.append(_request(GLASSNODE_PROVIDER, endpoint_id, params, f"{asset}:{start}:{end}",
-                             {"exchange": None, "asset": asset, "symbol": asset}))
+            "exchange": "all_exchange", "symbol": "all_symbol", **cq_common,
+        }, f"aggregate:{start}:{end}",
+            {"exchange": "all_exchange", "asset": asset, "symbol": "all_symbol"}))
+        for endpoint_id in (
+            GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID,
+            GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID,
+            GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID,
+            GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID,
+        ):
+            params = {"a": asset, "s": start, "u": end, "i": DEFAULT_INTERVAL, "f": "json", "timestamp_format": "unix"}
+            if endpoint_id != GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID:
+                params["c"] = "USD"
+            plan.append(_request(GLASSNODE_PROVIDER, endpoint_id, params, f"{asset}:{start}:{end}",
+                                 {"exchange": None, "asset": asset, "symbol": asset}))
     return plan
 
 
@@ -526,21 +535,22 @@ class LongShortLiquidationsRawExtractor:
 
     def build_fetch_plan(self, *, mode: str, recovery_requests: Sequence[Mapping[str, Any]] | None = None,
                          event_cursors: Mapping[str, int] | None = None,
-                         refresh_discovery: bool = False) -> list[dict[str, Any]]:
+                         refresh_discovery: bool = False, include_confirmations: bool = True, reuse_hourly: bool = False) -> list[dict[str, Any]]:
         reference = int(self.clock()) if self.reference_timestamp is None else self.reference_timestamp
         return build_long_short_liquidations_fetch_plan(
             mode=mode, reference_timestamp=reference, recovery_requests=recovery_requests,
-            event_cursors=event_cursors, refresh_discovery=refresh_discovery, **self._options(),
+            event_cursors=event_cursors, refresh_discovery=refresh_discovery,
+            include_confirmations=include_confirmations, reuse_hourly=reuse_hourly, **self._options(),
         )
 
     def run(self, *, mode: str, recovery_requests: Sequence[Mapping[str, Any]] | None = None,
             event_cursors: Mapping[str, int] | None = None,
-            refresh_discovery: bool = False) -> dict[str, Any]:
+            refresh_discovery: bool = False, include_confirmations: bool = True, reuse_hourly: bool = False) -> dict[str, Any]:
         execution = int(self.clock())
         reference = execution if self.reference_timestamp is None else self.reference_timestamp
         return extract_long_short_liquidations_raw(
             fetcher=self.fetcher, mode=mode, reference_timestamp=reference,
             execution_timestamp=execution, minimum_event_window_seconds=self.minimum_event_window_seconds,
             recovery_requests=recovery_requests, event_cursors=event_cursors,
-            refresh_discovery=refresh_discovery, **self._options(),
+            refresh_discovery=refresh_discovery, include_confirmations=include_confirmations, reuse_hourly=reuse_hourly, **self._options(),
         )

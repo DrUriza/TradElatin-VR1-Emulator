@@ -125,17 +125,29 @@ def test_cross_market_kpis_and_provider_roles(vertical: dict[str, Any]) -> None:
         "spot_cvd_sum", "spot_vd_sum", "spot_buying_volume_sum", "spot_selling_volume_sum"))
 
 
-def test_screen_b_indicator_policy_is_precomputed_and_excludes_volume_mfi(vertical: dict[str, Any]) -> None:
+def test_screen_b_policy_is_native_orderflow_and_screen_a_has_only_six_mas(vertical: dict[str, Any]) -> None:
     ta = vertical["technical_analysis"]
     assert ta["recalculate_in_hmi"] is False
-    assert ta["selector_contract"]["excluded"] == ["volume", "mfi"]
-    expected = {"macd", "rsi", "tsi", "stochastic", "williams_r", "cci", "adx", "atr", "wasserstein_distance", "bollinger_band_width"}
+    assert ta["selector_contract"] == {
+        "trend": ["ema_9", "ema_21", "sma_20", "sma_50", "wma_20", "wma_50"],
+        "derived_analysis": ["cvd_slope_acceleration", "delta_zscore", "buy_sell_imbalance"],
+        "momentum": ["price_cvd_divergence", "spot_futures_divergence"],
+        "volatility": ["wasserstein_distance"],
+    }
+    expected = {
+        "cvd_slope_acceleration", "delta_zscore", "buy_sell_imbalance",
+        "price_cvd_divergence", "spot_futures_divergence", "wasserstein_distance",
+    }
     for market in ("spot", "futures"):
         for timeframe in TIMEFRAMES:
             payload = ta["markets"][market]["timeframes"][timeframe]
             assert set(payload["indicators"]) == expected
-            assert set(payload["overlays"]) == {"moving_averages", "bollinger_bands", "regression_channel"}
+            assert set(payload["overlays"]) == {"moving_averages"}
+            assert payload["overlays"]["moving_averages"]["series_ids"] == [
+                "ema_9", "ema_21", "sma_20", "sma_50", "wma_20", "wma_50"
+            ]
             assert payload["calculation_history_records"] <= 730
+            assert all(item["recalculate_in_hmi"] is False for item in payload["indicators"].values())
 
 
 def test_screen_contract_matches_final_cvd_sp_structure(vertical: dict[str, Any]) -> None:
@@ -146,6 +158,25 @@ def test_screen_contract_matches_final_cvd_sp_structure(vertical: dict[str, Any]
     assert tuple(candidate) == tuple(reference)
     _assert_same_structure(reference, candidate)
     json.dumps(candidate, ensure_ascii=False, allow_nan=False)
+
+
+def test_events_are_only_approved_ma_crosses_and_are_anchored_to_visible_window(vertical: dict[str, Any]) -> None:
+    allowed_pairs = {
+        frozenset(("ema_9", "ema_21")),
+        frozenset(("sma_20", "sma_50")),
+        frozenset(("wma_20", "wma_50")),
+    }
+    for market in ("spot", "futures"):
+        for timeframe in TIMEFRAMES:
+            payload = vertical["technical_analysis"]["markets"][market]["timeframes"][timeframe]
+            start = payload["timestamps"][0] if payload["timestamps"] else None
+            for event in payload["events"]:
+                calc = event["calculation"]
+                assert frozenset((calc["first_series"], calc["second_series"])) in allowed_pairs
+                assert start is None or event["timestamp"] >= start
+                assert event["display"]["marker_anchor"] == "exact_interpolated_cross"
+                assert event["event_timestamp_exact"] == calc["event_timestamp_exact"]
+                assert event["event_value_exact"] == calc["event_value_exact"]
 
 
 def test_delta_chart_is_owned_by_processing_not_hmi(vertical: dict[str, Any]) -> None:

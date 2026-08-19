@@ -8,14 +8,13 @@ from typing          import Any
 from processing_signals.processing.math.native_analysis import (rolling_zscore, rolling_mean, pct_change as native_pct_change, difference, rolling_wasserstein, latest, score_to_probability)
 
 from .on_chain_miners_feature_builder import build_on_chain_miners_features
-from .on_chain_miners_technical_analysis import build_on_chain_technical_analysis
 
 
 ON_CHAIN_MINERS_FAMILY = "on_chain_miners"
 VALID_MODES            = {"bootstrap", "incremental", "recovery"}
 EXPECTED_UNITS         = {"miner_reserve": "BTC", "sopr": "ratio", "hashrate": "H/s", "difficulty": "provider_native_difficulty", "miner_net_position_change": "BTC/day", "mpi": "z_score"}
 EXTENSION_EXPECTED_UNITS = {"miner_outflow_total": "BTC/day", "miners_unspent_supply": "BTC", "utxo_age_distribution": "mixed", "miner_revenue_total_usd": "USD/day",
-                            "miner_block_reward_revenue_usd": "USD/day", "miner_revenue_from_fees": "provider_native_percentage", "nupl": "ratio"}
+                            "miner_revenue_from_fees": "provider_native_percentage", "nupl": "ratio"}
 CORE_PROCESSING_SERIES = ("miner_reserve_btc", "sopr", "sopr_7d", "hashrate_eh_s", "difficulty_t", "miner_net_position_change", "mpi")
 EXTENSION_PROCESSING_SERIES = ("miners_unspent_supply_btc", "nupl", "miner_outflow_total_btc", "miner_revenue_total_usd",
                                "miner_block_reward_revenue_usd", "miner_fee_revenue_usd", "miner_fee_share_ratio")
@@ -375,21 +374,19 @@ class OnChainMinersProcessor:
             quality  = {"status": "invalid", "availability": invalid_availability, "data_as_of": None,
                         "input_status": self.input_contract.get("quality", {}).get("status") if isinstance(self.input_contract, Mapping) else "invalid",
                         "missing_fields": list(required_series), "warnings": [], "errors": errors}
-            technical_analysis = {"status": "invalid", "recalculate_in_hmi": False, "targets": {}}
         else:
             built    = build_on_chain_miners_features(self.input_contract["series"], self.input_contract.get("collections", {}),
                                                       input_data_as_of=self.input_contract.get("quality", {}).get("data_as_of"),
                                                       include_screen_extensions=include_screen_extensions)
             series   = built["series"]
             features = built["features"]
-            technical_analysis = build_on_chain_technical_analysis(series)
             quality  = evaluate_on_chain_miners_processing_quality(series=series, features=features, input_quality=self.input_contract.get("quality", {}),
                                                                     input_series=self.input_contract.get("series", {}),
                                                                     input_collections=self.input_contract.get("collections", {}),
                                                                     include_screen_extensions=include_screen_extensions)
         miner_analysis = _native_miner_analysis(series) if not errors else {"analysis_id":"native_miner_analysis_vr1","status":"invalid","timestamps":[],"indicators":{},"recalculate_in_hmi":False}
         output = {"family": ON_CHAIN_MINERS_FAMILY, "stage": "processing", "mode": mode, "context": output_context,
-                  "series": series, "features": features, "technical_analysis": technical_analysis, "miner_analysis": miner_analysis, "quality": quality}
+                  "series": series, "features": features, "miner_analysis": miner_analysis, "quality": quality}
         output, unsafe = _json_safe_copy(output)
         if unsafe:
             output["quality"].update({"status": "invalid", "data_as_of": None})

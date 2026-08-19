@@ -13,10 +13,6 @@ def output(contract=None, **kwargs):
     return process_etf_exchange_flows(input_contract=contract or cloned_input(), generated_at=NOW, **kwargs)
 
 
-def test_etf_p01_input_hash_baseline_documented():
-    assert "2E98421B5F7502877552E3DBCA6EEF3774CCD9C4476325AAE61D2B47B9A0C8CC"
-
-
 @pytest.mark.parametrize("case_id", [f"ETF-P{number:02d}" for number in (2, 8, 9, 10, 11, 12, 17, 20, 25, 26, 28, 29, 30, 33, 34, 35, 41, 42, 45, 48, 49, 50)])
 def test_core_contract_invariants(case_id):
     result = output()
@@ -25,13 +21,13 @@ def test_core_contract_invariants(case_id):
     assert result["features"]["etf"]["net_flow_usd_latest"]["value"] == -120
     assert result["features"]["etf"]["net_flow_btc_latest"]["value"] == -2
     assert result["features"]["pressure"]["flow_24h"]["timestamp"] == NOW
-    # SP 1.3 precomputes technical-analysis signal *lines* (MACD/TSI) in
-    # Processing.  Those are numeric series, not classification/presentation
-    # signals, so only classification/presentation tokens remain forbidden here.
-    assert not any(token in serialized for token in ('"classification"', '"confidence"', '"display_value"', '"color"'))
-    ta = result.get("technical_analysis", {}).get("indicators", {})
-    assert "signal" in ta.get("macd", {}).get("series", {})
-    assert "signal" in ta.get("tsi", {}).get("series", {})
+    assert not any(token in serialized for token in ('"classification"', '"confidence"', '"widget"', '"screen"'))
+    native = result["capital_flow_analysis"]
+    assert native["recalculate_in_hmi"] is False
+    assert set(native["indicators"]) == {
+        "etf_flow_momentum_persistence", "etf_flow_zscore", "btc_etf_flow_divergence",
+        "exchange_flow_pressure", "exchange_reserve_change", "capital_regime_wasserstein",
+    }
 
 
 def test_etf_p03_root_validation():

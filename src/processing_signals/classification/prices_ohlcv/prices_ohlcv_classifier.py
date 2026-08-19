@@ -29,7 +29,7 @@ ATR_MODERATE_PERCENT        = 1.50
 ATR_HIGH_PERCENT            = 3.00
 
 TIMEFRAME_ORDER = ("1m", "5m", "15m", "1h", "4h", "1d")
-MARKET_ORDER    = ("spot", "futures", "general")
+MARKET_ORDER    = ("spot", "futures")
 
 PRICE_RETURN_VOLATILITY_THRESHOLDS = {
     "1m": {"low": 0.0010, "high": 0.0030}, "5m": {"low": 0.0020, "high": 0.0060},

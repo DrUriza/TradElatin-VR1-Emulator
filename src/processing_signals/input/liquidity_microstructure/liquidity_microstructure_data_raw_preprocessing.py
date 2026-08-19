@@ -382,7 +382,8 @@ def run_liquidity_microstructure_input(*, fetcher: RawFetcher, requested_mode: s
     mode = determine_liquidity_microstructure_input_mode(requested_mode=requested_mode, existing_contract=existing_contract,
                                                          recovery_requests=recovery_requests)
     raw = extract_liquidity_microstructure_raw(fetcher=fetcher, mode=mode, reference_timestamp=reference_timestamp,
-                                                recovery_requests=recovery_requests, **plan_arguments)
+                                                recovery_requests=recovery_requests, existing_contract=existing_contract,
+                                                **plan_arguments)
     return LiquidityMicrostructureInputPreprocessor().preprocess(raw, existing_contract=existing_contract,
                                                                  reference_timestamp=reference_timestamp,
                                                                  execution_timestamp=execution_timestamp,

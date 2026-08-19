@@ -66,7 +66,7 @@ def _builder_arguments(processing: dict) -> dict:
             },
             "selected_range": "7d",
         },
-        "cvd_volume_orderflow": {"selected_market": "general", "selected_timeframe": "15m"},
+        "cvd_volume_orderflow": {"selected_market": "spot", "selected_timeframe": "15m"},
     }
 
 
@@ -134,14 +134,11 @@ def test_all_eight_families_run_raw_through_contract_builder() -> None:
     assert contracts["prices_ohlcv"]["selectors"]["market"]["options"] == ["spot", "futures"]
     assert "spot_futures" in contracts["prices_ohlcv"]["comparison"]
 
-    volatility_text = json.dumps(contracts["volatility_market_regimes"], ensure_ascii=False).lower()
-    for forbidden in ("deribit", "implied_volatility", "spread_volatility"):
-        assert forbidden not in volatility_text
-    providers = [
-        row["provider_id"]
-        for row in contracts["volatility_market_regimes"]["widgets"]["source_status"]["items"]
-    ]
-    assert providers == ["coinglass", "glassnode", "internal"]
+    volatility = contracts["volatility_market_regimes"]
+    assert volatility["schema_version"] == "2.0.0-native-volatility-screen-b-demo"
+    assert set(volatility["charts"]) == {"realized_volatility", "implied_volatility", "implied_vs_realized", "term_structure"}
+    assert "technical_analysis" not in volatility
+    assert volatility["volatility_analysis"]["recalculate_in_hmi"] is False
 
     liquidity = contracts["liquidity_microstructure"]
     assert liquidity["quality"]["status"] == "ok"

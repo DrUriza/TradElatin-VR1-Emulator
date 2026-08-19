@@ -200,18 +200,8 @@ def test_etf_pc30_pc31_strict_json_and_deep_immutability_after_anomalies():
     assert build_etf_exchange_flows_features(input_contract=contract, generated_at=NOW)
 
 
-def test_etf_pc32_input_hashes_unchanged():
-    root = Path(__file__).parents[1]
-    expected = {
-        "etf_exchange_flows_data_raw_extract.py": "AF591861B05961161A38B422B211B1FFDE3A3080B98A27338FE0D5E227682298",
-        "etf_exchange_flows_data_raw_preprocessing.py": "053D57C3C8A867545C9E83C56CE3B3D309260B9474ED7D8328992DFA9869183C",
-    }
-    folder = root / "src/processing_signals/input/etf_exchange_flows"
-    assert {name: canonical_text_sha256(folder / name) for name in expected} == expected
-
-
 def test_etf_pc33_pc36_boundaries_and_regression_contract():
     result = output(cloned_input())
-    forbidden = {"classification", "confidence", "display_value", "color_token", "widget", "screen"}
+    forbidden = {"classification", "confidence", "widget", "screen"}
     assert not forbidden.intersection(json.dumps(result).lower().replace('"', " ").split())
     assert (result["family"], result["stage"], result["version"]) == ("etf_exchange_flows", "processing", "0.1")

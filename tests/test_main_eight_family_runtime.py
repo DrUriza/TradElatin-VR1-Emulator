@@ -17,7 +17,7 @@ def test_main_runs_and_exports_all_eight_families(tmp_path: Path) -> None:
     assert tuple(output["input"]) == FAMILY_ORDER
     assert tuple(output["processing"]) == FAMILY_ORDER
     assert tuple(output["classification"]) == FAMILY_ORDER
-    assert tuple(output["hmi_contract"]) == FAMILY_ORDER
+    assert tuple(output["hmi"]) == FAMILY_ORDER
 
     liquidations_processing = output["processing"]["long_short_liquidations"]
     reference = liquidations_processing["maps"]["reference_price"]
@@ -29,7 +29,7 @@ def test_main_runs_and_exports_all_eight_families(tmp_path: Path) -> None:
     assert reference["timestamp_alignment"] == "synthetic_fixture_rebased_to_target_reference"
     assert liquidations_processing["realized"]["windows"]["24h"]["window_end"] <= liquidations_processing["reference_timestamp"]
 
-    liquidations_screen = output["hmi_contract"]["long_short_liquidations"]
+    liquidations_screen = output["hmi"]["long_short_liquidations"]
     current = next(item for item in liquidations_screen["kpis"] if item["id"] == "current_price")
     assert current["status"] == "available"
     assert current["value"] == reference["value"]
@@ -39,10 +39,11 @@ def test_main_runs_and_exports_all_eight_families(tmp_path: Path) -> None:
     manifest = json.loads(Path(publication["manifest"]).read_text(encoding="utf-8"))
     assert tuple(manifest["families"]) == FAMILY_ORDER
 
-    assert not (tmp_path / "contracts" / "hmi").exists()
+    assert (tmp_path / "contracts" / "hmi").is_dir()
+    assert not (tmp_path / "contracts" / "hmi_contract").exists()
 
     for family in FAMILY_ORDER:
         assert (tmp_path / "contracts" / "input" / f"{family}.json").exists()
         assert (tmp_path / "contracts" / "processing" / f"{family}.json").exists()
         assert (tmp_path / "contracts" / "classification" / f"{family}.json").exists()
-        assert (tmp_path / "contracts" / "hmi_contract" / SCREEN_FILENAMES[family]).exists()
+        assert (tmp_path / "contracts" / "hmi" / SCREEN_FILENAMES[family]).exists()

@@ -108,7 +108,7 @@ def _validate_screen(value: Any, classification: Mapping[str, Any]) -> dict[str,
     if not isinstance(value, Mapping):
         raise ValueError("vertical_output_invalid:screen")
     if (value.get("family") != FAMILY or value.get("screen") != FAMILY
-            or value.get("schema_version") != "1.11.0-oi-adx-crosses" or tuple(value) != SCREEN_ROOT):
+            or value.get("schema_version") != "1.12.0-oi-native-screen-b-demo" or tuple(value) != SCREEN_ROOT):
         raise ValueError("vertical_output_invalid:screen")
     classification_context = classification.get("context")
     if not isinstance(classification_context, Mapping):
@@ -176,6 +176,7 @@ def run_open_interest_and_funding_vertical(
     data_mode: str = "live",
     is_demo: bool = False,
     include_debug_bundle: bool = False,
+    refresh_secondary: bool = False,
 ) -> dict[str, Any]:
     """Execute injected Input once, then delegate to the pure vertical."""
     if mode not in MODES:
@@ -186,7 +187,8 @@ def run_open_interest_and_funding_vertical(
             raise _input_error(name)
     for name, value in (("include_snapshots", include_snapshots),
                         ("include_confirmations", include_confirmations),
-                        ("is_demo", is_demo), ("include_debug_bundle", include_debug_bundle)):
+                        ("is_demo", is_demo), ("include_debug_bundle", include_debug_bundle),
+                        ("refresh_secondary", refresh_secondary)):
         if type(value) is not bool:
             raise _input_error(name)
     if data_mode not in {"live", "synthetic"}:
@@ -217,6 +219,7 @@ def run_open_interest_and_funding_vertical(
             recovery_requests=requests_copy, existing_state=state_copy,
             include_snapshots=include_snapshots, include_confirmations=include_confirmations,
             data_mode=data_mode, is_demo=is_demo, execution_timestamp=execution_timestamp,
+            refresh_secondary=refresh_secondary,
         )
     except (KeyError, AttributeError, TypeError, ValueError) as exc:
         raise _input_error("runtime", exc) from exc

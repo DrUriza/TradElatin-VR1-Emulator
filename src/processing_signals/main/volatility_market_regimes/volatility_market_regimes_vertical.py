@@ -19,7 +19,7 @@ from processing_signals.processing.volatility_market_regimes.volatility_market_r
 VOLATILITY_MARKET_REGIMES_FAMILY = "volatility_market_regimes"
 VALID_VERTICAL_MODES             = {"bootstrap", "incremental", "recovery"}
 DEFAULT_SELECTED_RANGE           = "7d"
-DEFAULT_SCREEN_EXPORT_PATH       = Path("runtime/contracts/hmi_contract/volatility_market_regimes_screen.json")
+DEFAULT_SCREEN_EXPORT_PATH       = Path("runtime/contracts/hmi/volatility_market_regimes_screen.json")
 SCREEN_JSON_INDENT               = 2
 
 
@@ -127,7 +127,7 @@ def _check_stage(contract: Any, stage: str, mode: str) -> None:
     if not isinstance(contract, Mapping) or contract.get("family") != VOLATILITY_MARKET_REGIMES_FAMILY:
         raise ValueError("invalid_contract")
     if stage == "screen":
-        if contract.get("screen") != VOLATILITY_MARKET_REGIMES_FAMILY or contract.get("schema_version") != "1.2.0-no-regime-timeline":
+        if contract.get("screen") != VOLATILITY_MARKET_REGIMES_FAMILY or contract.get("schema_version") != "2.0.0-native-volatility-screen-b-demo":
             raise ValueError("invalid_screen_contract")
     elif contract.get("stage") != stage or contract.get("mode") != mode:
         raise ValueError("invalid_stage_contract")
@@ -154,7 +154,7 @@ class VolatilityMarketRegimesVertical:
             raise VolatilityMarketRegimesVerticalError("validation", "recovery_targets_required")
         try:
             raw_bundle = extract_volatility_market_regimes_raw(fetcher=fetcher, mode=mode, reference_timestamp=int(reference_timestamp),
-                recovery_requests=effective_requests, clock=execution_clock)
+                recovery_requests=effective_requests, clock=execution_clock, existing_contract=previous_input)
         except Exception as exc:
             raise VolatilityMarketRegimesVerticalError("raw_extract", "raw_extract_failed", str(exc)) from exc
         try:

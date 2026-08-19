@@ -1,7 +1,7 @@
 {
   "family": "on_chain_miners",
   "stage": "classification",
-  "mode": "incremental",
+  "mode": "bootstrap",
   "context": {
     "asset": "BTC",
     "data_mode": "synthetic",
@@ -166,7 +166,7 @@
     }
   },
   "quality": {
-    "status": "ok",
+    "status": "partial",
     "availability": {
       "miner_pressure": "available",
       "reserve_trend": "available",
@@ -175,9 +175,21 @@
       "nupl_phase": "available"
     },
     "data_as_of": 1786060800,
-    "processing_status": "ok",
+    "processing_status": "partial",
     "missing_fields": [],
-    "warnings": [],
+    "warnings": [
+      "processing_warning:mpi:source_series_partial:mpi",
+      "processing_warning:mpi:input_series_warning:mpi:requested_history_not_fully_covered",
+      "processing_warning:input_warning:mpi: requested_history_not_fully_covered",
+      "processing_warning:input_warning:utxo_age_distribution: requested_history_not_fully_covered",
+      "processing_warning:input_series_warning:mpi:requested_history_not_fully_covered",
+      "processing_warning:input_series_warning:utxo_age_distribution:requested_history_not_fully_covered",
+      "processing_warning:input_quality_partial",
+      "processing_warning:required_series_partial:mpi",
+      "processing_warning:required_series_partial:miner_outflow_distribution",
+      "processing_warning:required_series_partial:reserve_age_context",
+      "processing_quality_partial"
+    ],
     "errors": []
   }
 }

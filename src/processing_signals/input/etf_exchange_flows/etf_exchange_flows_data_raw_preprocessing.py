@@ -16,6 +16,9 @@ CQ_FIELDS = {"exchange_inflow": ("inflow_total", "inflow_top10", "inflow_mean"),
              "exchange_outflow": ("outflow_total", "outflow_top10", "outflow_mean"),
              "exchange_netflow": ("netflow_total",), "exchange_reserve": ("reserve",)}
 
+ETF_HOURLY_REFRESH_SECONDS = 3_600
+ETF_SLOW_REFRESH_SECONDS = 86_400
+
 
 def _timestamp(value: Any) -> int:
     if isinstance(value, bool):
@@ -215,6 +218,63 @@ def _normalize_glassnode(endpoint: str, interval: str, entry: Mapping[str, Any],
     return valid
 
 
+def _rollup_cryptoquant_hour_to_day(datasets: dict[str, Any], endpoint: str) -> None:
+    """Roll persisted hourly primitives into UTC-day records locally.
+
+    Inflow/outflow totals are additive; reserve is a state variable and uses the
+    final hourly observation in the UTC day.  This avoids a duplicate provider
+    day request on every incremental refresh while retaining the 1D Screen B
+    history contract.
+    """
+    hourly = datasets.get(endpoint, {}).get("hour", [])
+    if not isinstance(hourly, list) or not hourly:
+        return
+    grouped: dict[tuple[int, str], list[Mapping[str, Any]]] = {}
+    for row in hourly:
+        if not isinstance(row, Mapping) or type(row.get("timestamp")) is not int:
+            continue
+        day = int(row["timestamp"]) - int(row["timestamp"]) % 86_400
+        scope = str(row.get("exchange_scope") or "")
+        grouped.setdefault((day, scope), []).append(row)
+    derived: list[dict[str, Any]] = []
+    for (day, scope), rows in sorted(grouped.items()):
+        rows = sorted(rows, key=lambda item: int(item["timestamp"]))
+        item: dict[str, Any] = {
+            "timestamp": day, "window": "day", "exchange_scope": scope,
+            "provider": "cryptoquant", "endpoint_id": endpoint,
+        }
+        if endpoint == "exchange_reserve":
+            value = rows[-1].get("reserve")
+            if value is None:
+                continue
+            item["reserve"] = value
+        else:
+            any_numeric = False
+            for field in CQ_FIELDS[endpoint]:
+                values = [row.get(field) for row in rows if isinstance(row.get(field), (int, float)) and not isinstance(row.get(field), bool)]
+                item[field] = float(sum(values)) if values else None
+                any_numeric = any_numeric or bool(values)
+            if not any_numeric and all(row.get(field) is None for row in rows for field in CQ_FIELDS[endpoint]):
+                # Preserve the canonical day schema for an explicitly observed
+                # null provider record instead of silently dropping its fields.
+                pass
+        derived.append(item)
+    keys = ("endpoint_id", "window", "exchange_scope", "timestamp")
+    current = datasets.get(endpoint, {}).get("day", [])
+    # Keep the canonical rolling 730-day calculation window.  The hourly
+    # observation for the current UTC day replaces/extends the newest day, so
+    # the oldest day is dropped when the bootstrap seed already contains 730.
+    datasets[endpoint]["day"] = _upsert(current, derived, keys)[-730:]
+
+
+def _refresh_due(existing_contract: Mapping[str, Any] | None, *, now: int, key: str, interval: int) -> bool:
+    if not isinstance(existing_contract, Mapping):
+        return True
+    state = existing_contract.get("context", {}).get("api_refresh_state", {})
+    last = state.get(key) if isinstance(state, Mapping) else None
+    return type(last) is not int or now - last >= interval
+
+
 NATURAL_KEYS = {"etf_flows_daily": ("timestamp",), "etf_fund_flows_daily": ("timestamp", "ticker"),
     "etf_funds_snapshot": ("ticker",), "etf_net_assets_daily": ("timestamp", "scope", "ticker"),
     "etf_premium_discount_daily": ("timestamp", "ticker"), "exchange_balances_snapshot": ("exchange_name", "symbol"),
@@ -241,9 +301,14 @@ def determine_etf_exchange_flows_input_mode(*, existing_contract=None, recovery_
     if recovery_requests:
         return "recovery"
     datasets = existing_contract.get("datasets", {}) if isinstance(existing_contract, Mapping) else {}
-    required = all(datasets.get(key) for key in ("etf_flows_daily", "etf_funds_snapshot", "etf_net_assets_daily",
-                   "exchange_balances_snapshot", "exchange_balances_history"))
-    required = required and all(datasets.get(endpoint, {}).get(window) for endpoint in CQ_FIELDS for window in ("hour", "day"))
+    required = all(datasets.get(key) for key in (
+        "etf_flows_daily", "etf_funds_snapshot", "etf_net_assets_daily", "etf_premium_discount_daily"
+    ))
+    required = required and all(
+        datasets.get(endpoint, {}).get(window)
+        for endpoint in ("exchange_inflow", "exchange_outflow", "exchange_reserve")
+        for window in ("hour", "day")
+    )
     return "incremental" if required else "bootstrap"
 
 
@@ -299,6 +364,8 @@ class EtfExchangeFlowsInputPreprocessor:
             for window in ("hour", "day"):
                 keys = ("endpoint_id", "window", "exchange_scope", "timestamp")
                 datasets[endpoint][window] = _upsert(old.get(endpoint, {}).get(window, []), datasets[endpoint][window], keys)
+        for endpoint in ("exchange_inflow", "exchange_outflow", "exchange_reserve"):
+            _rollup_cryptoquant_hour_to_day(datasets, endpoint)
         old_secondary = old.get("secondary_sources", {}).get("glassnode", {})
         for endpoint, intervals in old_secondary.items():
             for interval, records in intervals.items():
@@ -339,6 +406,19 @@ class EtfExchangeFlowsInputPreprocessor:
             provenance["providers"][provider] = {"requested_endpoints": names,
                 "successful_endpoints": [name for name in names if endpoint_quality[name]["status"] in {"available", "partial"}],
                 "failed_endpoints": [name for name in names if endpoint_quality[name]["status"] in {"unavailable", "invalid"}]}
+        context = deepcopy(raw_contract.get("context", {}))
+        previous_state = self.existing.get("context", {}).get("api_refresh_state", {})
+        refresh_state = deepcopy(dict(previous_state)) if isinstance(previous_state, Mapping) else {}
+        refresh_timestamp = context.get("refresh_timestamp")
+        if type(refresh_timestamp) is int:
+            if raw_contract.get("mode") == "bootstrap" or context.get("refresh_hourly") is True:
+                refresh_state["hourly"] = refresh_timestamp
+            if raw_contract.get("mode") == "bootstrap" or context.get("refresh_slow") is True:
+                refresh_state["slow"] = refresh_timestamp
+            if context.get("include_secondary") is True:
+                refresh_state["secondary"] = refresh_timestamp
+        context["api_refresh_state"] = refresh_state
+
         output = {
             "schema": {"id": "trad_elatin.etf_exchange_flows.input.v1", "version": "1.0.0"},
             "family": FAMILY,
@@ -346,7 +426,7 @@ class EtfExchangeFlowsInputPreprocessor:
             "mode": raw_contract["mode"],
             "data_mode": raw_contract["data_mode"],
             "is_demo": raw_contract["is_demo"],
-            "context": deepcopy(raw_contract.get("context", {})),
+            "context": context,
             "requested_at": raw_contract["requested_at"],
             "generated_at": generated_at,
             "data_as_of": provenance["data_as_of"],
@@ -366,15 +446,37 @@ class EtfExchangeFlowsInputPreprocessor:
 
 def run_etf_exchange_flows_input(*, fetcher, existing_contract=None, requested_mode=None, recovery_requests=None,
                                  include_secondary=False, data_mode="live", is_demo=False, exchange_scope=None,
-                                 symbol="BTC", now=None, bootstrap_limits=None, incremental_limits=None):
+                                 symbol="BTC", now=None, bootstrap_limits=None, incremental_limits=None,
+                                 hourly_refresh_seconds: int = ETF_HOURLY_REFRESH_SECONDS,
+                                 slow_refresh_seconds: int = ETF_SLOW_REFRESH_SECONDS):
     timestamp = now() if callable(now) else now
     if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp <= 0:
         raise ValueError("now must provide a positive integer timestamp")
+    if type(hourly_refresh_seconds) is not int or hourly_refresh_seconds <= 0:
+        raise ValueError("invalid_hourly_refresh_seconds")
+    if type(slow_refresh_seconds) is not int or slow_refresh_seconds <= 0:
+        raise ValueError("invalid_slow_refresh_seconds")
     mode = determine_etf_exchange_flows_input_mode(existing_contract=existing_contract,
         recovery_requests=recovery_requests, requested_mode=requested_mode)
+    refresh_hourly = mode != "incremental" or _refresh_due(
+        existing_contract, now=timestamp, key="hourly", interval=hourly_refresh_seconds)
+    refresh_slow = mode != "incremental" or _refresh_due(
+        existing_contract, now=timestamp, key="slow", interval=slow_refresh_seconds)
+
+    # ETF data changes much more slowly than the one-minute market loop.  A
+    # warm cycle inside both TTLs is a true acquisition NOOP: reuse the persisted
+    # Input contract and spend zero provider calls.
+    if mode == "incremental" and not refresh_hourly and not refresh_slow and not include_secondary:
+        reused = deepcopy(dict(existing_contract or {}))
+        if reused:
+            reused["mode"] = "incremental"
+            return reused
+
     extractor = EtfExchangeFlowsRawExtractor(fetcher=fetcher, exchange_scope=exchange_scope, symbol=symbol,
         include_secondary=include_secondary, data_mode=data_mode, is_demo=is_demo)
     raw = extractor.run(mode=mode, now=timestamp, recovery_requests=recovery_requests,
-                        bootstrap_limits=bootstrap_limits, incremental_limits=incremental_limits)
+                        bootstrap_limits=bootstrap_limits, incremental_limits=incremental_limits,
+                        refresh_hourly=refresh_hourly, refresh_slow=refresh_slow)
     return EtfExchangeFlowsInputPreprocessor(existing_contract=existing_contract).run(raw,
         generated_at=datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z"))
+

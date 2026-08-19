@@ -68,9 +68,16 @@ def _raw(fetcher=_fetcher, **kwargs):
 
 def test_incremental_limits_and_overlap():
     plan = build_open_interest_and_funding_fetch_plan(mode="incremental", reference_timestamp=NOW)
-    for row in plan[:12]:
-        assert row["params"]["limit"] == INCREMENTAL_LIMITS[row["timeframe"]]
+    primary = [row for row in plan if row["request_kind"] == "timeframe_series"]
+    assert [(row["metric_id"], row["timeframe"]) for row in primary] == [
+        ("open_interest_ohlc", "1m"), ("funding_rate_ohlc", "1m")
+    ]
+    for row in primary:
+        assert row["params"]["limit"] == INCREMENTAL_LIMITS["1m"]
         assert row["from_timestamp"] < row["to_timestamp"]
+    assert [row["metric_id"] for row in plan if row["request_kind"] == "snapshot"] == [
+        "open_interest_exchange_list", "funding_rate_exchange_list"
+    ]
 
 
 def test_recovery_is_explicit_and_validated():
@@ -153,12 +160,12 @@ def test_invalid_record_is_partial_and_does_not_remove_history():
     existing = run_open_interest_and_funding_input(fetcher=_fetcher, reference_timestamp=NOW, requested_mode="bootstrap",
         execution_timestamp=NOW, data_mode="synthetic", is_demo=True)
     def bad_fetcher(**kwargs):
-        if kwargs["endpoint_id"] == "aggregated_open_interest_ohlc" and kwargs["params"].get("interval") == "1h":
+        if kwargs["endpoint_id"] == "aggregated_open_interest_ohlc" and kwargs["params"].get("interval") == "1m":
             return _coinglass_ohlc(value=-1)
         return _fetcher(**kwargs)
     output = run_open_interest_and_funding_input(fetcher=bad_fetcher, reference_timestamp=NOW + 3600, requested_mode="incremental",
         existing_state=existing, execution_timestamp=NOW + 3600, data_mode="synthetic", is_demo=True)
-    payload = output["series"]["open_interest_ohlc"]["timeframes"]["1h"]
+    payload = output["series"]["open_interest_ohlc"]["timeframes"]["1m"]
     assert payload["status"] == "partial" and payload["records"][0]["open"] == 100.0 and payload["incoming_invalid_count"] == 1
 
 
@@ -172,7 +179,11 @@ def test_snapshot_failure_preserves_history_and_optional_absence_is_not_invalid(
         existing_state=existing, execution_timestamp=NOW + 1, data_mode="synthetic", is_demo=True)
     assert output["snapshots"]["open_interest_by_exchange"]["status"] == "partial"
     assert output["snapshots"]["open_interest_by_exchange"]["stale"] is True
-    assert output["snapshots"]["options_open_interest"]["status"] == "partial"
+    # Options are intentionally not requested on a normal incremental cycle;
+    # the persisted snapshot is reused rather than reported as a provider failure.
+    assert output["snapshots"]["options_open_interest"]["status"] == "available"
+    assert output["snapshots"]["options_open_interest"]["stale"] is True
+    assert "not_refreshed_this_cycle" in output["snapshots"]["options_open_interest"]["warnings"]
     assert output["quality"]["status"] == "partial"
 
 
@@ -209,7 +220,17 @@ def test_mode_determination_and_foreign_state_rejection():
     assert determine_open_interest_and_funding_input_mode(requested_mode="recovery") == "recovery"
     assert determine_open_interest_and_funding_input_mode(recovery_requests=[{}]) == "recovery"
     output = preprocess_open_interest_and_funding_raw(_raw())
-    assert determine_open_interest_and_funding_input_mode(existing_state={"input": output}) == "incremental"
+    # A deliberately tiny fixture cannot complete every derived timeframe, so
+    # automatic mode detection correctly stays in bootstrap until all bases exist.
+    assert determine_open_interest_and_funding_input_mode(existing_state={"input": output}) == "bootstrap"
+    complete = copy.deepcopy(output)
+    for metric in ("open_interest_ohlc", "funding_rate_ohlc"):
+        frames = complete["series"][metric]["timeframes"]
+        seed = copy.deepcopy(frames["1m"]["records"][0])
+        for frame in frames.values():
+            if not frame["records"]:
+                frame["records"] = [copy.deepcopy(seed)]
+    assert determine_open_interest_and_funding_input_mode(existing_state={"input": complete}) == "incremental"
     with pytest.raises(ValueError):
         determine_open_interest_and_funding_input_mode(existing_state={"family": "prices_ohlcv", "stage": "input"})
 

@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from .long_short_liquidations_sp_v1_2_adapter import align_long_short_liquidations_to_sp_v1_2
+from .long_short_liquidations_sp_v1_3_adapter import align_long_short_liquidations_to_sp_v1_3
 
 VALID_STATUS = {"available", "partial", "unavailable", "invalid"}
 INTERVALS = {
@@ -419,8 +419,12 @@ def _aggregate_map(processing: Mapping[str, Any], classification: Mapping[str, A
     bucket_items = buckets.get("items", []) if isinstance(buckets, Mapping) else []
     central = [deepcopy(item) for item in bucket_items if isinstance(item, Mapping) and item.get("region") == "central"]
     exchange_points = {item["exchange"]: {point["bucket_index"]: point for point in item["points"]} for item in series}
-    long_curve = {item["price"]: item["cumulative_share"] for item in source.get("curves", {}).get("estimated_long", [])}
-    short_curve = {item["price"]: item["cumulative_share"] for item in source.get("curves", {}).get("estimated_short", [])}
+    raw_long_curve = source.get("curves", {}).get("estimated_long", [])
+    raw_short_curve = source.get("curves", {}).get("estimated_short", [])
+    long_curve = {item["price"]: item["cumulative_share"] for item in raw_long_curve
+                  if isinstance(item, Mapping) and "price" in item and "cumulative_share" in item}
+    short_curve = {item["price"]: item["cumulative_share"] for item in raw_short_curve
+                   if isinstance(item, Mapping) and "price" in item and "cumulative_share" in item}
     visual_buckets = [{"bucket_index": item["bucket_index"], "price_low": item["lower_price"],
         "price_center": item["center_price"], "price_high": item["upper_price"],
         "bars": {exchange.lower(): exchange_points.get(exchange, {}).get(item["bucket_index"], {}).get("level_total", 0)
@@ -533,7 +537,11 @@ def _confirmations(processing: Mapping[str, Any], classification: Mapping[str, A
             "pearson_correlation": value("pearson_correlation"), "mape": value("median_absolute_percentage_error"),
             "status": model["status"], "reason": model["reason"], "evidence": model["evidence"], "provenance": model["provenance"]})
     status = "available" if not rows else _combined_status(*(row["status"] for row in rows))
-    return {"id": "provider_confirmations", "status": status, "reason": None, "rows": rows}
+    reason = None if status != "unavailable" else next(
+        (row["reason"] for row in rows if row.get("reason")),
+        "provider_confirmations_unavailable",
+    )
+    return {"id": "provider_confirmations", "status": status, "reason": reason, "rows": rows}
 
 
 def _max_pain(processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
@@ -742,7 +750,7 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
         _with_view_id({**confirmations, "items": confirmations["rows"]}, view_id="provider_confirmations"), max_pain,
         _with_view_id({"status": quality["status"], "reason": None, "warnings": quality["warnings"],
                        "errors": quality["errors"]}, view_id="screen_quality_summary")]
-    result = {"contract_version": "1.2.0", "screen_id": "long_short_liquidations", "family": "long_short_liquidations",
+    result = {"contract_version": "1.3.0-native-liquidations-b", "screen_id": "long_short_liquidations", "family": "long_short_liquidations",
         "stage": "screen_contract_final", "reference_timestamp": processing["reference_timestamp"],
         "context": {**screen_context, "exchange_scope": selected["exchange"], "selected_interval": selected["interval"],
                     "available_intervals": list(INTERVALS)},
@@ -767,7 +775,7 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
         "history_contract": {"source_resolution": "1h", "map_time_semantics": "snapshot",
             "hmi_calculation": False, "fabricated_records": 0},
         "quality": quality, "warnings": warnings, "errors": errors}
-    result = align_long_short_liquidations_to_sp_v1_2(result, processing, classification, runtime)
+    result = align_long_short_liquidations_to_sp_v1_3(result, processing, classification, runtime)
     json.dumps(result, ensure_ascii=False, allow_nan=False)
     return result
 
@@ -786,7 +794,7 @@ class LongShortLiquidationsContractBuilder:
 
 
 def export_long_short_liquidations_contract(contract: Mapping[str, Any], path: str | Path =
-                                             "runtime/contracts/hmi_contract/long_short_liquidations_screen.json") -> Path:
+                                             "runtime/contracts/hmi/long_short_liquidations_screen.json") -> Path:
     contract = _mapping(contract, "contract")
     _json_safe(contract, "contract")
     destination = Path(path)

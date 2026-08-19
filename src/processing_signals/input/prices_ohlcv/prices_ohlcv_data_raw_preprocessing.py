@@ -347,7 +347,7 @@ class PricesOhlcvInputPreprocessor:
             "mode": mode,
             "context": {
                 "price_market": "spot",
-                "canonical_contract_market": "general",
+                "canonical_contract_market": "spot",
                 "canonical_source_market": "spot",
                 "available_markets": ["spot", "futures"],
                 "symbol": self.raw_extractor.symbol,
@@ -371,6 +371,7 @@ def run_prices_ohlcv_input(
     bootstrap_limit: int = 500,
     incremental_limits: Mapping[str, int] | None = None,
     include_glassnode: bool = True,
+    refresh_secondary: bool = False,
 ) -> dict[str, Any]:
     """Single public family facade backed by the OO implementation."""
     raw_extractor = PricesOhlcvRawExtractor(
@@ -380,6 +381,7 @@ def run_prices_ohlcv_input(
         bootstrap_limit=bootstrap_limit,
         incremental_limits=incremental_limits,
         include_glassnode=include_glassnode,
+        refresh_secondary=refresh_secondary,
     )
     preprocessor = PricesOhlcvInputPreprocessor(
         raw_extractor=raw_extractor,

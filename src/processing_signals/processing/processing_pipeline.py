@@ -54,9 +54,7 @@ def _run_oi(input_contract: Mapping[str, Any], *, existing_processing, now_times
 
 def _run_volatility(input_contract: Mapping[str, Any], *, existing_processing, now_timestamp, family_arguments):
     del existing_processing, now_timestamp
-    if family_arguments:
-        raise ValueError("volatility_market_regimes Processing does not accept family arguments")
-    return process_volatility_market_regimes(input_contract)
+    return process_volatility_market_regimes(input_contract, **dict(family_arguments))
 
 
 def _run_cvd(input_contract: Mapping[str, Any], *, existing_processing, now_timestamp, family_arguments):

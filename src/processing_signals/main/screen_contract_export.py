@@ -8,7 +8,7 @@ import tempfile
 from typing import Any
 
 
-CVD_VOLUME_ORDERFLOW_OUTPUT_PATH = Path("runtime/contracts/hmi_contract/cvd_volume_orderflow_screen.json")
+CVD_VOLUME_ORDERFLOW_OUTPUT_PATH = Path("runtime/contracts/hmi/cvd_volume_orderflow_screen.json")
 CVD_VOLUME_ORDERFLOW_SCREEN_ROOT = (
     "schema", "screen", "stage", "mode", "context", "badges", "selectors", "operational_status",
     "kpis", "charts", "tables", "drilldowns", "events", "availability", "quality", "technical_analysis",
@@ -89,7 +89,7 @@ def write_long_short_liquidations_screen_json(*, screen_contract: Mapping[str, A
         raise ValueError("Expected long_short_liquidations family")
     if screen_contract.get("screen_id") != "long_short_liquidations":
         raise ValueError("Expected long_short_liquidations screen_id")
-    if screen_contract.get("contract_version") != "1.2.0" or not isinstance(screen_contract.get("quality"), Mapping):
+    if screen_contract.get("contract_version") != "1.3.0-native-liquidations-b" or not isinstance(screen_contract.get("quality"), Mapping):
         raise ValueError("Invalid long_short_liquidations screen contract")
     serialized = json.dumps(screen_contract, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=False) + "\n"
     destination = Path(output_path)
@@ -112,7 +112,7 @@ def write_long_short_liquidations_screen_json(*, screen_contract: Mapping[str, A
 
 def export_long_short_liquidations_screen_json(*, vertical_output: Mapping[str, Any],
                                                output_path: str | Path =
-                                               "runtime/contracts/hmi_contract/long_short_liquidations_screen.json") -> Path:
+                                               "runtime/contracts/hmi/long_short_liquidations_screen.json") -> Path:
     screen = vertical_output.get("screen") if isinstance(vertical_output, Mapping) else None
     if not isinstance(screen, Mapping):
         raise ValueError("vertical_output must contain a mapping at 'screen'")
@@ -152,7 +152,7 @@ def write_on_chain_miners_screen_json(*, screen_contract: Mapping[str, Any],
 
 def export_on_chain_miners_screen_json(*, vertical_output: Mapping[str, Any],
                                        output_path: str | Path =
-                                       "runtime/contracts/hmi_contract/on_chain_miners_screen.json") -> Path:
+                                       "runtime/contracts/hmi/on_chain_miners_screen.json") -> Path:
     screen = vertical_output.get("screen") if isinstance(vertical_output, Mapping) else None
     if not isinstance(screen, Mapping):
         raise ValueError("vertical_output must contain a mapping at 'screen'")
@@ -170,8 +170,11 @@ def write_etf_exchange_flows_screen_json(*, screen_contract: Mapping[str, Any],
     if (not isinstance(screen, Mapping) or screen.get("id") != "etf_exchange_flows" or
             screen.get("family") != "etf_exchange_flows"):
         raise ValueError("Expected etf_exchange_flows screen identity")
-    if (screen_contract.get("stage") != "screen_contract" or screen_contract.get("version") != "0.1" or
-            not isinstance(screen_contract.get("quality"), Mapping)):
+    if (screen_contract.get("stage") != "screen_contract" or
+            screen_contract.get("version") != "1.4.1-exchange-reserve-realism-v4" or
+            schema.get("version") != "1.4.1-exchange-reserve-realism-v2" or
+            not isinstance(screen_contract.get("quality"), Mapping) or
+            not isinstance(screen_contract.get("capital_flow_analysis"), Mapping)):
         raise ValueError("Invalid etf_exchange_flows screen contract")
     serialized = json.dumps(screen_contract, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=False) + "\n"
     destination = Path(output_path)
@@ -194,7 +197,7 @@ def write_etf_exchange_flows_screen_json(*, screen_contract: Mapping[str, Any],
 
 def export_etf_exchange_flows_screen_json(*, vertical_output: Mapping[str, Any],
                                           output_path: str | Path =
-                                          "runtime/contracts/hmi_contract/etf_exchange_flows_screen.json") -> Path:
+                                          "runtime/contracts/hmi/etf_exchange_flows_screen.json") -> Path:
     screen = vertical_output.get("screen") if isinstance(vertical_output, Mapping) else None
     if not isinstance(screen, Mapping):
         raise ValueError("vertical_output must contain a mapping at 'screen'")

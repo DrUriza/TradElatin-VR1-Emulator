@@ -10,11 +10,12 @@ from typing import Any, Iterator
 
 import pytest
 
+from processing_signals.runtime.contract_validator import CANONICAL_TEMPLATE_PATHS
+
 
 ROOT = Path(__file__).parents[1]
 CONTRACTS = ROOT / "runtime" / "contracts"
-REFERENCE = CONTRACTS / "hmi"
-GENERATED = CONTRACTS / "hmi_contract"
+GENERATED = CONTRACTS / "hmi"
 FAMILIES = {
     "prices_ohlcv": ("prices_VR1_FINAL.json", "prices_screen.json"),
     "cvd_volume_orderflow": ("cvd_volume_orderflow_VR1_FINAL.json", "cvd_volume_orderflow_screen.json"),
@@ -36,8 +37,9 @@ def _load(path: Path) -> dict[str, Any]:
 @pytest.fixture(scope="session", params=tuple(FAMILIES))
 def contracts(request: pytest.FixtureRequest) -> tuple[str, dict[str, Any], dict[str, Any]]:
     family = str(request.param)
-    reference_name, generated_name = FAMILIES[family]
-    return family, _load(REFERENCE / reference_name), _load(GENERATED / generated_name)
+    _, generated_name = FAMILIES[family]
+    reference_path = ROOT / CANONICAL_TEMPLATE_PATHS[family]
+    return family, _load(reference_path), _load(GENERATED / generated_name)
 
 
 def _walk(value: Any, path: str = "$") -> Iterator[tuple[str, Any]]:
@@ -140,11 +142,26 @@ def test_hmi_computation_policy_and_family_exceptions(contracts: tuple[str, dict
     if family == "open_interest_and_funding":
         assert generated["technical_analysis"].get("canonical_location") == "technical_analysis"
         assert generated["technical_analysis"].get("enabled") is True
+    if family == "etf_exchange_flows":
+        assert "technical_analysis" not in generated
+        assert set(generated["capital_flow_analysis"]["indicators"]) == {
+            "etf_flow_momentum_persistence", "etf_flow_zscore", "btc_etf_flow_divergence",
+            "exchange_flow_pressure", "exchange_reserve_change", "capital_regime_wasserstein",
+        }
+        assert generated["charts"]["exchange_balance"].get("technical_analysis_allowed") is False
+    if family == "on_chain_miners":
+        assert "technical_analysis" not in generated
+        assert set(generated["miner_analysis"]["indicators"]) == {
+            "miner_reserve_change_zscore", "miner_selling_pressure", "puell_revenue_stress",
+            "hashrate_momentum_hash_ribbon", "hashrate_difficulty_stress",
+            "miner_capitulation_recovery_regime",
+        }
+        assert all(item.get("hmi_recalculate") is False for item in generated["miner_analysis"]["indicators"].values())
 
 
 def test_manifest_publishes_exactly_eight_outputs() -> None:
     manifest = _load(CONTRACTS / "run_manifest.json")
-    published = manifest["paths"]["hmi_contract"]
+    published = manifest["paths"]["hmi"]
     assert set(published) == set(FAMILIES)
     assert len(set(published.values())) == 8
     for relative_path in published.values():

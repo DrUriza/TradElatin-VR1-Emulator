@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .on_chain_miners_sp_v1_3_adapter import align_on_chain_miners_to_sp_v1_3
+from .on_chain_miners_sp_v2_0_adapter import align_on_chain_miners_to_sp_v2_0
 
 import copy
 import json
@@ -665,7 +665,7 @@ class OnChainMinersContractBuilder:
                       len(processing["series"][series_id].get("records", [])) for series_id, *_ in SERIES_CONFIG.values()),
                       "status": "blocked_upstream", "fabricated_records": 0},
                   "quality": quality}
-        output = align_on_chain_miners_to_sp_v1_3(output, processing, classification)
+        output = align_on_chain_miners_to_sp_v2_0(output, processing, classification)
         copied, copy_errors = copy_json_safe_value(output, path="screen_contract")
         if copy_errors:
             output = _fallback(mode, copy_errors)

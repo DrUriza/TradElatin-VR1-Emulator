@@ -206,9 +206,65 @@ def support_resistance_levels(
     resistances = [x for x in clusters if x["kind"] == "resistance" and x["value"] > valid_close]
     supports.sort(key=lambda x: (valid_close - x["value"], -x["touches"], -x["last_index"]))
     resistances.sort(key=lambda x: (x["value"] - valid_close, -x["touches"], -x["last_index"]))
+
+    support_values = [float(x["value"]) for x in supports[:levels]]
+    resistance_values = [float(x["value"]) for x in resistances[:levels]]
+
+    # Sparse swing clusters can legitimately produce fewer than the three
+    # horizontal levels required by Screen A. Fill only the missing slots with
+    # the nearest distinct observed lows/highs from the same lookback window.
+    # This remains a direct market-data calculation; no HMI placeholder values
+    # or synthetic offsets are introduced.
+    def fill_nearest(selected: list[float], observed: Sequence[float | None], *, below: bool) -> list[float]:
+        candidates = sorted(
+            {float(v) for v in observed if v is not None and ((v < valid_close) if below else (v > valid_close))},
+            key=lambda v: (valid_close - v) if below else (v - valid_close),
+        )
+        for value in candidates:
+            fallback_tolerance = max(abs(valid_close) * 0.0002, 1e-12)
+            if any(abs(value - existing) <= fallback_tolerance for existing in selected):
+                continue
+            selected.append(value)
+            if len(selected) >= levels:
+                break
+        return selected[:levels]
+
+    support_values = sorted(fill_nearest(support_values, l, below=True), reverse=True)[:levels]
+    resistance_values = sorted(fill_nearest(resistance_values, h, below=False))[:levels]
+
+    # In edge regimes (for example price sitting at a 500-bar low) there may
+    # simply be fewer than N observed extrema below/above spot. Screen A still
+    # requires three deterministic levels, so complete the sparse side with a
+    # volatility/range-derived projection. This fallback is explicitly marked
+    # as calculated rather than pretending an observed swing existed.
+    finite_highs = [float(v) for v in h if v is not None]
+    finite_lows = [float(v) for v in l if v is not None]
+    span = (max(finite_highs) - min(finite_lows)) if finite_highs and finite_lows else 0.0
+    step = max(span / max(8, levels * 4), abs(valid_close) * 0.0025, 1e-9)
+    fallback_used = False
+    k = 1
+    while len(support_values) < levels:
+        value = float(valid_close - step * k)
+        k += 1
+        if any(abs(value - existing) <= max(abs(valid_close) * 0.0002, 1e-12) for existing in support_values):
+            continue
+        support_values.append(value)
+        fallback_used = True
+    k = 1
+    while len(resistance_values) < levels:
+        value = float(valid_close + step * k)
+        k += 1
+        if any(abs(value - existing) <= max(abs(valid_close) * 0.0002, 1e-12) for existing in resistance_values):
+            continue
+        resistance_values.append(value)
+        fallback_used = True
+    support_values = sorted(support_values, reverse=True)[:levels]
+    resistance_values = sorted(resistance_values)[:levels]
     return {
-        "support": [float(x["value"]) for x in supports[:levels]],
-        "resistance": [float(x["value"]) for x in resistances[:levels]],
+        "support": support_values,
+        "resistance": resistance_values,
+        "method": "swing_clusters_with_range_fallback" if fallback_used else "swing_clusters",
+        "fallback_used": fallback_used,
     }
 
 

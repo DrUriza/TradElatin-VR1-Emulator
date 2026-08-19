@@ -110,11 +110,11 @@ def align_prices_contract_to_sp_v1_9(candidate: Mapping[str, Any]) -> dict[str, 
     aligned["schema_version"] = SP_SCHEMA_VERSION
 
     context = aligned.get("context", {})
-    context["default_market"] = "general"
-    context["available_markets"] = ["general"]
-    context["price_role"] = "canonical_general_reference"
-    context["market_scope"] = "single_general_market"
-    context["price_construction"] = "direct_general_reference_series"
+    context["default_market"] = "spot"
+    context["available_markets"] = ["spot"]
+    context["price_role"] = "canonical_spot_reference"
+    context["market_scope"] = "single_spot_market"
+    context["price_construction"] = "direct_spot_reference_series"
     # Never describe a live provider run as a synthetic fixture merely because
     # the SP reference used a calibrated visual fixture.
     if not bool(context.get("is_demo", False)):
@@ -122,12 +122,12 @@ def align_prices_contract_to_sp_v1_9(candidate: Mapping[str, Any]) -> dict[str, 
         context["fixture_as_of_timestamp"] = None
         context["fixture_as_of_iso"] = None
         context["realism_refactor_version"] = "runtime_provider_v1"
-        context["realism_note"] = "runtime provider data; general is canonical CoinGlass Spot"
+        context["realism_note"] = "runtime provider data; spot is canonical CoinGlass Spot"
     aligned["context"] = context
 
     selectors = aligned.get("selectors", {})
     if isinstance(selectors.get("market"), dict):
-        selectors["market"].update({"selected": "general", "options": ["general"], "status": "fixed", "visible": False})
+        selectors["market"].update({"selected": "spot", "options": ["spot"], "status": "fixed", "visible": False})
     aligned["selectors"] = selectors
 
     # VR1-final makes Screen B canonical at the root.  Promote the already
@@ -135,10 +135,19 @@ def align_prices_contract_to_sp_v1_9(candidate: Mapping[str, Any]) -> dict[str, 
     chart_analysis = aligned.get("charts", {}).get("ohlcv", {}).get("technical_fundamental_analysis")
     if isinstance(chart_analysis, Mapping):
         root_analysis = deepcopy(dict(chart_analysis))
+        # Root technical_analysis is the canonical Screen B package. Preserve
+        # the oscillator display contract that lives only at the root in the
+        # final Screens schema.
+        root_reference = reference.get("technical_analysis", {})
+        oscillator_contract = aligned.get("technical_analysis", {}).get(
+            "oscillator_display_contract",
+            deepcopy(root_reference.get("oscillator_display_contract")),
+        )
         root_analysis.update({
             "canonical_location": "technical_analysis",
             "compatibility_mirror": False,
             "legacy_mirror_paths": ["charts.ohlcv.technical_fundamental_analysis"],
+            "oscillator_display_contract": oscillator_contract,
         })
         aligned["technical_analysis"] = root_analysis
         chart_analysis.update({

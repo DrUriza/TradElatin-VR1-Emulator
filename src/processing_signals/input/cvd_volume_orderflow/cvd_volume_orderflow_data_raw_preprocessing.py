@@ -276,6 +276,62 @@ def _primary_payload(pages: Sequence[Mapping[str, Any]], existing: Mapping[str, 
         "provenance": {"provider": "coinglass", "dataset": "aggregated_cvd", "timeframe": timeframe}}
 
 
+def _derive_15m_from_1m(one_minute: Mapping[str, Any], existing: Mapping[str, Any] | None, required: int) -> dict[str, Any]:
+    """Update the persisted 15m CVD base locally from complete 1m buckets.
+
+    Bootstrap still comes from the provider-native 15m endpoint.  This function
+    is only the incremental bridge that prevents a second paid timeframe call.
+    """
+    source = [row for row in one_minute.get("records", []) if isinstance(row, Mapping)]
+    existing_records = copy.deepcopy(existing.get("records", [])) if isinstance(existing, Mapping) else []
+    last_existing = max((row.get("timestamp") for row in existing_records if isinstance(row, Mapping) and type(row.get("timestamp")) is int), default=None)
+    # Provider fixtures and some venues can carry a stable non-zero timestamp
+    # phase. Preserve the native 15m phase instead of assuming epoch modulo 900.
+    phase = (last_existing % TIMEFRAME_SECONDS["15m"]) if last_existing is not None else (source[0]["timestamp"] % TIMEFRAME_SECONDS["15m"] if source else 0)
+    buckets: dict[int, list[Mapping[str, Any]]] = {}
+    for row in source:
+        stamp = row.get("timestamp")
+        if type(stamp) is not int:
+            continue
+        bucket = phase + ((stamp - phase) // TIMEFRAME_SECONDS["15m"]) * TIMEFRAME_SECONDS["15m"]
+        buckets.setdefault(bucket, []).append(row)
+    incoming: list[dict[str, Any]] = []
+    for bucket in sorted(buckets):
+        if last_existing is not None and bucket < last_existing:
+            continue
+        rows = sorted(buckets[bucket], key=lambda row: row["timestamp"])
+        one_minute_phase = rows[0]["timestamp"] % TIMEFRAME_SECONDS["1m"]
+        expected = [bucket + one_minute_phase + offset * TIMEFRAME_SECONDS["1m"] for offset in range(15)]
+        # If the provider 15m phase already includes the minute phase, avoid
+        # double counting it (the common case).
+        if rows and rows[0]["timestamp"] == bucket:
+            expected = [bucket + offset * TIMEFRAME_SECONDS["1m"] for offset in range(15)]
+        if len(rows) != 15 or [row["timestamp"] for row in rows] != expected:
+            continue
+        incoming.append({
+            "timestamp": bucket,
+            "taker_buy_volume_usd": sum(float(row["taker_buy_volume_usd"]) for row in rows),
+            "taker_sell_volume_usd": sum(float(row["taker_sell_volume_usd"]) for row in rows),
+            "provider_cvd_usd": rows[-1].get("provider_cvd_usd"),
+        })
+    records, upsert = upsert_records_by_timestamp(existing_records, incoming)
+    gaps = detect_internal_gaps(records, TIMEFRAME_SECONDS["15m"])
+    status, reason = _status(structural=False, records=records, failed=False, invalid=[], gaps=gaps, insufficient=len(records) < required)
+    earliest_required = records[-1]["timestamp"] - (required - 1) * TIMEFRAME_SECONDS["15m"] if records else None
+    return {
+        "status": status, "reason": reason, "records": records, "incoming_records": incoming, "invalid_records": [],
+        "records_required": required, "records_available": len(records), "missing_records": max(0, required - len(records)),
+        "earliest_required_timestamp": earliest_required, "earliest_available_timestamp": records[0]["timestamp"] if records else None,
+        "expected_interval_seconds": TIMEFRAME_SECONDS["15m"], "gaps": gaps,
+        "pagination": {"pages_requested": 0, "pages_succeeded": 0, "pages_failed": 0, "records_raw": 0,
+                       "records_unique": len(incoming), "duplicates_removed": 0, "pagination_complete": True,
+                       "pagination_stop_reason": "derived_from_1m"},
+        "upsert": upsert,
+        "provenance": {"provider": "coinglass", "dataset": "aggregated_cvd", "timeframe": "15m",
+                       "construction": "local_resample_from_1m", "paid_request": False},
+    }
+
+
 def _optional_payload(pages: Sequence[Mapping[str, Any]], existing: Mapping[str, Any] | None, provider: str,
                       dataset: str, enabled: bool) -> dict[str, Any]:
     if not enabled:
@@ -425,8 +481,13 @@ class CvdVolumeOrderflowInputPreprocessor:
             for timeframe in BASE_TIMEFRAMES:
                 identifier = f"coinglass:{market}:aggregated_cvd:{timeframe}"
                 previous = old.get("markets", {}).get(market, {}).get("cvd", {}).get("timeframes", {}).get(timeframe) if old else None
-                frames[timeframe] = self.preprocess_coinglass_cvd(by_logical.get(identifier, []), existing=previous,
-                    timeframe=timeframe, records_required=required_base_records(timeframe, target_display_records, warmup_records))
+                required = required_base_records(timeframe, target_display_records, warmup_records)
+                pages = by_logical.get(identifier, [])
+                if timeframe == "15m" and raw.get("mode") == "incremental" and not pages:
+                    frames[timeframe] = _derive_15m_from_1m(frames["1m"], previous, required)
+                else:
+                    frames[timeframe] = self.preprocess_coinglass_cvd(pages, existing=previous,
+                        timeframe=timeframe, records_required=required)
             footprint_pages = [item for key, value in by_logical.items() if key.startswith(f"coinglass:{market}:footprint:") for item in value]
             previous_footprint = old.get("markets", {}).get(market, {}).get("footprint") if old else None
             footprint = self.preprocess_footprint(footprint_pages, existing=previous_footprint, enabled=include_footprint)
@@ -462,7 +523,7 @@ def run_cvd_volume_orderflow_input(*, fetcher: CvdVolumeOrderflowFetcher, base_a
                                    target_display_records: int = FINAL_DISPLAY_RECORDS, warmup_records: int = FINAL_WARMUP_RECORDS,
                                    incremental_limits: Mapping[str, int] | None = None, footprint_history_seconds: int = 172800,
                                    max_pages: int | None = None, data_mode: str = "synthetic", is_demo: bool = True,
-                                   reference_timestamp: int | None = None, clock: Any = None) -> dict[str, Any]:
+                                   reference_timestamp: int | None = None, clock: Any = None, refresh_secondary: bool = False) -> dict[str, Any]:
     if reference_timestamp is None:
         raise ValueError("reference_timestamp is required")
     extractor = CvdVolumeOrderflowRawExtractor(fetcher, clock=clock)
@@ -471,4 +532,5 @@ def run_cvd_volume_orderflow_input(*, fetcher: CvdVolumeOrderflowFetcher, base_a
         include_cryptoquant_confirmation=include_cryptoquant_confirmation, include_glassnode_confirmation=include_glassnode_confirmation,
         target_display_records=target_display_records, warmup_records=warmup_records, base_asset=base_asset, pair_symbol=pair_symbol,
         exchanges=exchanges, footprint_exchanges=footprint_exchanges, incremental_limits=incremental_limits,
-        footprint_history_seconds=footprint_history_seconds, max_pages=max_pages, data_mode=data_mode, is_demo=is_demo)
+        footprint_history_seconds=footprint_history_seconds, max_pages=max_pages, data_mode=data_mode, is_demo=is_demo,
+        refresh_secondary=refresh_secondary)

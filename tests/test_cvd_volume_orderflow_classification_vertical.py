@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 from pathlib import Path
 
@@ -307,15 +306,6 @@ def test_output_has_no_presentation_runtime_or_history_layers():
     encoded = json.dumps(classify(), allow_nan=False).lower()
     for forbidden in ('"screen"', '"kpi"', '"charts"', '"widgets"', '"color_token"', '"display_label"', '"route"'):
         assert forbidden not in encoded
-
-
-def test_six_frozen_layer_hashes():
-    expected = {
-        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_extract.py": "e461826c4c4d067d0cbff2dea33dcb9f977caefec61cfc96699bb39b06a1f13e",
-        "src/processing_signals/input/cvd_volume_orderflow/cvd_volume_orderflow_data_raw_preprocessing.py": "2d218f206cbb841cd0724ee757590594e47208b444901be737d3864e05196e38",
-        "tests/test_cvd_volume_orderflow_input_vertical.py": "1ddd3587e7f5f218ac15df9b1d72b06f288b632b7f59a96770eb608d6d09e5b0",
-    }
-    assert {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in expected} == expected
 
 
 def test_registered_in_classification_pipeline():

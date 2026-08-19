@@ -71,15 +71,11 @@ def _assert_same_structure(reference: Any, candidate: Any, path: str = "$") -> N
     assert type(reference) is type(candidate), path
 
 
-def test_general_is_exact_canonical_spot_for_prices_only() -> None:
+def test_processing_uses_real_spot_and_futures_markets_only() -> None:
     vertical = _vertical()
     for timeframe in TIMEFRAMES:
-        spot = vertical["processing"]["markets"]["spot"]["timeframes"][timeframe]["records"]
-        general = vertical["processing"]["markets"]["general"]["timeframes"][timeframe]["records"]
-        assert len(spot) == len(general)
-        for source, canonical in zip(spot, general, strict=True):
-            for field in ("timestamp", "open", "high", "low", "close", "volume", "volume_usd"):
-                assert canonical.get(field) == source.get(field)
+        assert vertical["processing"]["markets"]["spot"]["timeframes"][timeframe]["records"]
+        assert vertical["processing"]["markets"]["futures"]["timeframes"][timeframe]["records"]
 
 
 def test_glassnode_confirmation_and_market_cap_reach_screen_contract() -> None:
@@ -99,9 +95,9 @@ def test_screen_contract_matches_final_sp_structure() -> None:
     reference = json.loads(reference_path.read_text(encoding="utf-8"))
     candidate = vertical["screen"]
     assert candidate["schema_version"] == "1.9.0"
-    assert candidate["context"]["default_market"] == "general"
-    assert candidate["context"]["available_markets"] == ["general"]
-    assert candidate["selectors"]["market"]["selected"] == "general"
+    assert candidate["context"]["default_market"] == "spot"
+    assert candidate["context"]["available_markets"] == ["spot"]
+    assert candidate["selectors"]["market"]["selected"] == "spot"
     assert candidate["selectors"]["market"]["visible"] is False
     _assert_same_structure(reference, candidate)
     json.dumps(candidate, allow_nan=False)
@@ -111,5 +107,5 @@ def test_event_registry_uses_runtime_event_ids_not_sp_fixture_ids() -> None:
     vertical = _vertical()
     screen = vertical["screen"]
     assert screen["events"]["by_id"]
-    assert all(event["source"]["market"] == "general" for event in screen["events"]["by_id"].values())
+    assert all(event["source"]["market"] == "spot" for event in screen["events"]["by_id"].values())
     assert all(uid == event["event_uid"] for uid, event in screen["events"]["by_id"].items())

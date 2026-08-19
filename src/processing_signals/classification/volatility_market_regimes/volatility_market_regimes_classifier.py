@@ -15,10 +15,6 @@ LOW_VOL_PERCENTILE_THRESHOLD = 1.0 / 3.0
 HIGH_VOL_PERCENTILE_THRESHOLD = 2.0 / 3.0
 CONFIDENCE_HIGH_THRESHOLD = 0.75
 CONFIDENCE_MEDIUM_THRESHOLD = 0.40
-POSITIONING_SHORT_THRESHOLD = 0.95
-POSITIONING_LONG_THRESHOLD = 1.05
-POSITIONING_EXTREME_SHORT = 0.67
-POSITIONING_EXTREME_LONG = 1.50
 DAY_SECONDS = 86400
 
 REGIME_STATES = {"low_vol", "normal", "high_vol"}
@@ -30,10 +26,6 @@ _BASIS_FIELDS = (
     "realized_rolling_std_30d",
     "realized_z_score_30d",
     "realized_percentile_rank_90d",
-    "long_percent",
-    "short_percent",
-    "long_short_ratio",
-    "net_long_percentage_points",
     "dvol",
     "spread_7d",
 )
@@ -82,11 +74,11 @@ def validate_volatility_market_regimes_processing_contract(contract: Any) -> Non
     quality = contract.get("quality")
     if not isinstance(quality, Mapping) or quality.get("status") not in {"ok", "partial", "invalid"}:
         raise ValueError("quality:invalid")
-    for name in ("positioning", "realized_volatility", "dvol", "volatility_spread", "daily_regime_basis"):
+    for name in ("realized_volatility", "dvol", "volatility_spread", "daily_regime_basis"):
         feature = features.get(name)
         if not isinstance(feature, Mapping) or feature.get("status") not in AVAILABILITY_STATES:
             raise ValueError(f"features.{name}:invalid")
-    for feature_name in ("positioning", "realized_volatility", "dvol", "volatility_spread", "daily_regime_basis"):
+    for feature_name in ("realized_volatility", "dvol", "volatility_spread", "daily_regime_basis"):
         records = features[feature_name].get("records")
         if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
             raise ValueError(f"features.{feature_name}.records:sequence_required")
@@ -166,8 +158,6 @@ def classify_daily_regime_record(record: Mapping[str, Any]) -> dict[str, Any]:
         output["reason"] = "classification_warmup_incomplete"
         return output
     confidence = calculate_regime_confidence(record.get("realized_percentile_rank_90d"), realized_state)
-    if record.get("long_short_ratio") is None:
-        output["warnings"].append("positioning_context_unavailable")
     output.update(regime=realized_state, status="available", reason=None, **confidence)
     return output
 
@@ -318,53 +308,9 @@ def build_technical_events(feature: Mapping[str, Any]) -> dict[str, Any]:
     return {"by_id": by_id, "technical_cross_ids": ids}
 
 
-def classify_positioning_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    ratio = _finite(record.get("long_short_ratio"), "long_short_ratio", nullable=False)
-    state = "short_bias" if ratio < POSITIONING_SHORT_THRESHOLD else "long_bias" if ratio > POSITIONING_LONG_THRESHOLD else "balanced"
-    crowding = "extreme_short" if ratio <= POSITIONING_EXTREME_SHORT else "extreme_long" if ratio >= POSITIONING_EXTREME_LONG else "normal"
-    return {
-        "timestamp": _timestamp(record.get("timestamp"), "positioning.timestamp"),
-        "long_percent": _finite(record.get("long_percent"), "long_percent", nullable=False),
-        "short_percent": _finite(record.get("short_percent"), "short_percent", nullable=False),
-        "long_short_ratio": ratio,
-        "net_long_percentage_points": _finite(record.get("net_long_percentage_points"), "net_long_percentage_points", nullable=False),
-        "positioning_state": state,
-        "crowding_state": crowding,
-        "status": "available",
-        "reason": None,
-    }
-
-
-def classify_positioning_history(feature: Mapping[str, Any]) -> dict[str, Any]:
-    if feature.get("status") in {"unavailable", "invalid"} and not feature.get("records"):
-        status = "invalid" if feature.get("status") == "invalid" else "unavailable"
-        reason = "invalid_positioning_feature" if status == "invalid" else "positioning_feature_unavailable"
-        return {"status": status, "reason": reason, "records": [], "current": None, "records_available": 0, "source_data_as_of": feature.get("source_data_as_of")}
-    records = []
-    for raw in sorted(feature.get("records", []), key=lambda item: item["timestamp"]):
-        try:
-            records.append(classify_positioning_record(raw))
-        except (TypeError, ValueError):
-            records.append({"timestamp": raw.get("timestamp"), "status": "invalid", "reason": "invalid_positioning_record"})
-    valid = [record for record in records if record["status"] == "available"]
-    if any(record["status"] == "invalid" for record in records):
-        status, reason = "invalid", "invalid_positioning_record"
-    elif feature.get("status") == "available" and valid:
-        status, reason = "available", None
-    elif valid:
-        status, reason = "partial", feature.get("reason") or "positioning_feature_partial"
-    else:
-        status, reason = "unavailable", "positioning_feature_unavailable"
-    return {
-        "status": status, "reason": reason, "records": records,
-        "current": deepcopy(valid[-1]) if valid else None,
-        "records_available": len(valid), "source_data_as_of": feature.get("source_data_as_of"),
-    }
-
-
 def _source_availability(features: Mapping[str, Any]) -> dict[str, Any]:
     output = {}
-    for name in ("positioning", "realized_volatility", "dvol", "volatility_spread", "daily_regime_basis"):
+    for name in ("realized_volatility", "dvol", "volatility_spread", "daily_regime_basis"):
         feature = features[name]
         output[f"processing.{name}"] = {
             "status": feature.get("status"),
@@ -413,7 +359,7 @@ def evaluate_volatility_market_regimes_classification_quality(
     classifications: Mapping[str, Any], distribution: Mapping[str, Any], events: Mapping[str, Any],
     processing_status: str, errors: Sequence[str] = (), warnings: Sequence[str] = (),
 ) -> dict[str, Any]:
-    required = ["daily_regimes", "positioning", "volatility_context"]
+    required = ["daily_regimes", "volatility_context"]
     groups = {state: [name for name in required if classifications[name].get("status") == state] for state in AVAILABILITY_STATES}
     current = classifications["daily_regimes"].get("current")
     refs_ok = all(event_id in events["by_id"] for event_id in events["regime_transition_ids"])
@@ -455,15 +401,10 @@ def _context(processing: Mapping[str, Any]) -> dict[str, Any]:
             "high_vol_percentile_threshold": HIGH_VOL_PERCENTILE_THRESHOLD,
             "confidence_high_threshold": CONFIDENCE_HIGH_THRESHOLD,
             "confidence_medium_threshold": CONFIDENCE_MEDIUM_THRESHOLD,
-            "positioning_short_threshold": POSITIONING_SHORT_THRESHOLD,
-            "positioning_long_threshold": POSITIONING_LONG_THRESHOLD,
-            "positioning_extreme_short": POSITIONING_EXTREME_SHORT,
-            "positioning_extreme_long": POSITIONING_EXTREME_LONG,
         },
         "classification_policy": {
             "primary_regime_basis": "realized_percentile_rank_90d",
             "confidence_basis": "realized_percentile_boundary_distance",
-            "positioning_role": "context_only",
             "dvol_role": "implied_volatility_context",
             "spread_basis": "realized_minus_implied",
             "distribution_basis": "empirical_classified_day_share",
@@ -476,7 +417,7 @@ def _context(processing: Mapping[str, Any]) -> dict[str, Any]:
 def _invalid_contract(processing: Any, error: str) -> dict[str, Any]:
     safe = processing if isinstance(processing, Mapping) else {}
     invalid = {"status": "invalid", "reason": "processing_contract_invalid", "records": [], "current": None}
-    classifications = {"daily_regimes": deepcopy(invalid), "positioning": deepcopy(invalid), "volatility_context": deepcopy(invalid)}
+    classifications = {"daily_regimes": deepcopy(invalid), "volatility_context": deepcopy(invalid)}
     distribution = calculate_regime_distribution([])
     events = {"by_id": {}, "regime_transition_ids": [], "technical_cross_ids": []}
     quality = evaluate_volatility_market_regimes_classification_quality(classifications, distribution, events, "invalid", [error])
@@ -500,9 +441,8 @@ class VolatilityMarketRegimesClassifier:
             validate_volatility_market_regimes_processing_contract(processing)
             features = processing["features"]
             daily = classify_daily_regime_history(features["daily_regime_basis"])
-            positioning = classify_positioning_history(features["positioning"])
             volatility_context = classify_volatility_context(features)
-            classifications = {"daily_regimes": daily, "positioning": positioning, "volatility_context": volatility_context}
+            classifications = {"daily_regimes": daily, "volatility_context": volatility_context}
             distribution = calculate_regime_distribution(daily["records"])
             statistics = calculate_regime_statistics(daily["records"], daily["current"])
             events = build_regime_transition_events(daily["records"])

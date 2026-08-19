@@ -171,7 +171,8 @@ def build_cvd_volume_orderflow_fetch_plan(*, mode: str, reference_timestamp: int
                                             include_cryptoquant_confirmation: bool = True, include_glassnode_confirmation: bool = True,
                                             target_display_records: int = FINAL_DISPLAY_RECORDS, warmup_records: int = FINAL_WARMUP_RECORDS,
                                             incremental_limits: Mapping[str, int] | None = None,
-                                            footprint_history_seconds: int = DEFAULT_FOOTPRINT_HISTORY_SECONDS) -> list[dict[str, Any]]:
+                                            footprint_history_seconds: int = DEFAULT_FOOTPRINT_HISTORY_SECONDS,
+                                            refresh_secondary: bool = False) -> list[dict[str, Any]]:
     if mode not in VALID_MODES:
         raise ValueError("unsupported mode")
     reference = _timestamp(reference_timestamp, "reference_timestamp")
@@ -199,7 +200,12 @@ def build_cvd_volume_orderflow_fetch_plan(*, mode: str, reference_timestamp: int
                 records_required=required, exchanges=list(exchanges), symbol=base_asset))
         return plan
     for market in ("spot", "futures"):
-        for timeframe in BASE_TIMEFRAMES:
+        # Bootstrap keeps both 1m and 15m provider history: 1m gives recent
+        # resolution while 15m seeds a much deeper history efficiently. During
+        # normal incremental operation only 1m is paid for; complete 15m bars
+        # are rebuilt locally from the persisted 1m flow in Input.
+        requested_timeframes = BASE_TIMEFRAMES if mode == "bootstrap" else ("1m",)
+        for timeframe in requested_timeframes:
             required = required_base_records(timeframe, target_display_records, warmup_records)
             limit = min(COINGLASS_CVD_MAX_LIMIT, required) if mode == "bootstrap" else _positive_int(limits[timeframe], f"incremental_limits[{timeframe}]")
             end = reference
@@ -210,18 +216,19 @@ def build_cvd_volume_orderflow_fetch_plan(*, mode: str, reference_timestamp: int
                 path=COINGLASS_ENDPOINT_PATHS[endpoint], timeframe=timeframe, limit=limit, start=start, end=end,
                 records_required=required, exchanges=list(exchanges), symbol=base_asset))
     optional_start = max(0, reference - _positive_int(footprint_history_seconds, "footprint_history_seconds"))
-    if include_footprint:
+    refresh_optional = mode != "incremental" or bool(refresh_secondary)
+    if include_footprint and refresh_optional:
         for market in ("spot", "futures"):
             for exchange in footprint_exchanges:
                 endpoint = f"{market}_footprint"
                 plan.append(_logical(provider=COINGLASS_PROVIDER, dataset="footprint", market=market, endpoint_id=endpoint,
                     path=COINGLASS_ENDPOINT_PATHS[endpoint], timeframe="1m", limit=COINGLASS_FOOTPRINT_MAX_LIMIT,
                     start=optional_start, end=reference, exchange=exchange, symbol=pair_symbol))
-    if include_cryptoquant_confirmation:
+    if include_cryptoquant_confirmation and refresh_optional:
         plan.append(_logical(provider=CRYPTOQUANT_PROVIDER, dataset="taker_buy_sell_stats", market="futures", endpoint_id="taker_buy_sell_stats",
             path=CRYPTOQUANT_ENDPOINT_PATH, timeframe="1h", limit=min(CRYPTOQUANT_MAX_LIMIT, max(1, footprint_history_seconds // 3600 + 1)),
             start=optional_start, end=reference, provider_window="hour"))
-    if include_glassnode_confirmation:
+    if include_glassnode_confirmation and refresh_optional:
         for endpoint, path in GLASSNODE_ENDPOINT_PATHS.items():
             plan.append(_logical(provider=GLASSNODE_PROVIDER, dataset=endpoint, market="spot", endpoint_id=endpoint, path=path,
                 timeframe="1h", limit=max(1, footprint_history_seconds // 3600 + 1), start=optional_start, end=reference,
@@ -329,7 +336,7 @@ class CvdVolumeOrderflowRawExtractor:
             include_glassnode_confirmation: bool = True, target_display_records: int = FINAL_DISPLAY_RECORDS,
             warmup_records: int = FINAL_WARMUP_RECORDS, incremental_limits: Mapping[str, int] | None = None,
             footprint_history_seconds: int = DEFAULT_FOOTPRINT_HISTORY_SECONDS, max_pages: int | None = None,
-            data_mode: str = "synthetic", is_demo: bool = True) -> dict[str, Any]:
+            data_mode: str = "synthetic", is_demo: bool = True, refresh_secondary: bool = False) -> dict[str, Any]:
         if data_mode not in {"synthetic", "live"} or type(is_demo) is not bool or (data_mode == "synthetic" and not is_demo):
             raise ValueError("invalid data_mode/is_demo combination")
         execution = _clock_timestamp(self.clock)
@@ -338,7 +345,8 @@ class CvdVolumeOrderflowRawExtractor:
             exchanges=copy.deepcopy(tuple(exchanges)), existing_input=existing_input, recovery_requests=recovery_requests, include_footprint=include_footprint,
             footprint_exchanges=copy.deepcopy(tuple(footprint_exchanges)), include_cryptoquant_confirmation=include_cryptoquant_confirmation,
             include_glassnode_confirmation=include_glassnode_confirmation, target_display_records=target_display_records, warmup_records=warmup_records,
-            incremental_limits=incremental_limits, footprint_history_seconds=footprint_history_seconds)
+            incremental_limits=incremental_limits, footprint_history_seconds=footprint_history_seconds,
+            refresh_secondary=refresh_secondary)
         physical, warnings, errors = [], [], []
         for request in plan:
             if request["provider"] == COINGLASS_PROVIDER and request["dataset"] == "aggregated_cvd":

@@ -12,10 +12,7 @@ from typing import Any
 
 from processing_signals.processing.math.technical_cross_signals import detect_cross_pairs
 from processing_signals.processing.math.native_analysis import (difference, rolling_zscore, rolling_wasserstein, interpolated_cross, latest, finite)
-from processing_signals.processing.prices_ohlcv.prices_ohlcv_processor import (
-    PRICE_INDICATOR_CONFIG, build_regression_channel_indicator, calculate_prices_indicator_package,
-)
-from processing_signals.processing.math.indicators.trend.moving_averages import ema
+from processing_signals.processing.math.indicators.trend.moving_averages import ema, sma, wma
 
 
 from .cvd_volume_orderflow_feature_builder import (
@@ -149,7 +146,10 @@ class CvdVolumeOrderflowProcessor:
 
     @staticmethod
     def _augment_cvd_indicators(package: dict[str, Any], candles: Sequence[Mapping[str, Any]], market: str, timeframe: str) -> dict[str, Any]:
-        """Add the CVD-only SP indicators and remove volume-dependent metrics."""
+        """Compatibility filter for the approved CVD moving-average surface."""
+        return {"moving_averages": copy.deepcopy(package.get("moving_averages", {}))}
+
+        # Historical implementation retained below as unreachable audit context.
         package = copy.deepcopy(package)
         package.pop("mfi", None)
         package.pop("fibonacci_levels", None)
@@ -272,13 +272,19 @@ class CvdVolumeOrderflowProcessor:
                 deltas = [row.get("volume_delta_usd") for row in records]
                 imbalances = [row.get("order_flow_imbalance", {}).get("value") for row in records]
 
-                config = copy.deepcopy(PRICE_INDICATOR_CONFIG)
-                config["ema_periods"], config["sma_periods"], config["wma_periods"] = (9, 21), (20, 50), (20, 50)
-                indicator_package = calculate_prices_indicator_package(
-                    records=candles, market_type=f"cvd_{market}", timeframe=timeframe, config=config
-                ) if candles else {}
-                moving = indicator_package.get("moving_averages", {})
-                ma_series = moving.get("series", {})
+                close_series = pd.Series(closes, dtype="float64")
+                ma_series = {
+                    "ema_9": ema(close_series, 9).where(lambda values: values.index >= 8).tolist(),
+                    "ema_21": ema(close_series, 21).where(lambda values: values.index >= 20).tolist(),
+                    "sma_20": sma(close_series, 20).tolist(),
+                    "sma_50": sma(close_series, 50).tolist(),
+                    "wma_20": wma(close_series, 20).tolist(),
+                    "wma_50": wma(close_series, 50).tolist(),
+                } if candles else {}
+                ma_series = {
+                    name: [None if pd.isna(value) else float(value) for value in values]
+                    for name, values in ma_series.items()
+                }
                 cross_pairs = (("ema_9", "ema_21"), ("sma_20", "sma_50"), ("wma_20", "wma_50"))
                 crosses = detect_cross_pairs(timestamps=timestamps, series=ma_series, pairs=cross_pairs) if candles else []
                 index_by_timestamp = {ts: index for index, ts in enumerate(timestamps)}
@@ -349,7 +355,7 @@ class CvdVolumeOrderflowProcessor:
                     "overlays": {"moving_averages": {"alignment": "cvd_candles_by_index",
                                                      "series": {name: list(values) for name, values in ma_series.items() if name in {"ema_9","ema_21","sma_20","sma_50","wma_20","wma_50"}},
                                                      "parameters": {"ema_periods": [9,21], "sma_periods": [20,50], "wma_periods": [20,50]},
-                                                     "status": moving.get("quality", {}).get("status", "unavailable")}},
+                                                     "status": "ok" if candles and any(value is not None for values in ma_series.values() for value in values) else "unavailable"}},
                     "indicators": native, "events": events, "calculation_history_records": len(records),
                     "screen_b_data_mode": "runtime_processing", "screen_b_processing_contract": "native_cvd_orderflow_vr1",
                 }

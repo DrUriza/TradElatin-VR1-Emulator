@@ -620,76 +620,148 @@ class CvdVolumeOrderflowContractBuilder:
         }
 
     def build_technical_analysis(self, processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
+        """Publish the native CVD analysis already computed by Processing.
+
+        Screen A exposes only the six approved moving averages. Screen B owns
+        six native order-flow analyses.  HMI never recalculates either package.
+        """
         source_ta = processing.get("technical_analysis", {})
-        event_registry = classification.get("technical_events", {}).get("by_id", {})
-        markets: dict[str, Any] = {}
-        indicator_ids = (
-            "macd", "rsi", "tsi", "stochastic", "williams_r", "cci", "adx", "atr",
-            "wasserstein_distance", "bollinger_band_width",
+        context = processing.get("context", {})
+        is_demo = bool(context.get("is_demo", False))
+        data_mode = "synthetic_demo_runtime" if is_demo else "runtime_processing"
+        classification_basis = "processing_precomputed_native"
+        selector_contract = {
+            "trend": ["ema_9", "ema_21", "sma_20", "sma_50", "wma_20", "wma_50"],
+            "derived_analysis": ["cvd_slope_acceleration", "delta_zscore", "buy_sell_imbalance"],
+            "momentum": ["price_cvd_divergence", "spot_futures_divergence"],
+            "volatility": ["wasserstein_distance"],
+        }
+        indicator_order = (
+            "cvd_slope_acceleration", "delta_zscore", "buy_sell_imbalance",
+            "price_cvd_divergence", "spot_futures_divergence", "wasserstein_distance",
         )
+        parameter_defaults = {
+            "cvd_slope_acceleration": {"slope": "first_difference_then_rolling_zscore", "zscore_window": 30,
+                                       "acceleration": "first_difference_of_slope_zscore"},
+            "delta_zscore": {"source": "delta_buy_sell_usd", "window": 30},
+            "buy_sell_imbalance": {"source": "normalized_order_flow_imbalance", "range": [-1, 1]},
+            "price_cvd_divergence": {"price_source": "prices.processing.ohlcv.close", "cvd_source": "cvd.close",
+                                     "return_zscore_window": 30, "definition": "z(price_return)-z(cvd_return)"},
+            "spot_futures_divergence": {"definition": "z(spot_cvd_return)-z(futures_cvd_return)", "return_zscore_window": 30},
+            "wasserstein_distance": {"recent_window_differences": 20, "reference_window_differences": 100,
+                                     "input": "close first differences"},
+        }
+        threshold_defaults = {
+            "cvd_slope_acceleration": [{"value": 0.0, "role": "neutral"}],
+            "delta_zscore": [{"value": 2.0, "role": "upper_extreme"}, {"value": 0.0, "role": "neutral"},
+                             {"value": -2.0, "role": "lower_extreme"}],
+            "buy_sell_imbalance": [{"value": 0.0, "role": "neutral"}],
+            "price_cvd_divergence": [{"value": 1.0, "role": "positive_divergence"}, {"value": 0.0, "role": "neutral"},
+                                     {"value": -1.0, "role": "negative_divergence"}],
+            "spot_futures_divergence": [{"value": 1.0, "role": "positive_divergence"}, {"value": 0.0, "role": "neutral"},
+                                        {"value": -1.0, "role": "negative_divergence"}],
+            "wasserstein_distance": [],
+        }
+        unit_defaults = {
+            "cvd_slope_acceleration": "zscore", "delta_zscore": "zscore",
+            "buy_sell_imbalance": "normalized_ratio", "price_cvd_divergence": "standardized_divergence",
+            "spot_futures_divergence": "standardized_divergence", "wasserstein_distance": "distance",
+        }
+        label_defaults = {
+            "cvd_slope_acceleration": ("CVD Slope / Acceleration", "flow"),
+            "delta_zscore": ("Delta Z-Score", "flow"),
+            "buy_sell_imbalance": ("Buy/Sell Imbalance", "flow"),
+            "price_cvd_divergence": ("Price ↔ CVD Divergence", "divergence"),
+            "spot_futures_divergence": ("Spot ↔ Futures CVD Divergence", "divergence"),
+            "wasserstein_distance": ("Wasserstein Distance", "regime"),
+        }
+
+        def summary(indicator_id: str, package: Mapping[str, Any]) -> dict[str, Any]:
+            current = package.get("current", {}) if isinstance(package.get("current"), Mapping) else {}
+            value = next((v for v in current.values() if isinstance(v, (int, float)) and not isinstance(v, bool)), None)
+            source_summary = package.get("summary", {}) if isinstance(package.get("summary"), Mapping) else {}
+            label, section = label_defaults[indicator_id]
+            status = package.get("status", "unavailable")
+            display = source_summary.get("display_value")
+            if display is None and value is not None:
+                display = f"{float(value):+.3f}" if indicator_id != "wasserstein_distance" else f"{float(value):.3f}"
+            signal = source_summary.get("signal", "unavailable" if value is None else "neutral")
+            signal_color = source_summary.get("signal_color", signal)
+            strength = source_summary.get("strength", 0.0 if value is None else min(5.0, abs(float(value))))
+            return {
+                "indicator_id": indicator_id, "label": label, "section": section, "value": value,
+                "display_value": display, "signal": signal, "signal_color": signal_color, "strength": strength,
+                "status": status, "classification_basis": classification_basis, "recalculate_in_hmi": False,
+            }
+
+        markets: dict[str, Any] = {}
         for market in MARKETS:
             target_timeframes: dict[str, Any] = {}
-            market_source = source_ta.get("markets", {}).get(market, {})
+            market_source = source_ta.get("markets", {}).get(market, {}) if isinstance(source_ta, Mapping) else {}
             for timeframe in TIMEFRAMES:
-                source = market_source.get("timeframes", {}).get(timeframe, {})
-                timestamps = list(source.get("timestamps", []))
-                history_timestamps = timestamps[-CALCULATION_HISTORY_LIMIT:]
-                tail_timestamps = timestamps[-self.display_point_limit:]
-                packages = source.get("indicators", {}) if isinstance(source, Mapping) else {}
-                overlays: dict[str, Any] = {}
-                for overlay_id in ("moving_averages", "bollinger_bands", "regression_channel"):
-                    package = packages.get(overlay_id, {}) if isinstance(packages, Mapping) else {}
-                    overlay_series = package.get("series", {}) if isinstance(package, Mapping) else {}
-                    overlays[overlay_id] = {
-                        "status": source.get("status", "unavailable") if overlay_series else "unavailable",
-                        "parameters": copy.deepcopy(package.get("parameters", {})) if isinstance(package, Mapping) else {},
-                        "series": {key: list(values)[-self.display_point_limit:] for key, values in overlay_series.items()} if isinstance(overlay_series, Mapping) else {},
-                        "recalculate_in_hmi": False,
-                    }
+                source = market_source.get("timeframes", {}).get(timeframe, {}) if isinstance(market_source, Mapping) else {}
+                all_timestamps = list(source.get("timestamps", []))[-CALCULATION_HISTORY_LIMIT:]
+                tail_timestamps = all_timestamps[-self.display_point_limit:]
+                history_records = min(int(source.get("calculation_history_records", len(all_timestamps)) or 0), CALCULATION_HISTORY_LIMIT)
+                source_overlays = source.get("overlays", {}) if isinstance(source, Mapping) else {}
+                moving = source_overlays.get("moving_averages", {}) if isinstance(source_overlays, Mapping) else {}
+                moving_series = moving.get("series", {}) if isinstance(moving, Mapping) else {}
+                approved_mas = ("ema_9", "ema_21", "sma_20", "sma_50", "wma_20", "wma_50")
+                overlay = {
+                    "series": {name: list(moving_series.get(name, []))[-self.display_point_limit:] for name in approved_mas},
+                    "recalculate_in_hmi": False,
+                    "status": moving.get("status", source.get("status", "unavailable")),
+                    "series_ids": list(approved_mas),
+                }
+                source_indicators = source.get("indicators", {}) if isinstance(source, Mapping) else {}
                 indicators: dict[str, Any] = {}
-                for indicator_id in indicator_ids:
-                    package = packages.get(indicator_id, {}) if isinstance(packages, Mapping) else {}
+                for indicator_id in indicator_order:
+                    package = source_indicators.get(indicator_id, {}) if isinstance(source_indicators, Mapping) else {}
                     raw_series = package.get("series", {}) if isinstance(package, Mapping) else {}
                     current = copy.deepcopy(package.get("current", {})) if isinstance(package, Mapping) else {}
-                    indicator = {
-                        "status": source.get("status", "unavailable") if raw_series else "unavailable",
-                        "unit": self._indicator_unit(indicator_id),
-                        "parameters": copy.deepcopy(package.get("parameters", {})) if isinstance(package, Mapping) else {},
+                    payload = {
+                        "status": package.get("status", source.get("status", "unavailable")),
+                        "unit": unit_defaults[indicator_id],
+                        "parameters": copy.deepcopy(parameter_defaults[indicator_id]),
                         "timestamps": tail_timestamps,
                         "series": {key: list(values)[-self.display_point_limit:] for key, values in raw_series.items()} if isinstance(raw_series, Mapping) else {},
                         "current": current,
-                        "thresholds": [],
+                        "thresholds": copy.deepcopy(threshold_defaults[indicator_id]),
                         "recalculate_in_hmi": False,
-                        "summary": self._summary(indicator_id, package),
-                        "calculation_history_records": len(history_timestamps),
+                        "summary": summary(indicator_id, package if isinstance(package, Mapping) else {}),
+                        "calculation_history_records": history_records,
                     }
-                    indicators[indicator_id] = indicator
-                history_start = history_timestamps[0] if history_timestamps else None
-                events = [copy.deepcopy(event) for event in event_registry.values()
-                    if isinstance(event, Mapping) and event.get("source", {}).get("market") == market
-                    and event.get("source", {}).get("timeframe") == timeframe
-                    and (history_start is None or int(event.get("timestamp", 0)) >= history_start)]
+                    if indicator_id != "wasserstein_distance":
+                        payload.update({"data_mode": data_mode, "is_proxy": False})
+                    indicators[indicator_id] = payload
+                display_start = tail_timestamps[0] if tail_timestamps else None
+                events = [
+                    copy.deepcopy(event) for event in source.get("events", [])
+                    if isinstance(event, Mapping)
+                    and (display_start is None or int(event.get("timestamp", 0)) >= int(display_start))
+                ] if isinstance(source, Mapping) else []
                 events.sort(key=lambda event: (event.get("timestamp", 0), event.get("event_uid", "")))
                 target_timeframes[timeframe] = {
-                    "status": source.get("status", "unavailable"),
-                    "source_records": len(history_timestamps),
-                    "timestamps": tail_timestamps,
-                    "overlays": overlays,
-                    "indicators": indicators,
-                    "events": events,
-                    "calculation_history_records": len(history_timestamps),
+                    "status": source.get("status", "unavailable"), "source_records": history_records,
+                    "timestamps": tail_timestamps, "overlays": {"moving_averages": overlay},
+                    "indicators": indicators, "events": events,
+                    "calculation_history_records": history_records, "screen_b_data_mode": data_mode,
+                    "screen_b_processing_contract": "native_cvd_orderflow_vr1",
                 }
-            markets[market] = {
-                "source_chart_id": f"cvd_{market}",
-                "title": f"CVD {market.title()}",
-                "timeframes": target_timeframes,
-            }
+            markets[market] = {"source_chart_id": f"cvd_{market}", "title": f"CVD {market.title()}", "timeframes": target_timeframes}
         return {
-            "analysis_id": "cvd_three_candle_technical_analysis",
-            "contract_version": "1.0.0",
-            "source": "CVD OHLC close/high/low series",
-            "recalculate_in_hmi": False,
-            "markets": markets,
+            "analysis_id": "cvd_native_orderflow_analysis", "contract_version": "2.0.0",
+            "source": "CVD OHLC + executed buy/sell flow + synchronized BTC price", "recalculate_in_hmi": False,
+            "markets": markets, "selector_contract": selector_contract,
+            "screen_b_native_orderflow_contract": {
+                "status": "available", "data_mode": data_mode, "recalculate_in_hmi": False, "future_owner": "Processing",
+                "panels": list(indicator_order), "screen_title": "ANÁLISIS CVD · ORDER FLOW",
+                "panel_labels": {
+                    "cvd_slope_acceleration": "CVD SLOPE / ACCELERATION", "delta_zscore": "DELTA Z-SCORE",
+                    "buy_sell_imbalance": "BUY / SELL IMBALANCE", "price_cvd_divergence": "PRICE ↔ CVD DIVERGENCE",
+                    "spot_futures_divergence": "SPOT ↔ FUTURES CVD DIVERGENCE", "wasserstein_distance": "WASSERSTEIN DISTANCE",
+                },
+            },
         }
 
     def run(self, bundle: Mapping[str, Any]) -> dict[str, Any]:

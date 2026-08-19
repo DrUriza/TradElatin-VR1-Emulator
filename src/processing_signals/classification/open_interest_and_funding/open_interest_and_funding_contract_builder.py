@@ -8,9 +8,9 @@ import json
 import math
 from typing import Any
 
-from .open_interest_and_funding_sp_v1_11_adapter import (
+from .open_interest_and_funding_sp_v1_12_adapter import (
     SP_SCHEMA_VERSION,
-    align_open_interest_and_funding_to_sp_v1_11,
+    align_open_interest_and_funding_to_sp_v1_12,
 )
 
 
@@ -26,7 +26,7 @@ CONTEXT_FIELDS = (
     "asset", "exchange_scope", "primary_provider", "confirmation_providers", "data_mode", "is_demo",
     "reference_timestamp", "execution_timestamp", "generated_at",
 )
-OPTIONAL_CONTEXT_FIELDS = ("requested_at", "include_snapshots", "include_confirmations")
+OPTIONAL_CONTEXT_FIELDS = ("requested_at", "include_snapshots", "include_confirmations", "refresh_secondary")
 CHART_IDS = (
     "open_interest_candlestick", "open_interest_ohlc", "macd", "rsi", "tsi", "adx",
     "stochastic", "williams_r", "cci", "atr", "wasserstein_distance",
@@ -165,7 +165,7 @@ def _validate_bundle(bundle: Any, selected_timeframe: Any) -> tuple[Mapping[str,
         requested_at = p_context["requested_at"]
         if type(requested_at) is not str or not requested_at.strip():
             raise ValueError("contract_builder_bundle_mismatch:context")
-    for field in ("include_snapshots", "include_confirmations"):
+    for field in ("include_snapshots", "include_confirmations", "refresh_secondary"):
         if field in p_context and type(p_context[field]) is not bool:
             raise ValueError("contract_builder_bundle_mismatch:context")
     reference = _timestamp(p_context.get("reference_timestamp"), "context.reference_timestamp")
@@ -758,7 +758,7 @@ def build_open_interest_and_funding_contract(bundle: Mapping[str, Any], *, selec
         "quality": {"status": classification["quality"]["status"], "contract_complete": True,
                     "data_complete": classification["quality"]["data_complete"], "warnings": [], "errors": []},
     }
-    output = align_open_interest_and_funding_to_sp_v1_11(
+    output = align_open_interest_and_funding_to_sp_v1_12(
         output, processing, classification, selected_timeframe=selected_timeframe,
     )
     output = _json_copy(output, "screen_contract")

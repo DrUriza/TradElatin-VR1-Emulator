@@ -223,7 +223,15 @@ def _native_capital_flow_analysis(payload: Mapping[str, Any], *, price_history_d
 
     inflow = align_day("exchange_inflow", "inflow_total")
     outflow = align_day("exchange_outflow", "outflow_total")
-    netflow = align_day("exchange_netflow", "netflow_total")
+    reported_netflow = align_day("exchange_netflow", "netflow_total")
+    # Netflow is an exact identity, not an independent primitive requirement.
+    # Prefer the provider confirmation when present; otherwise derive it locally
+    # from the already acquired inflow/outflow series.
+    netflow = [
+        reported if reported is not None else
+        (None if incoming is None or outgoing is None else float(incoming) - float(outgoing))
+        for reported, incoming, outgoing in zip(reported_netflow, inflow, outflow, strict=True)
+    ]
     reserve = align_day("exchange_reserve", "reserve")
     pressure: list[float | None] = []
     for i, o in zip(inflow, outflow, strict=True):
@@ -265,7 +273,11 @@ def _native_capital_flow_analysis(payload: Mapping[str, Any], *, price_history_d
     }
     return {"analysis_id":"capital_flow_analysis", "contract_family":"native_capital_flow", "status":"available",
             "recalculate_in_hmi":False, "source_resolution":"1d", "indicators":indicators,
-            "supporting_series":{"timestamps":timestamps, "etf_flow_usd":flow_values, "exchange_netflow":netflow, "exchange_reserve":reserve}}
+            "supporting_series":{
+                "timestamps":timestamps, "etf_flow_usd":flow_values, "btc_price":aligned_prices,
+                "exchange_inflow":inflow, "exchange_outflow":outflow,
+                "exchange_netflow":netflow, "exchange_reserve":reserve,
+            }}
 
 
 def process_etf_exchange_flows(*, input_contract: Mapping[str, Any], generated_at: Any = None,

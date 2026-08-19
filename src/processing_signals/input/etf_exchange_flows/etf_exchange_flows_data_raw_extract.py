@@ -16,15 +16,22 @@ RECOVERY_ALLOWED_FIELDS = {
     "cryptoquant": {"provider", "endpoint_id", "window", "start_time", "end_time", "limit", "exchange_scope"},
     "glassnode": {"provider", "endpoint_id", "interval", "start_time", "end_time", "asset"},
 }
-BOOTSTRAP_LIMITS = {"cryptoquant_hour": 48, "cryptoquant_day": 120}
+BOOTSTRAP_LIMITS = {"cryptoquant_hour": 48, "cryptoquant_day": 730}
 INCREMENTAL_LIMITS = {"cryptoquant_hour": 48, "cryptoquant_day": 8}
 ETF_HISTORICAL_BOOTSTRAP_LIMITS = {
-    ("exchange_netflow", "day"): 730,
+    ("exchange_inflow", "day"): 730,
+    ("exchange_outflow", "day"): 730,
     ("exchange_reserve", "day"): 730,
-    # One extra day allows Processing to discard partial boundary days while
-    # retaining 730 complete UTC candles.
-    ("exchange_reserve", "hour"): 17_544,
+    ("exchange_netflow", "day"): 730,
 }
+# Runtime request groups.  CoinGlass ETF flow is documented as hourly-cached;
+# slow ETF state is daily.  CryptoQuant netflow is a confirmation because
+# Processing can derive it exactly as inflow - outflow.
+HOURLY_COINGLASS_ENDPOINTS = ("bitcoin_etf_flows",)
+SLOW_COINGLASS_ENDPOINTS = ("bitcoin_etf_net_assets_history", "bitcoin_etf_premium_discount_history")
+BOOTSTRAP_STATIC_COINGLASS_ENDPOINTS = ("bitcoin_etf_list",)
+PRIMARY_CRYPTOQUANT_ENDPOINTS = ("exchange_inflow", "exchange_outflow", "exchange_reserve")
+SECONDARY_CRYPTOQUANT_ENDPOINTS = ("exchange_netflow",)
 ProviderFetcher = Callable[..., Mapping[str, Any] | Sequence[Any]]
 
 ENDPOINT_SPECS = {
@@ -147,7 +154,8 @@ def _request(provider: str, endpoint_id: str, params: Mapping[str, Any], variant
 
 
 def build_etf_exchange_flows_fetch_plan(*, mode: str, exchange_scope: str | None, symbol: str = "BTC",
-                                        include_secondary: bool = False,
+                                        include_secondary: bool = False, refresh_hourly: bool = True,
+                                        refresh_slow: bool = True,
                                         recovery_requests: Sequence[Mapping[str, Any]] | None = None,
                                         bootstrap_limits: Mapping[str, int] | None = None,
                                         incremental_limits: Mapping[str, int] | None = None) -> list[dict[str, Any]]:
@@ -176,18 +184,48 @@ def build_etf_exchange_flows_fetch_plan(*, mode: str, exchange_scope: str | None
         raise ValueError("exchange_scope_required")
     limits = {**(BOOTSTRAP_LIMITS if mode == "bootstrap" else INCREMENTAL_LIMITS),
               **dict((bootstrap_limits if mode == "bootstrap" else incremental_limits) or {})}
-    plan = [_request("coinglass", endpoint, build_coinglass_params(endpoint, symbol=symbol)) for endpoint in ENDPOINT_SPECS["coinglass"]]
-    for endpoint in ENDPOINT_SPECS["cryptoquant"]:
-        for window in ("day", "hour"):
-            limit = limits[f"cryptoquant_{window}"]
-            if mode == "bootstrap":
+    plan: list[dict[str, Any]] = []
+
+    if mode == "bootstrap" or refresh_hourly:
+        for endpoint in HOURLY_COINGLASS_ENDPOINTS:
+            plan.append(_request("coinglass", endpoint, build_coinglass_params(endpoint, symbol=symbol)))
+
+    if mode == "bootstrap" or refresh_slow:
+        for endpoint in SLOW_COINGLASS_ENDPOINTS:
+            plan.append(_request("coinglass", endpoint, build_coinglass_params(endpoint, symbol=symbol)))
+
+    if mode == "bootstrap":
+        for endpoint in BOOTSTRAP_STATIC_COINGLASS_ENDPOINTS:
+            plan.append(_request("coinglass", endpoint, build_coinglass_params(endpoint, symbol=symbol)))
+        # Deep history is paid only once.  Hourly windows remain short and are
+        # used for the exact rolling-24h KPIs; day history feeds Screen A/B.
+        for endpoint in PRIMARY_CRYPTOQUANT_ENDPOINTS:
+            for window in ("day", "hour"):
+                limit = limits[f"cryptoquant_{window}"]
                 limit = max(limit, ETF_HISTORICAL_BOOTSTRAP_LIMITS.get((endpoint, window), limit))
-            plan.append(_request("cryptoquant", endpoint, build_cryptoquant_params(exchange_scope=exchange_scope,
-                window=window, limit=_positive_int(limit, "limit")), window))
+                plan.append(_request("cryptoquant", endpoint, build_cryptoquant_params(
+                    exchange_scope=exchange_scope, window=window, limit=_positive_int(limit, "limit")), window))
+    elif refresh_hourly:
+        # One short hourly request per primitive.  Input rolls these observations
+        # into the current UTC day locally; no duplicate day request is needed.
+        for endpoint in PRIMARY_CRYPTOQUANT_ENDPOINTS:
+            limit = limits["cryptoquant_hour"]
+            plan.append(_request("cryptoquant", endpoint, build_cryptoquant_params(
+                exchange_scope=exchange_scope, window="hour", limit=_positive_int(limit, "limit")), "hour"))
+
     if include_secondary:
+        # Reported CQ netflow and Glassnode are confirmation channels, never
+        # requirements for the normal incremental cycle.
+        for window in (("day", "hour") if mode == "bootstrap" else ("hour",)):
+            endpoint = "exchange_netflow"
+            limit = limits[f"cryptoquant_{window}"]
+            limit = max(limit, ETF_HISTORICAL_BOOTSTRAP_LIMITS.get((endpoint, window), limit))
+            plan.append(_request("cryptoquant", endpoint, build_cryptoquant_params(
+                exchange_scope=exchange_scope, window=window, limit=_positive_int(limit, "limit")), window))
         for endpoint in ENDPOINT_SPECS["glassnode"]:
-            for interval in (("24h",) if endpoint == "us_spot_etf_flows_net" else ("1h", "24h")):
-                plan.append(_request("glassnode", endpoint, build_glassnode_params(interval=interval, asset=symbol), interval))
+            # Screen B is daily.  A single 24h confirmation per Glassnode metric
+            # is sufficient; the old duplicate 1h+24h polling is unnecessary.
+            plan.append(_request("glassnode", endpoint, build_glassnode_params(interval="24h", asset=symbol), "24h"))
     return plan
 
 
@@ -214,6 +252,7 @@ def extract_endpoint_raw(*, fetcher: ProviderFetcher, request: Mapping[str, Any]
 
 def extract_etf_exchange_flows_raw(*, fetcher: ProviderFetcher, mode: str, exchange_scope: str | None,
                                    symbol: str = "BTC", include_secondary: bool = False,
+                                   refresh_hourly: bool = True, refresh_slow: bool = True,
                                    recovery_requests: Sequence[Mapping[str, Any]] | None = None,
                                    data_mode: str = "live", is_demo: bool = False, now: int,
                                    bootstrap_limits: Mapping[str, int] | None = None,
@@ -222,8 +261,8 @@ def extract_etf_exchange_flows_raw(*, fetcher: ProviderFetcher, mode: str, excha
         raise ValueError("invalid_data_mode")
     timestamp = _positive_int(now, "now")
     plan = build_etf_exchange_flows_fetch_plan(mode=mode, exchange_scope=exchange_scope, symbol=symbol,
-        include_secondary=include_secondary, recovery_requests=recovery_requests,
-        bootstrap_limits=bootstrap_limits, incremental_limits=incremental_limits)
+        include_secondary=include_secondary, refresh_hourly=refresh_hourly, refresh_slow=refresh_slow,
+        recovery_requests=recovery_requests, bootstrap_limits=bootstrap_limits, incremental_limits=incremental_limits)
     requested_at, raw = _utc_iso(timestamp), {provider: {} for provider in PROVIDERS}
     for request in plan:
         entry = extract_endpoint_raw(fetcher=fetcher, request=request, fetched_at=requested_at)
@@ -243,6 +282,9 @@ def extract_etf_exchange_flows_raw(*, fetcher: ProviderFetcher, mode: str, excha
             "asset": symbol,
             "exchange_scope": exchange_scope,
             "include_secondary": include_secondary,
+            "refresh_hourly": refresh_hourly,
+            "refresh_slow": refresh_slow,
+            "refresh_timestamp": timestamp,
         },
         "requested_at": requested_at,
         "raw": raw,
@@ -255,6 +297,8 @@ class EtfExchangeFlowsRawExtractor:
         self.options = {"fetcher": fetcher, "exchange_scope": exchange_scope, "symbol": symbol,
                         "include_secondary": include_secondary, "data_mode": data_mode, "is_demo": is_demo}
 
-    def run(self, *, mode: str, now: int, recovery_requests=None, bootstrap_limits=None, incremental_limits=None):
+    def run(self, *, mode: str, now: int, recovery_requests=None, bootstrap_limits=None, incremental_limits=None,
+                refresh_hourly: bool = True, refresh_slow: bool = True):
         return extract_etf_exchange_flows_raw(mode=mode, now=now, recovery_requests=recovery_requests,
-            bootstrap_limits=bootstrap_limits, incremental_limits=incremental_limits, **self.options)
+            bootstrap_limits=bootstrap_limits, incremental_limits=incremental_limits,
+            refresh_hourly=refresh_hourly, refresh_slow=refresh_slow, **self.options)

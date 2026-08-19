@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
-from copy import deepcopy
 
 from .prices_ohlcv.prices_ohlcv_contract_builder import build_prices_screen_contract
 from .etf_exchange_flows.etf_exchange_flows_contract_builder import build_etf_exchange_flows_contract
@@ -47,15 +46,7 @@ def _liquidity(processing: Mapping[str, Any], classification: Mapping[str, Any],
         )
         for market in ("spot", "perpetual")
     }
-    base = built_by_market[selected if selected in built_by_market else "perpetual"]
-    base["_prebuilt_market_views"] = {
-        market: {
-            "kpis": deepcopy(view.get("kpis", {})), "charts": deepcopy(view.get("charts", {})),
-            "tables": deepcopy(view.get("tables", {})), "widgets": deepcopy(view.get("widgets", {})),
-            "context": {"market": market},
-        } for market, view in built_by_market.items()
-    }
-    return base
+    return built_by_market[selected if selected in built_by_market else "perpetual"]
 
 
 def _liquidations(processing: Mapping[str, Any], classification: Mapping[str, Any], arguments: Mapping[str, Any]) -> dict[str, Any]:

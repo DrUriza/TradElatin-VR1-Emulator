@@ -1,6 +1,7 @@
-"""Screen Contract Builder v0.1 for frozen ETF exchange-flow contracts."""
+"""ETF & Exchange Flows Screen Contract Builder; SP 1.4 adapter is final authority."""
 from __future__ import annotations
 
+from .etf_exchange_flows_sp_v1_4_adapter import align_etf_exchange_flows_contract_to_sp_v1_4
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -10,9 +11,9 @@ from typing import Any
 
 FAMILY = "etf_exchange_flows"
 UPSTREAM_VERSION = "0.1"
-CONTRACT_VERSION = "0.1"
+CONTRACT_VERSION = "1.4.1-exchange-reserve-realism-v4"
 SCHEMA_ID = "trad_elatin.etf_exchange_flows.screen.v1"
-SCHEMA_VERSION = "1.3.0"
+SCHEMA_VERSION = "1.4.1-exchange-reserve-realism-v2"
 RANGE_SECONDS = {"1d": 86_400, "7d": 604_800, "30d": 2_592_000, "90d": 7_776_000, "360d": 31_104_000}
 CLASSIFICATION_RANGES = ("1d", "7d", "30d", "90d")
 DISPLAY_RANGES = ("30d", "90d", "360d")
@@ -602,7 +603,10 @@ def build_etf_exchange_flows_contract(*, processing_contract: Mapping[str, Any],
     data_mode = processing_contract.get("data_mode") if isinstance(processing_contract, Mapping) else None
     is_demo = processing_contract.get("is_demo") if isinstance(processing_contract, Mapping) else None
     if errors:
-        return _fallback(errors, selected_range=selected_range, mode=mode, data_mode=data_mode, is_demo=is_demo)
+        return align_etf_exchange_flows_contract_to_sp_v1_4(
+            _fallback(errors, selected_range=selected_range, mode=mode, data_mode=data_mode, is_demo=is_demo),
+            processing_contract if isinstance(processing_contract, Mapping) else {},
+        )
     processing = processing_contract
     classification = classification_contract
     processing_declared_anchor = _timestamp(processing["data_as_of"])
@@ -611,8 +615,11 @@ def build_etf_exchange_flows_contract(*, processing_contract: Mapping[str, Any],
     classification_anchor = _timestamp(classification["data_as_of"])
     assert classification_anchor is not None
     if classification_anchor > processing_anchor:
-        return _fallback(["upstream_timestamp_inconsistent"], selected_range=selected_range,
-                         mode=mode, data_mode=data_mode, is_demo=is_demo)
+        return align_etf_exchange_flows_contract_to_sp_v1_4(
+            _fallback(["upstream_timestamp_inconsistent"], selected_range=selected_range,
+                      mode=mode, data_mode=data_mode, is_demo=is_demo),
+            processing,
+        )
     seconds = RANGE_SECONDS[selected_range]
     features = processing["features"]
     series = processing["series"]
@@ -778,6 +785,7 @@ def build_etf_exchange_flows_contract(*, processing_contract: Mapping[str, Any],
     root["context"]["data_as_of"] = data_as_of
     root["operational_status"].update(quality_status=quality_status, data_as_of=data_as_of)
     output = _json_copy(root, "screen_contract")
+    output = align_etf_exchange_flows_contract_to_sp_v1_4(output, processing)
     json.dumps(output, ensure_ascii=False, allow_nan=False)
     if processing_contract != processing_before or classification_contract != classification_before:
         raise RuntimeError("Contract Builder mutated an upstream contract")

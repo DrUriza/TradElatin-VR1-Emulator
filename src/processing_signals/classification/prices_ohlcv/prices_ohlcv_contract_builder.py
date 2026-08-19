@@ -11,8 +11,8 @@ from .prices_sp_v1_9_adapter import align_prices_contract_to_sp_v1_9
 
 
 TIMEFRAME_ORDER        = ("1m", "5m", "15m", "1h", "4h", "1d")
-MARKET_ORDER           = ("general",)
-DEFAULT_MARKET         = "general"
+MARKET_ORDER           = ("spot",)
+DEFAULT_MARKET         = "spot"
 DEFAULT_TIMEFRAME      = "1h"
 DEFAULT_DISPLAY_WINDOW = 120
 TIMEFRAME_SECONDS      = {"1m": 60, "5m": 300, "15m": 900, "1h": 3_600, "4h": 14_400, "1d": 86_400}
@@ -134,8 +134,18 @@ def _ohlcv_overlays(indicators: Mapping[str, Any], limit: int) -> dict[str, Any]
                             "status": moving.get("quality", {}).get("status", "unavailable")},
         "bollinger_bands": {"alignment": "ohlcv_records_by_index", "series": _tail_series(bands.get("series", {}), limit), "parameters": deepcopy(bands.get("parameters", {})),
                             "status": bands.get("quality", {}).get("status", "unavailable")},
-        "fibonacci_levels": {"render_mode": "horizontal_levels", "current": deepcopy(fibonacci.get("current", {})),
-                             "parameters": deepcopy(fibonacci.get("parameters", {})), "status": fibonacci.get("quality", {}).get("status", "unavailable")},
+        "fibonacci_levels": {
+            "render_mode": "horizontal_levels",
+            "current": deepcopy(fibonacci.get("current", {})),
+            "parameters": {**deepcopy(fibonacci.get("parameters", {})),
+                           "ratios": [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0],
+                           "mode": "processing_calculated"},
+            "unit": "USDT",
+            "status": "available" if fibonacci.get("quality", {}).get("status") == "ok" else "unavailable",
+            "data_mode": "processing",
+            "is_proxy": False,
+            "reason": None if fibonacci.get("quality", {}).get("status") == "ok" else fibonacci.get("quality", {}).get("status", "fibonacci_unavailable"),
+        },
         "regression_channel": {
             "alignment": "ohlcv_records_by_index",
             "series": _tail_series(regression.get("series", {}), limit),
@@ -146,19 +156,34 @@ def _ohlcv_overlays(indicators: Mapping[str, Any], limit: int) -> dict[str, Any]
             "provenance": {"owner": "Prices Processing", "calculation": "rolling_ordinary_least_squares", "recalculate_in_hmi": False},
         },
     }
-    supports = list(sr_current.get("support_levels", []) or [])
-    resistances = list(sr_current.get("resistance_levels", []) or [])
+    # Processor publishes support/resistance under ``current.support`` and
+    # ``current.resistance``.  Screen A consumes a keyed S1..S3 / R1..R3
+    # contract, so normalize the Processing result here without HMI math.
+    supports = list(sr_current.get("support", sr_current.get("support_levels", [])) or [])
+    resistances = list(sr_current.get("resistance", sr_current.get("resistance_levels", [])) or [])
+    support_levels = {f"S{i+1}": value for i, value in enumerate(supports[:3])}
+    resistance_levels = {f"R{i+1}": value for i, value in enumerate(resistances[:3])}
+    sr_parameters = deepcopy(support_resistance.get("parameters", {})) if isinstance(support_resistance, Mapping) else {}
+    sr_parameters = {"level_count": 3, "mode": "processing_calculated", **sr_parameters}
     overlays["support"] = {
-        "status": "available" if supports else "unavailable",
-        "reason": None if supports else "support_levels_unavailable",
-        "current": {"levels": [{"id": f"S{i+1}", "label": f"S{i+1}", "value": value} for i, value in enumerate(supports)]},
-        "parameters": deepcopy(support_resistance.get("parameters", {})) if isinstance(support_resistance, Mapping) else {},
+        "render_mode": "horizontal_levels",
+        "current": {"levels": support_levels},
+        "parameters": sr_parameters,
+        "unit": "USDT",
+        "status": "available" if len(support_levels) == 3 else "unavailable",
+        "data_mode": "processing",
+        "is_proxy": False,
+        "reason": None if len(support_levels) == 3 else "support_levels_unavailable",
     }
     overlays["resistance"] = {
-        "status": "available" if resistances else "unavailable",
-        "reason": None if resistances else "resistance_levels_unavailable",
-        "current": {"levels": [{"id": f"R{i+1}", "label": f"R{i+1}", "value": value} for i, value in enumerate(resistances)]},
-        "parameters": deepcopy(support_resistance.get("parameters", {})) if isinstance(support_resistance, Mapping) else {},
+        "render_mode": "horizontal_levels",
+        "current": {"levels": resistance_levels},
+        "parameters": deepcopy(sr_parameters),
+        "unit": "USDT",
+        "status": "available" if len(resistance_levels) == 3 else "unavailable",
+        "data_mode": "processing",
+        "is_proxy": False,
+        "reason": None if len(resistance_levels) == 3 else "resistance_levels_unavailable",
     }
     for overlay_id in ("pivot_points", "vwap"):
         overlays[overlay_id] = {"status": "unavailable", "reason": "not_available_in_prices_processing"}
@@ -286,7 +311,7 @@ def build_main_ohlcv_chart(processing_output: Mapping[str, Any], classification_
             }
     return {"chart_id": "prices_main_ohlcv", "selected_market": selection["selected_market"], "available_markets": list(selection["available_markets"]),
             "selected_timeframe": selection["selected_timeframe"], "available_timeframes": list(selection["available_timeframes"]), "markets": deepcopy(markets),
-            "optional_overlays": {"general_close": True, "regression_channel": True, "moving_average_cross_markers": True,
+            "optional_overlays": {"spot_close": True, "regression_channel": True, "moving_average_cross_markers": True,
                                   "regression_bollinger_cross_markers": True, "buy_sell_volume_split": True},
             "annotations": _chart_annotations(classification_output or {}, processing_output)}
 
@@ -485,17 +510,17 @@ def build_prices_events(classification_output: Mapping[str, Any], processing_out
         "event_groups": ["moving_average_cross", "channel_cross"],
     }
 
-    coverage: dict[str, Any] = {"general": {}}
+    coverage: dict[str, Any] = {"spot": {}}
     stochastic: dict[str, Any] = {}
     for timeframe in TIMEFRAME_ORDER:
         events = [
             registry["by_id"][uid] for uid in technical
-            if registry["by_id"].get(uid, {}).get("source", {}).get("market") == "general"
+            if registry["by_id"].get(uid, {}).get("source", {}).get("market") == "spot"
             and registry["by_id"].get(uid, {}).get("source", {}).get("timeframe") == timeframe
         ]
         ma_events = [event for event in events if event.get("event_group") == "moving_average_cross"]
         channel_events = [event for event in events if event.get("event_group") == "channel_cross"]
-        coverage["general"][timeframe] = {
+        coverage["spot"][timeframe] = {
             "moving_average_cross_events": len(ma_events),
             "channel_cross_events": len(channel_events),
             "ema_cross_events": sum(str(event.get("event_id", "")).startswith("ema_") for event in ma_events),
@@ -559,7 +584,7 @@ def build_prices_events(classification_output: Mapping[str, Any], processing_out
         "stochastic_zone_filter": {"policy_id": "stochastic_cross_zone_30_70_v1", "recalculate_in_hmi": False},
     }
     registry["stochastic_cross_coverage"] = {
-        "market": "general",
+        "market": "spot",
         "thresholds": {"buy_max": 30.0, "sell_min": 70.0},
         "by_timeframe": stochastic,
     }
@@ -573,11 +598,11 @@ def _buy_sell_projection(processing_output: Mapping[str, Any], selection: Mappin
     The proxy follows the frozen SP policy: candle-position allocation of
     ``volume_usd`` into buy/sell components.
     """
-    by_market_timeframe: dict[str, Any] = {"general": {}}
+    by_market_timeframe: dict[str, Any] = {"spot": {}}
     expected_24h = {"1m": 1440, "5m": 288, "15m": 96, "1h": 24, "4h": 6, "1d": 1}
 
     for timeframe in TIMEFRAME_ORDER:
-        records = _processing_records(processing_output, "general", timeframe)
+        records = _processing_records(processing_output, "spot", timeframe)
         display_records = records[-DEFAULT_DISPLAY_WINDOW:]
         display_rows = [_volume_side_row(row) for row in display_records]
         expected = expected_24h[timeframe]
@@ -588,7 +613,7 @@ def _buy_sell_projection(processing_output: Mapping[str, Any], selection: Mappin
             "buy_share": None, "sell_share": None,
         }
         status = "available" if display_rows else "unavailable"
-        by_market_timeframe["general"][timeframe] = {
+        by_market_timeframe["spot"][timeframe] = {
             "status": status,
             "current": current,
             "display_window": _volume_side_summary(display_rows),
@@ -596,7 +621,7 @@ def _buy_sell_projection(processing_output: Mapping[str, Any], selection: Mappin
         }
 
     selected_timeframe = str(selection.get("selected_timeframe") or DEFAULT_TIMEFRAME)
-    selected = by_market_timeframe["general"].get(selected_timeframe, {})
+    selected = by_market_timeframe["spot"].get(selected_timeframe, {})
     current = deepcopy(selected.get("current"))
     window_24h = deepcopy(selected.get("window_24h"))
     status = selected.get("status", "unavailable")
@@ -605,7 +630,7 @@ def _buy_sell_projection(processing_output: Mapping[str, Any], selection: Mappin
         "status": status,
         "reason": None if status == "available" else "records_unavailable",
         "unit": "USD",
-        "selected_market": "general",
+        "selected_market": "spot",
         "selected_timeframe": selected_timeframe,
         "current": current,
         "window_24h": window_24h,
@@ -620,7 +645,7 @@ def _buy_sell_projection(processing_output: Mapping[str, Any], selection: Mappin
             "annotations": False, "summary_box": False,
             "buy_color_token": "bullish", "sell_color_token": "bearish",
         },
-        "source_paths": ["charts.ohlcv.markets.general.timeframes.*.volume_by_side"],
+        "source_paths": ["charts.ohlcv.markets.spot.timeframes.*.volume_by_side"],
     }
 
 
@@ -748,6 +773,35 @@ def build_prices_widgets(processing_output: Mapping[str, Any], classification_ou
                      if registry["by_id"][uid].get("source", {}).get("market") == market and registry["by_id"][uid].get("source", {}).get("timeframe") == timeframe]
     averages   = indicators.get("moving_averages", {})
     statistics = classification_output.get("statistical_signals", {}).get(market, {}).get(timeframe, {})
+
+    # Screen A consumes precomputed support/resistance for every timeframe.
+    # Keep the selected pair at the widget root and the full map available for
+    # one-click timeframe changes; the HMI never derives levels.
+    sr_by_timeframe: dict[str, Any] = {}
+    all_indicators = processing_output.get("features", {}).get("indicators", {}).get(market, {})
+    for tf in TIMEFRAME_ORDER:
+        sr_package = all_indicators.get(tf, {}).get("support_resistance", {})
+        current = sr_package.get("current", {}) if isinstance(sr_package, Mapping) else {}
+        supports = list(current.get("support", current.get("support_levels", [])) or [])
+        resistances = list(current.get("resistance", current.get("resistance_levels", [])) or [])
+        support_map = {f"S{i+1}": value for i, value in enumerate(supports[:3])}
+        resistance_map = {f"R{i+1}": value for i, value in enumerate(resistances[:3])}
+        sr_by_timeframe[tf] = {
+            "support": support_map,
+            "resistance": resistance_map,
+            "status": "available" if len(support_map) == 3 and len(resistance_map) == 3 else "unavailable",
+        }
+    selected_sr = sr_by_timeframe.get(timeframe, {})
+    sr_widget = {
+        "widget_id": "support_resistance_zones",
+        "status": selected_sr.get("status", "unavailable"),
+        "selected_market": market,
+        "selected_timeframe": timeframe,
+        "by_market_timeframe": {market: sr_by_timeframe},
+        "data_mode": "processing",
+        "is_proxy": False,
+        "reason": None if selected_sr.get("status") == "available" else "support_resistance_unavailable",
+    }
     return {
         "price_change": {"widget_id": "price_change", "status": "available" if records else "unavailable", "unit": "percent",
                          "windows": _price_change_windows(records, change_24h=window_24h["change_percent"])},
@@ -768,7 +822,7 @@ def build_prices_widgets(processing_output: Mapping[str, Any], classification_ou
                                  "low_24h": min((float(record["low"]) for record in window), default=None)},
         "volume_profile": _unavailable_widget("volume_profile", "price_volume_distribution_not_calculated"),
         "pivot_points_summary": _unavailable_widget("pivot_points_summary", "pivot_points_not_calculated"),
-        "support_resistance_zones": _unavailable_widget("support_resistance_zones", "zones_not_calculated"),
+        "support_resistance_zones": sr_widget,
         "distribution_histogram": _unavailable_widget("distribution_histogram", "histogram_bins_not_calculated"),
         "correlation": _unavailable_widget("correlation", "benchmark_series_not_available"),
         "price_forecast": _unavailable_widget("price_forecast", "forecast_model_not_configured"),
@@ -871,7 +925,7 @@ def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classifi
     raw_stochastic: list[Mapping[str, Any]] = []
     for timeframe in TIMEFRAME_ORDER:
         raw_stochastic.extend(
-            event for event in classification_output.get("events", {}).get("technical_crosses", {}).get("general", {}).get(timeframe, [])
+            event for event in classification_output.get("events", {}).get("technical_crosses", {}).get("spot", {}).get(timeframe, [])
             if str(event.get("event_id", "")) in {"k_above_d", "k_below_d"}
         )
     retained_buy = sum(event.get("signal") == "bullish" for event in stochastic_events)
@@ -901,22 +955,22 @@ def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classifi
     return {
         "regression_channel": {
             "status": "available", "window": 100, "deviation_multiplier": 2.0,
-            "channel_cross_event_count": len(channel), "market_scope": "general",
+            "channel_cross_event_count": len(channel), "market_scope": "spot",
         },
         "buy_sell_volume_split": {
             "status": contract.get("widgets", {}).get("volume_buy_sell_split", {}).get("status", "unavailable"),
             "method": "synthetic_candle_position_proxy", "is_proxy": True,
-            "presentation": "mirrored_buy_above_sell_below", "market_scope": "general",
+            "presentation": "mirrored_buy_above_sell_below", "market_scope": "spot",
         },
-        "single_general_price": {
-            "status": "available", "market": "general",
-            "construction": "direct_general_reference_series", "alternate_market_prices": False,
+        "single_spot_price": {
+            "status": "available", "market": "spot",
+            "construction": "direct_spot_reference_series", "alternate_market_prices": False,
         },
         "same_family_moving_average_pairs": {
-            "status": "available", "family_count": 3, "series_count": 9, "pair_count": 10,
+            "status": "available", "family_count": 3, "series_count": 6, "pair_count": 3,
             "event_count": len(moving),
             "events_by_family": {"ema": count_prefix("ema_"), "sma": count_prefix("sma_"), "wma": count_prefix("wma_")},
-            "cross_family_policy": "same_family_only", "mixed_family_events_removed": 0, "market_scope": "general",
+            "cross_family_policy": "same_family_only", "mixed_family_events_removed": 0, "market_scope": "spot",
         },
         "stochastic_cross_zone_filter": {
             "status": "available", "policy_id": "stochastic_cross_zone_30_70_v1",
@@ -938,7 +992,7 @@ def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classifi
                 "stochastic_gate": {"bullish": "K crosses above D while K,D <= 20", "bearish": "K crosses below D while K,D >= 80"},
                 "recalculate_in_hmi": False, "no_event_behavior": "show_no_arrow",
             },
-            "default_context": {"market": "general", "timeframe": "1h"},
+            "default_context": {"market": "spot", "timeframe": "1h"},
             "default_context_event_counts": one_hour_counts,
         },
         "analysis_navigation_and_summary_v1": {
@@ -957,6 +1011,16 @@ def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classifi
             "all_ma_series_warm_in_visible_window": records_per_timeframe >= 200, "recalculate_in_hmi": False,
         },
         "temporal_selector_contract_v3": {"selector_type": "TIMEFRAME", "options": list(TIMEFRAME_ORDER), "auto_refresh": True},
+        "screen_a_price_levels_demo_v1": {
+            "status": "available",
+            "scope": "prices_screen_a",
+            "timeframes": list(TIMEFRAME_ORDER),
+            "support_resistance": "processing_calculated",
+            "fibonacci": "processing_calculated",
+            "real_market_calculation": True,
+            "hmi_recalculation": False,
+            "note": "Support, resistance and Fibonacci are calculated upstream by Prices Processing.",
+        },
         "realism_v1": {
             "status": "available", "fixture_as_of_timestamp": reference_timestamp if is_demo else None,
             "fixture_as_of_iso": fixture_iso if is_demo else None,
@@ -1064,7 +1128,7 @@ def build_prices_selected_view(processing_output: Mapping[str, Any], classificat
         raise ValueError("Selected Prices view requires a prices_ohlcv processing contract")
     if classification_output.get("family") != "prices_ohlcv" or classification_output.get("stage") != "classification":
         raise ValueError("Selected Prices view requires a prices_ohlcv classification contract")
-    if market not in {"general", "spot", "futures"}:
+    if market not in {"spot", "spot", "futures"}:
         raise ValueError(f"Unsupported Prices market: {market}")
     if timeframe not in TIMEFRAME_ORDER:
         raise ValueError(f"Unsupported Prices timeframe: {timeframe}")

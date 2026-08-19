@@ -34,7 +34,6 @@ def fetch(store: FixtureStore, family: str, *, endpoint_id: str, path: str,
             "transfers_volume_from_miners_sum": ("transfers_volume_from_miners_sum", f"{interval}_raw.json"),
             "miners_unspent_supply": ("miners_unspent_supply", "24h_raw.json"),
             "revenue_sum": ("revenue_sum", "24h_usd_raw.json"),
-            "volume_mined_sum": ("volume_mined_sum", "24h_usd_raw.json"),
             "revenue_from_fees": ("revenue_from_fees", "24h_raw.json"),
         }
         metric, filename = mapping[endpoint_id]

@@ -12,8 +12,9 @@ FAMILY             = "open_interest_and_funding"
 SCREEN_TIMEFRAMES  = ("1m", "5m", "15m", "1h", "4h", "1d")
 TIMEFRAME_SECONDS  = {"1m": 60, "5m": 300, "15m": 900, "1h": 3_600, "4h": 14_400, "1d": 86_400}
 VALID_MODES        = {"bootstrap", "incremental", "recovery"}
-BOOTSTRAP_LIMIT    = 500
-INCREMENTAL_LIMITS = {"1m": 15, "5m": 12, "15m": 8, "1h": 6, "4h": 4, "1d": 3}
+BOOTSTRAP_LIMIT    = 1000
+BOOTSTRAP_TIMEFRAMES = ("1m", "15m", "1h", "4h", "1d")
+INCREMENTAL_LIMITS = {"1m": 15}
 
 ENDPOINTS = {
     "aggregated_open_interest_ohlc": {"provider": "coinglass", "endpoint_id": "aggregated_open_interest_ohlc", "path": "/api/futures/open-interest/aggregated-history", "request_kind": "timeframe_series", "raw_shape": "code_msg_data_list_ohlc", "required": True, "canonical_id": "open_interest_ohlc"},
@@ -110,7 +111,7 @@ def _request(spec: Mapping[str, Any], *, metric_id: str, timeframe: str | None, 
 
 def build_open_interest_and_funding_fetch_plan(*, mode: str, reference_timestamp: int, existing_state: Mapping[str, Any] | None = None,
                                                 recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_snapshots: bool = True,
-                                                include_confirmations: bool = True) -> list[dict[str, Any]]:
+                                                include_confirmations: bool = True, refresh_secondary: bool = False) -> list[dict[str, Any]]:
     if mode not in VALID_MODES:
         raise ValueError("unsupported mode")
     reference = _timestamp(reference_timestamp, "reference_timestamp")
@@ -149,20 +150,27 @@ def build_open_interest_and_funding_fetch_plan(*, mode: str, reference_timestamp
         return plan
 
     plan: list[dict[str, Any]] = []
+    primary_timeframes = BOOTSTRAP_TIMEFRAMES if mode == "bootstrap" else ("1m",)
     for metric, key in (("open_interest_ohlc", "aggregated_open_interest_ohlc"), ("funding_rate_ohlc", "oi_weighted_funding_rate_ohlc")):
         spec = ENDPOINTS[key]
-        for timeframe in SCREEN_TIMEFRAMES:
+        for timeframe in primary_timeframes:
             limit = BOOTSTRAP_LIMIT if mode == "bootstrap" else INCREMENTAL_LIMITS[timeframe]
             end = reference
             existing_last = _last_timestamp(existing, metric, timeframe)
             start = max(0, (existing_last if mode == "incremental" and existing_last is not None else end - (limit - 1) * TIMEFRAME_SECONDS[timeframe]) - TIMEFRAME_SECONDS[timeframe])
             plan.append(_request(spec, metric_id=metric, timeframe=timeframe, start=start, end=end,
                                  params=build_coinglass_history_params(timeframe=timeframe, limit=limit, start_timestamp=start, end_timestamp=end), suffix=timeframe))
+    # The two exchange snapshots drive current OI/Funding widgets and remain live.
+    # Options and confirmation providers are secondary and are refreshed only on
+    # bootstrap or an explicit secondary pass.
     if include_snapshots:
-        for key, params in (("open_interest_exchange_list", {"symbol": "BTC"}), ("funding_rate_exchange_list", {}), ("options_info", {"symbol": "BTC"})):
+        for key, params in (("open_interest_exchange_list", {"symbol": "BTC"}), ("funding_rate_exchange_list", {})):
             spec = ENDPOINTS[key]
             plan.append(_request(spec, metric_id=key, timeframe=None, start=None, end=reference, params=params, suffix="snapshot"))
-    if include_confirmations:
+        if mode != "incremental" or refresh_secondary:
+            spec = ENDPOINTS["options_info"]
+            plan.append(_request(spec, metric_id="options_info", timeframe=None, start=None, end=reference, params={"symbol": "BTC"}, suffix="snapshot"))
+    if include_confirmations and (mode != "incremental" or refresh_secondary):
         start = max(0, reference - (BOOTSTRAP_LIMIT - 1) * 3_600)
         for key in ("cryptoquant_open_interest", "cryptoquant_funding_rates"):
             spec = ENDPOINTS[key]
@@ -203,13 +211,15 @@ class OpenInterestAndFundingRawExtractor:
 
     def extract(self, *, mode: str, reference_timestamp: int, existing_state: Mapping[str, Any] | None = None,
                 recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_snapshots: bool = True, include_confirmations: bool = True,
-                data_mode: str = "live", is_demo: bool = False, execution_timestamp: int | None = None) -> dict[str, Any]:
+                data_mode: str = "live", is_demo: bool = False, execution_timestamp: int | None = None,
+                refresh_secondary: bool = False) -> dict[str, Any]:
         if data_mode not in {"live", "synthetic"} or type(is_demo) is not bool or (data_mode == "synthetic" and not is_demo):
             raise ValueError("invalid data_mode/is_demo combination")
         reference = _timestamp(reference_timestamp, "reference_timestamp")
         execution = _timestamp(int(time.time()) if execution_timestamp is None else execution_timestamp, "execution_timestamp")
         plan = build_open_interest_and_funding_fetch_plan(mode=mode, reference_timestamp=reference, existing_state=existing_state,
-            recovery_requests=recovery_requests, include_snapshots=include_snapshots, include_confirmations=include_confirmations)
+            recovery_requests=recovery_requests, include_snapshots=include_snapshots, include_confirmations=include_confirmations,
+            refresh_secondary=refresh_secondary)
         raw = {"series": {metric: {"provider": "coinglass", "endpoint_id": endpoint, "timeframes": {}} for metric, endpoint in
                 (("open_interest_ohlc", "aggregated_open_interest_ohlc"), ("funding_rate_ohlc", "oi_weighted_funding_rate_ohlc"))},
                "snapshots": {}, "confirmations": {}}
@@ -224,13 +234,15 @@ class OpenInterestAndFundingRawExtractor:
         return {"family": FAMILY, "stage": "raw_input", "mode": mode, "context": {"asset": "BTC", "exchange_scope": "all_exchanges",
                 "primary_provider": "coinglass", "confirmation_providers": ["cryptoquant", "glassnode"], "data_mode": data_mode, "is_demo": is_demo,
                 "reference_timestamp": reference, "execution_timestamp": execution, "requested_at": _iso_utc(execution),
-                "include_snapshots": include_snapshots, "include_confirmations": include_confirmations}, "raw": raw}
+                "include_snapshots": include_snapshots, "include_confirmations": include_confirmations,
+                "refresh_secondary": bool(refresh_secondary)}, "raw": raw}
 
 
 def extract_open_interest_and_funding_raw(*, fetcher: OpenInterestAndFundingFetcher, mode: str, reference_timestamp: int,
                                           existing_state: Mapping[str, Any] | None = None, recovery_requests: Sequence[Mapping[str, Any]] | None = None,
                                           include_snapshots: bool = True, include_confirmations: bool = True, data_mode: str = "live",
-                                          is_demo: bool = False, execution_timestamp: int | None = None) -> dict[str, Any]:
+                                          is_demo: bool = False, execution_timestamp: int | None = None,
+                                          refresh_secondary: bool = False) -> dict[str, Any]:
     return OpenInterestAndFundingRawExtractor(fetcher).extract(mode=mode, reference_timestamp=reference_timestamp, existing_state=existing_state,
         recovery_requests=recovery_requests, include_snapshots=include_snapshots, include_confirmations=include_confirmations,
-        data_mode=data_mode, is_demo=is_demo, execution_timestamp=execution_timestamp)
+        data_mode=data_mode, is_demo=is_demo, execution_timestamp=execution_timestamp, refresh_secondary=refresh_secondary)

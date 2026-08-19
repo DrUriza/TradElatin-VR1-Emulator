@@ -21,7 +21,8 @@ PricesFetcher = Callable[..., Any]
 
 def build_prices_fetch_plan(*, mode: str, requests: Sequence[Mapping[str, Any]] | None = None, bootstrap: int = 500,
                             incremental: Mapping[str, int] | None = None, recovery_requests: Sequence[Mapping[str, Any]] | None = None,
-                            bootstrap_limit: int | None = None, incremental_limits: Mapping[str, int] | None = None) -> list[dict[str, Any]]:
+                            bootstrap_limit: int | None = None, incremental_limits: Mapping[str, int] | None = None,
+                            refresh_secondary: bool = False) -> list[dict[str, Any]]:
     """Build the exact CoinGlass requests required for one Prices run."""
     requests    = recovery_requests if recovery_requests is not None else requests
     bootstrap   = bootstrap_limit if bootstrap_limit is not None else bootstrap
@@ -41,8 +42,12 @@ def build_prices_fetch_plan(*, mode: str, requests: Sequence[Mapping[str, Any]] 
             raise ValueError("incremental 1m limit must be between 3 and 15")
         if not 4 <= int(limits["15m"]) <= 8:
             raise ValueError("incremental 15m limit must be between 4 and 8")
+        # Screen Prices is canonical Spot. Futures is retained as a secondary
+        # confirmation/basis dataset and does not need a paid refresh every
+        # incremental cycle. Refresh it only on an explicit secondary pass.
+        markets = ("spot", "futures") if refresh_secondary else ("spot",)
         requests = [{"market": market, "timeframe": timeframe, "limit": int(limit)}
-                    for market in ("spot", "futures")
+                    for market in markets
                     for timeframe, limit in limits.items()]
     else:
         recovery_source = requests
@@ -130,16 +135,19 @@ class PricesOhlcvRawExtractor:
     """Stateful CoinGlass adapter for the two external Prices markets."""
     def __init__(self, *, fetcher: PricesFetcher, symbol: str = "BTCUSDT", exchange: str = "Binance", bootstrap: int = 500,
                  incremental: Mapping[str, int] | None = None, bootstrap_limit: int | None = None,
-                 incremental_limits: Mapping[str, int] | None = None, include_glassnode: bool = True) -> None:
+                 incremental_limits: Mapping[str, int] | None = None, include_glassnode: bool = True,
+                 refresh_secondary: bool = False) -> None:
         self.fetcher            = fetcher
         self.symbol             = symbol
         self.exchange           = exchange
         self.bootstrap_limit    = bootstrap_limit if bootstrap_limit is not None else bootstrap
         self.incremental_limits = dict(incremental_limits if incremental_limits is not None else (incremental or {}))
         self.include_glassnode   = bool(include_glassnode)
+        self.refresh_secondary   = bool(refresh_secondary)
 
     def build_fetch_plan(self, *, mode: str, requests: Sequence[Mapping[str, Any]] | None = None) -> list[dict[str, Any]]:
-        return build_prices_fetch_plan(mode=mode, requests=requests, bootstrap=self.bootstrap_limit, incremental=self.incremental_limits)
+        return build_prices_fetch_plan(mode=mode, requests=requests, bootstrap=self.bootstrap_limit,
+                                       incremental=self.incremental_limits, refresh_secondary=self.refresh_secondary)
 
     def build_params(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return build_coinglass_ohlc_params(symbol=self.symbol, exchange=self.exchange, timeframe=str(request["timeframe"]),
@@ -154,14 +162,19 @@ class PricesOhlcvRawExtractor:
     def run(self, *, mode: str, requests: Sequence[Mapping[str, Any]] | None = None, recovery_requests: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
         fetch_plan = self.build_fetch_plan(mode=mode, requests=recovery_requests if recovery_requests is not None else requests)
         raw: dict[str, Any] = {"spot": self.extract_spot(fetch_plan), "futures": self.extract_futures(fetch_plan)}
-        if self.include_glassnode:
+        # Glassnode Price OHLC + Market Cap are secondary/slow-moving for this
+        # family. Bootstrap them once; incremental runs reuse persisted values
+        # unless a scheduled secondary refresh is explicitly requested.
+        if self.include_glassnode and (mode == "bootstrap" or self.refresh_secondary):
             asset = self.symbol.upper().removesuffix("USDT").removesuffix("USD") or "BTC"
             raw["glassnode"] = extract_glassnode_prices_raw(fetcher=self.fetcher, asset=asset, interval="1h")
         return {"family": PRICES_FAMILY, "mode": mode, "raw": raw}
 
 def extract_prices_ohlcv_raw(*, fetcher: PricesFetcher, mode: str, symbol: str = "BTCUSDT", exchange: str = "Binance",
                              requests: Sequence[Mapping[str, Any]] | None = None, bootstrap: int = 500,
-                             incremental: Mapping[str, int] | None = None, include_glassnode: bool = True) -> dict[str, Any]:
+                             incremental: Mapping[str, int] | None = None, include_glassnode: bool = True,
+                             refresh_secondary: bool = False) -> dict[str, Any]:
     """Public compatibility facade for the OO raw extractor."""
-    extractor = PricesOhlcvRawExtractor(fetcher=fetcher, symbol=symbol, exchange=exchange, bootstrap=bootstrap, incremental=incremental, include_glassnode=include_glassnode)
+    extractor = PricesOhlcvRawExtractor(fetcher=fetcher, symbol=symbol, exchange=exchange, bootstrap=bootstrap, incremental=incremental,
+                                        include_glassnode=include_glassnode, refresh_secondary=refresh_secondary)
     return extractor.run(mode=mode, requests=requests)

@@ -33,7 +33,7 @@ UNITS = {
     "miner_net_position_change": "BTC/day", "miner_outflow_total": "BTC/day", "mpi": "z_score",
     "puell_multiple": "ratio", "sth_sopr": "ratio", "lth_sopr": "ratio", "nupl": "ratio",
     "miners_unspent_supply": "BTC", "utxo_age_distribution": "mixed",
-    "miner_revenue_total_usd": "USD/day", "miner_block_reward_revenue_usd": "USD/day",
+    "miner_revenue_total_usd": "USD/day",
     "miner_revenue_from_fees": "provider_native_percentage",
 }
 # Daily providers may omit the open boundary or the still-incomplete current day.
@@ -236,7 +236,6 @@ NORMALIZERS: dict[str, Callable[..., dict[str, Any]]] = {
     "sth_sopr": normalize_sth_sopr_record, "lth_sopr": normalize_lth_sopr_record, "nupl": normalize_nupl_record,
     "miners_unspent_supply": lambda record: _normalize_glassnode_extension("miners_unspent_supply", record),
     "miner_revenue_total_usd": lambda record: _normalize_glassnode_extension("miner_revenue_total_usd", record),
-    "miner_block_reward_revenue_usd": lambda record: _normalize_glassnode_extension("miner_block_reward_revenue_usd", record),
     "miner_revenue_from_fees": lambda record: _normalize_glassnode_extension("miner_revenue_from_fees", record),
     "utxo_age_distribution": normalize_utxo_age_distribution_record,
 }
@@ -582,7 +581,7 @@ class OnChainMinersInputPreprocessor:
                                       execution_timestamp=execution_timestamp)
         existing_series = self.existing_contract.get("series", {})
         existing_series = existing_series if isinstance(existing_series, Mapping) else {}
-        series = _copy_normalizing_negative_zero(dict(existing_series)) if mode == "recovery" else {}
+        series = _copy_normalizing_negative_zero(dict(existing_series)) if mode in {"incremental", "recovery"} else {}
         for metric_id, payload in raw["raw"].items():
             if metric_id not in COLLECTION_EXTENSION_IDS:
                 series[metric_id] = preprocess_on_chain_metric(
@@ -598,7 +597,7 @@ class OnChainMinersInputPreprocessor:
                         existing_series={}, mode=mode)
         existing_collections = self.existing_contract.get("collections", {})
         existing_collections = existing_collections if isinstance(existing_collections, Mapping) else {}
-        collections: dict[str, Any] = _copy_normalizing_negative_zero(dict(existing_collections)) if mode == "recovery" else {}
+        collections: dict[str, Any] = _copy_normalizing_negative_zero(dict(existing_collections)) if mode in {"incremental", "recovery"} else {}
         if "miner_entities" in raw["raw"]:
             collections["miner_entities"] = preprocess_miner_entities(
                 raw["raw"]["miner_entities"], existing_collections.get("miner_entities", {}))

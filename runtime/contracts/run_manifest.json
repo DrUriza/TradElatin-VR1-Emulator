@@ -3,7 +3,7 @@
     "id": "trad_elatin.runtime.run_manifest.v1",
     "version": "1.0.0"
   },
-  "mode": "incremental",
+  "mode": "bootstrap",
   "data_mode": "synthetic",
   "data_source": "emulator",
   "families": [
@@ -47,15 +47,15 @@
       "long_short_liquidations": "classification\\long_short_liquidations.json",
       "liquidity_microstructure": "classification\\liquidity_microstructure.json"
     },
-    "hmi_contract": {
-      "prices_ohlcv": "hmi_contract\\prices_screen.json",
-      "cvd_volume_orderflow": "hmi_contract\\cvd_volume_orderflow_screen.json",
-      "open_interest_and_funding": "hmi_contract\\open_interest_and_funding_screen.json",
-      "etf_exchange_flows": "hmi_contract\\etf_exchange_flows_screen.json",
-      "on_chain_miners": "hmi_contract\\on_chain_miners_screen.json",
-      "volatility_market_regimes": "hmi_contract\\volatility_market_regimes_screen.json",
-      "long_short_liquidations": "hmi_contract\\long_short_liquidations_screen.json",
-      "liquidity_microstructure": "hmi_contract\\liquidity_microstructure_screen.json"
+    "hmi": {
+      "prices_ohlcv": "hmi\\prices_screen.json",
+      "cvd_volume_orderflow": "hmi\\cvd_volume_orderflow_screen.json",
+      "open_interest_and_funding": "hmi\\open_interest_and_funding_screen.json",
+      "etf_exchange_flows": "hmi\\etf_exchange_flows_screen.json",
+      "on_chain_miners": "hmi\\on_chain_miners_screen.json",
+      "volatility_market_regimes": "hmi\\volatility_market_regimes_screen.json",
+      "long_short_liquidations": "hmi\\long_short_liquidations_screen.json",
+      "liquidity_microstructure": "hmi\\liquidity_microstructure_screen.json"
     }
   },
   "quality": {
@@ -63,49 +63,49 @@
       "input": "ok",
       "processing": "ok",
       "classification": "ok",
-      "hmi_contract": "ok"
+      "hmi": "ok"
     },
     "cvd_volume_orderflow": {
       "input": "ok",
       "processing": "ok",
       "classification": "ok",
-      "hmi_contract": "ok"
+      "hmi": "ok"
     },
     "open_interest_and_funding": {
       "input": "ok",
       "processing": "ok",
       "classification": "ok",
-      "hmi_contract": "ok"
+      "hmi": "ok"
     },
     "etf_exchange_flows": {
       "input": "ok",
       "processing": "ok",
       "classification": "ok",
-      "hmi_contract": "ok"
+      "hmi": "ok"
     },
     "on_chain_miners": {
-      "input": "ok",
-      "processing": "ok",
-      "classification": "ok",
-      "hmi_contract": "available"
+      "input": "partial",
+      "processing": "partial",
+      "classification": "partial",
+      "hmi": "partial"
     },
     "volatility_market_regimes": {
       "input": "ok",
       "processing": "ok",
       "classification": "ok",
-      "hmi_contract": "available"
+      "hmi": "unknown"
     },
     "long_short_liquidations": {
       "input": "ok",
-      "processing": "partial",
-      "classification": "partial",
-      "hmi_contract": "partial"
+      "processing": "available",
+      "classification": "available",
+      "hmi": "available"
     },
     "liquidity_microstructure": {
       "input": "ok",
       "processing": "ok",
       "classification": "ok",
-      "hmi_contract": "partial"
+      "hmi": "ok"
     }
   },
   "notes": {
@@ -114,17 +114,82 @@
     "timestamp_alignment": "Liquidations price context is rebased only during emulator replay because frozen fixture families were generated at different epochs."
   },
   "acquisition": {
-    "mode": "incremental",
-    "cold_start": false,
-    "database": "runtime\\state\\acquisition.sqlite3",
+    "mode": "bootstrap",
+    "cold_start": true,
+    "database": ".phase2_prices_rebuild_state\\acquisition.sqlite3",
     "raw_inventory": {
-      "count": 191,
-      "sha256": "f6631a283140ddf71a0361ec02716aa1e83a247e45ad62a56e4d30c75b43581c"
+      "count": 226,
+      "sha256": "e44237db11e31c431a5e352259eeca48a3e2b61373cdd7e7ed6200018ddd4a96"
     },
-    "endpoint_states": 184,
-    "records_persisted": 276078,
-    "duration_seconds": 17.635619,
-    "families": {}
+    "endpoint_states": 115,
+    "records_persisted": 241991,
+    "duration_seconds": 115.454983,
+    "families": {
+      "prices_ohlcv": {
+        "requests": 14,
+        "records_read": 41040,
+        "records_new": 41040,
+        "records_deduplicated": 0,
+        "records_revised": 0,
+        "late_arrivals": 0
+      },
+      "cvd_volume_orderflow": {
+        "requests": 25,
+        "records_read": 57144,
+        "records_new": 57144,
+        "records_deduplicated": 0,
+        "records_revised": 0,
+        "late_arrivals": 39384
+      },
+      "open_interest_and_funding": {
+        "requests": 18,
+        "records_read": 10962,
+        "records_new": 10962,
+        "records_deduplicated": 0,
+        "records_revised": 0,
+        "late_arrivals": 0
+      },
+      "etf_exchange_flows": {
+        "requests": 17,
+        "records_read": 8960,
+        "records_new": 8960,
+        "records_deduplicated": 0,
+        "records_revised": 0,
+        "late_arrivals": 0
+      },
+      "on_chain_miners": {
+        "requests": 17,
+        "records_read": 78896,
+        "records_new": 78896,
+        "records_deduplicated": 0,
+        "records_revised": 0,
+        "late_arrivals": 0
+      },
+      "volatility_market_regimes": {
+        "requests": 2,
+        "records_read": 35040,
+        "records_new": 35040,
+        "records_deduplicated": 0,
+        "records_revised": 0,
+        "late_arrivals": 0
+      },
+      "long_short_liquidations": {
+        "requests": 19,
+        "records_read": 3443,
+        "records_new": 3443,
+        "records_deduplicated": 0,
+        "records_revised": 0,
+        "late_arrivals": 0
+      },
+      "liquidity_microstructure": {
+        "requests": 13,
+        "records_read": 6506,
+        "records_new": 6506,
+        "records_deduplicated": 0,
+        "records_revised": 0,
+        "late_arrivals": 0
+      }
+    }
   },
   "contract_validation": {
     "status": "passed",
@@ -174,20 +239,47 @@
     }
   },
   "dirty_execution": {
-    "families": [],
+    "families": [
+      "prices_ohlcv",
+      "cvd_volume_orderflow",
+      "open_interest_and_funding",
+      "etf_exchange_flows",
+      "on_chain_miners",
+      "volatility_market_regimes",
+      "long_short_liquidations",
+      "liquidity_microstructure"
+    ],
     "source_timeframes": [],
     "derived_timeframes": [],
     "windows": [],
     "processing": {
-      "families_executed": [],
-      "records_recomputed": 0,
-      "indicator_points_recomputed": 0
+      "families_executed": [
+        "prices_ohlcv",
+        "cvd_volume_orderflow",
+        "open_interest_and_funding",
+        "etf_exchange_flows",
+        "on_chain_miners",
+        "volatility_market_regimes",
+        "long_short_liquidations",
+        "liquidity_microstructure"
+      ],
+      "records_recomputed": 6000,
+      "indicator_points_recomputed": 6000,
+      "required_lookback_points": 0
     },
     "classification": {
-      "families_executed": []
+      "families_executed": [
+        "prices_ohlcv",
+        "cvd_volume_orderflow",
+        "open_interest_and_funding",
+        "etf_exchange_flows",
+        "on_chain_miners",
+        "volatility_market_regimes",
+        "long_short_liquidations",
+        "liquidity_microstructure"
+      ]
     },
-    "contracts_rebuilt": [],
-    "contracts_reused": [
+    "contracts_rebuilt": [
       "prices_screen.json",
       "cvd_volume_orderflow_screen.json",
       "open_interest_and_funding_screen.json",
@@ -197,10 +289,11 @@
       "long_short_liquidations_screen.json",
       "liquidity_microstructure_screen.json"
     ],
-    "rebuilt_count": 0,
+    "contracts_reused": [],
+    "rebuilt_count": 8,
     "validator": {
       "validated_count": 8,
-      "reused_count": 8
+      "reused_count": 0
     }
   }
 }

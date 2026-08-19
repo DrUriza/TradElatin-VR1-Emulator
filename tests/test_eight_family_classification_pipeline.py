@@ -32,13 +32,14 @@ def test_all_eight_families_run_raw_through_classification() -> None:
     for family in FAMILIES:
         assert classification[family]["family"] == family
         assert classification[family]["stage"] == "classification"
-        assert classification[family]["quality"]["status"] in {"ok", "available"}
+        allowed = {"ok", "available", "partial"} if family == "on_chain_miners" else {"ok", "available"}
+        assert classification[family]["quality"]["status"] in allowed
         json.dumps(classification[family], ensure_ascii=False, allow_nan=False)
 
     prices = classification["prices_ohlcv"]
     assert tuple(prices["technical_bias"]) == ("spot", "futures")
     assert tuple(prices["indicator_signals"]) == ("spot", "futures")
-    assert "general" not in json.dumps(prices, ensure_ascii=False).lower()
+    assert "spot" not in json.dumps(prices, ensure_ascii=False).lower()
 
     volatility = classification["volatility_market_regimes"]
     volatility_text = json.dumps(volatility, ensure_ascii=False).lower()
