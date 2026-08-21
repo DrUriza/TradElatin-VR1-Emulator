@@ -255,7 +255,7 @@ def test_contract_shape_absence_of_classification_and_full_history():
     output = process(contract)
     assert (output["family"], output["stage"], output["version"]) == ("cvd_volume_orderflow", "processing", "0.1.0")
     assert set(output["markets"]) == {"spot", "futures"}
-    assert set(output["markets"]["spot"]["timeframes"]) == {"1m", "5m", "15m", "1h", "4h", "1d"}
+    assert set(output["markets"]["spot"]["timeframes"]) == {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
     assert len(output["markets"]["spot"]["timeframes"]["1m"]["records"]) == len(contract["markets"]["spot"]["cvd"]["timeframes"]["1m"]["records"])
     encoded = json.dumps(output, allow_nan=False).lower()
     for forbidden in ('"classification"', '"kpis"', '"charts"', '"widgets"', '"screen"'):
@@ -278,7 +278,7 @@ def test_quality_ok_with_complete_core_scoped_enrichment_and_prices():
     refs = {market: {"timestamp": START + 3_000_000, "price_usd": 10} for market in ("spot", "futures")}
     output = process(contract, price_reference_by_market=refs)
     assert all(output["markets"][market]["timeframes"][timeframe]["status"] == "available"
-        for market in ("spot", "futures") for timeframe in ("1m", "5m", "15m", "1h", "4h", "1d"))
+        for market in ("spot", "futures") for timeframe in ("1m", "5m", "15m", "30m", "1h", "4h", "1d"))
     assert output["quality"] == {"status": "ok", "core_status": "available", "enrichment_status": "available", "warnings": [], "errors": []}
 
 

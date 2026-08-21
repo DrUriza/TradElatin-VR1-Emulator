@@ -50,3 +50,29 @@ def test_native_only_policies_are_explicit() -> None:
     assert endpoint_policy("funding_rates").resampling_class.value == "NATIVE_ONLY"
     assert endpoint_policy("whale_index").resampling_class.value == "NATIVE_ONLY"
     assert endpoint_policy("realized_volatility_1_week").resampling_class.value == "ROLLING_METRIC"
+
+
+def test_identical_network_request_is_coalesced_within_one_run(tmp_path: Path) -> None:
+    raw = _raw_root(tmp_path)
+    state = tmp_path / "state"
+    calls = {"count": 0}
+
+    class CountingRouter:
+        def for_family(self, family):
+            def fetcher(**request):
+                calls["count"] += 1
+                return {"code": "0", "data": [{"time": 1_700_000_000_000, "value": 1.0}]}
+            return fetcher
+
+    request = {"provider": "coinglass", "endpoint_id": "spot_footprint", "path": "/api/spot/volume/footprint-history",
+               "params": {"exchange": "Binance", "symbol": "BTCUSDT", "interval": "1m", "limit": 100}}
+    manager = AcquisitionManager(state, input_raw_root=raw)
+    router = manager.wrap_router(CountingRouter())
+    first = router.for_family("cvd_volume_orderflow")(**request)
+    second = router.for_family("liquidity_microstructure")(**request)
+    assert first == second
+    assert calls["count"] == 1
+    summary = manager.summary()
+    assert summary["families"]["cvd_volume_orderflow"]["requests"] == 1
+    assert summary["families"]["liquidity_microstructure"]["requests_avoided"] == 1
+    manager.close()

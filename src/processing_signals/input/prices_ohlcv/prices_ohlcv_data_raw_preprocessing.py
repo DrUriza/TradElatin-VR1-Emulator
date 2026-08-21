@@ -29,10 +29,12 @@ def determine_prices_input_mode(
     if recovery_requests:
         return "recovery"
     markets = (existing_contract or {}).get("markets", {})
-    for market in ("spot", "futures"):
-        timeframes = markets.get(market, {}).get("timeframes", {}) if isinstance(markets, Mapping) else {}
-        if not all(timeframes.get(timeframe, {}).get("records") for timeframe in BOOTSTRAP_TIMEFRAMES):
-            return "bootstrap"
+    # Spot is the only required Prices primitive in the final 33-endpoint
+    # runtime. Futures is a structural unavailable placeholder and must never
+    # force a perpetual bootstrap loop.
+    timeframes = markets.get("spot", {}).get("timeframes", {}) if isinstance(markets, Mapping) else {}
+    if not all(timeframes.get(timeframe, {}).get("records") for timeframe in BOOTSTRAP_TIMEFRAMES):
+        return "bootstrap"
     return "incremental"
 
 
@@ -235,9 +237,14 @@ def evaluate_prices_input_quality(markets: Mapping[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
     statuses: dict[str, str] = {}
     for market in ("spot", "futures"):
-        timeframes      = markets.get(market, {}).get("timeframes", {})
-        has_records     = bool(timeframes) and all(payload.get("records") for payload in timeframes.values())
+        timeframes = markets.get(market, {}).get("timeframes", {})
+        has_records = bool(timeframes) and all(payload.get("records") for payload in timeframes.values())
         has_unavailable = any(payload.get("unavailable_records") for payload in timeframes.values())
+        if market == "futures":
+            statuses[market] = "unavailable"
+            # Structural compatibility only; Futures OHLC is not a required
+            # source and therefore must not trigger recovery.
+            continue
         statuses[market] = "ok" if has_records and not has_unavailable else "partial"
         for timeframe, payload in timeframes.items():
             for warning in payload.get("warnings", []):
@@ -245,7 +252,7 @@ def evaluate_prices_input_quality(markets: Mapping[str, Any]) -> dict[str, Any]:
             unavailable = payload.get("unavailable_records", [])
             if unavailable:
                 warnings.append(f"{market}/{timeframe}: {len(unavailable)} unsynchronized timestamps")
-    recovery_required = any(status != "ok" for status in statuses.values())
+    recovery_required = statuses.get("spot") != "ok"
     return {
         **statuses,
         "recovery_required": recovery_required,
@@ -323,15 +330,31 @@ class PricesOhlcvInputPreprocessor:
             mode=mode,
             recovery_requests=recovery_requests,
         )
-        spot    = self.preprocess_market(market="spot", raw_market=raw["raw"]["spot"])
-        futures = self.preprocess_market(market="futures", raw_market=raw["raw"]["futures"])
+        spot = self.preprocess_market(market="spot", raw_market=raw["raw"]["spot"])
+        # Final 33-endpoint policy: Prices has one canonical external market,
+        # CoinGlass Spot.  Keep a structural Futures placeholder because older
+        # Processing/Classification contracts expose a Spot/Futures comparison,
+        # but never carry stale Futures OHLC forward or fabricate it from Spot.
+        futures = {
+            "provider": "coinglass",
+            "endpoint_id": "futures_ohlcv",
+            "status": "unavailable",
+            "reason": "retired_by_33_endpoint_policy",
+            "timeframes": {
+                timeframe: {
+                    "incoming_records": [],
+                    "records": [],
+                    "warnings": ["retired_by_33_endpoint_policy"],
+                    "status": "unavailable",
+                    "reason": "retired_by_33_endpoint_policy",
+                }
+                for timeframe in BOOTSTRAP_TIMEFRAMES
+            },
+        }
         spot.update({"exchange": self.raw_extractor.exchange, "symbol": self.raw_extractor.symbol})
         futures.update({"exchange": self.raw_extractor.exchange, "symbol": self.raw_extractor.symbol})
 
-        markets = {
-            "spot": spot,
-            "futures": futures,
-        }
+        markets = {"spot": spot, "futures": futures}
         previous_confirmations = self.existing_contract.get("confirmations", {}).get("glassnode", {})
         previous_features = self.existing_contract.get("provider_features", {})
         previous_glassnode = {
@@ -349,7 +372,7 @@ class PricesOhlcvInputPreprocessor:
                 "price_market": "spot",
                 "canonical_contract_market": "spot",
                 "canonical_source_market": "spot",
-                "available_markets": ["spot", "futures"],
+                "available_markets": ["spot"],
                 "symbol": self.raw_extractor.symbol,
                 "exchange": self.raw_extractor.exchange,
             },

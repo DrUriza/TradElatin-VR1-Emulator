@@ -30,6 +30,7 @@ from .long_short_liquidations_data_raw_extract import (
     COINGLASS_TOP_POSITION_ENDPOINT_ID,
     COINGLASS_TOP_ACCOUNT_ENDPOINT_ID,
     COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID,
+    POSITIONING_TIMEFRAMES,
     LONG_SHORT_LIQUIDATIONS_FAMILY,
     VALID_MODES,
     LongShortLiquidationsRawExtractor,
@@ -646,9 +647,8 @@ def determine_required_datasets(
         return required
     required = set()
     if mode == "bootstrap":
-        required.update({"coinglass.aggregated_history", "coinglass.exchange_snapshot",
-                         "coinglass.aggregated_map"})
-    required_endpoints = {"aggregated_liquidation_history", "liquidation_exchange_list",
+        required.update({"coinglass.aggregated_history", "coinglass.aggregated_map"})
+    required_endpoints = {"aggregated_liquidation_history",
                           "aggregated_liquidation_map", "pair_liquidation_history",
                           "liquidation_order_events", "pair_liquidation_map",
                           COINGLASS_TOP_POSITION_ENDPOINT_ID, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID,
@@ -689,18 +689,34 @@ class LongShortLiquidationsInputPreprocessor:
         history = _dataset(select("coinglass", "aggregated_liquidation_history"), raw,
                            unwrap_coinglass_list_response, normalize_coinglass_aggregated_history_record,
                            existing=coinglass_old.get("aggregated_history"), interval="1h")
-        top_position_ratio = _dataset(select("coinglass", COINGLASS_TOP_POSITION_ENDPOINT_ID), raw,
-                                      unwrap_coinglass_list_response,
-                                      lambda row: normalize_coinglass_positioning_record(row, kind="top_position"),
-                                      existing=coinglass_old.get("top_position_ratio"), interval="1h")
-        top_account_ratio = _dataset(select("coinglass", COINGLASS_TOP_ACCOUNT_ENDPOINT_ID), raw,
-                                     unwrap_coinglass_list_response,
-                                     lambda row: normalize_coinglass_positioning_record(row, kind="top_account"),
-                                     existing=coinglass_old.get("top_account_ratio"), interval="1h")
-        global_account_ratio = _dataset(select("coinglass", COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID), raw,
-                                        unwrap_coinglass_list_response,
-                                        lambda row: normalize_coinglass_positioning_record(row, kind="global_account"),
-                                        existing=coinglass_old.get("global_account_ratio"), interval="1h")
+        def positioning_by_timeframe(endpoint_id: str, kind: str, legacy_key: str) -> dict[str, Any]:
+            previous = coinglass_old.get("positioning_by_timeframe", {}).get(legacy_key, {}) \
+                if isinstance(coinglass_old.get("positioning_by_timeframe"), Mapping) else {}
+            requests_by_tf: dict[str, list[Mapping[str, Any]]] = {}
+            for request in select("coinglass", endpoint_id):
+                interval = request.get("params", {}).get("interval") if isinstance(request.get("params"), Mapping) else None
+                if isinstance(interval, str):
+                    requests_by_tf.setdefault(interval, []).append(request)
+            result: dict[str, Any] = {}
+            for timeframe in POSITIONING_TIMEFRAMES:
+                existing_tf = previous.get(timeframe) if isinstance(previous, Mapping) else None
+                # Backward compatibility: old contracts stored only the canonical 1h dataset.
+                if timeframe == "1h" and existing_tf is None:
+                    existing_tf = coinglass_old.get(legacy_key)
+                result[timeframe] = _dataset(
+                    requests_by_tf.get(timeframe, []), raw, unwrap_coinglass_list_response,
+                    lambda row, k=kind: normalize_coinglass_positioning_record(row, kind=k),
+                    existing=existing_tf, interval=timeframe)
+            return result
+
+        positioning_tf = {
+            "top_position_ratio": positioning_by_timeframe(COINGLASS_TOP_POSITION_ENDPOINT_ID, "top_position", "top_position_ratio"),
+            "top_account_ratio": positioning_by_timeframe(COINGLASS_TOP_ACCOUNT_ENDPOINT_ID, "top_account", "top_account_ratio"),
+            "global_account_ratio": positioning_by_timeframe(COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID, "global_account", "global_account_ratio"),
+        }
+        top_position_ratio = positioning_tf["top_position_ratio"]["1h"]
+        top_account_ratio = positioning_tf["top_account_ratio"]["1h"]
+        global_account_ratio = positioning_tf["global_account_ratio"]["1h"]
         exchange_requests = select("coinglass", "liquidation_exchange_list")
         exchange_snapshot = _snapshot(exchange_requests, raw,
                                       unwrap_coinglass_list_response, normalize_coinglass_exchange_snapshot_record,
@@ -781,6 +797,7 @@ class LongShortLiquidationsInputPreprocessor:
                                      "aggregated_history": history, "exchange_snapshot": exchange_snapshot,
                                      "top_position_ratio": top_position_ratio, "top_account_ratio": top_account_ratio,
                                      "global_account_ratio": global_account_ratio,
+                                     "positioning_by_timeframe": positioning_tf,
                                      "pair_history": pair_history, "events": events,
                                      "aggregated_map": aggregated_map, "pair_maps": pair_maps,
                                      "max_pain": max_pain},

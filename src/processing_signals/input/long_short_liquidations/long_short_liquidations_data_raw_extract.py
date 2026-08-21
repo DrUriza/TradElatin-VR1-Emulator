@@ -16,6 +16,7 @@ GLASSNODE_PROVIDER = "glassnode"
 VALID_MODES = {"bootstrap", "incremental", "recovery"}
 DEFAULT_ASSET = "BTC"
 DEFAULT_INTERVAL = "1h"
+POSITIONING_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h")
 DEFAULT_HISTORY_HOURS = 730
 DEFAULT_INCREMENTAL_OVERLAP_H = 6
 DEFAULT_EVENT_LOOKBACK_H = 24
@@ -329,27 +330,27 @@ def build_long_short_liquidations_fetch_plan(
     start, end = _window(reference_timestamp, history_window)
     limit = max(1, history_window)
     plan: list[dict[str, Any]] = []
-    # Discovery and slow-changing views are bootstrap/hourly concerns. Event
-    # liquidation orders remain the only per-cycle REST primitive.
-    if (mode == "bootstrap" or refresh_discovery) and not reuse_hourly:
-        plan.append(_request(COINGLASS_PROVIDER, "supported_exchange_pairs", {}, "all",
-                             {"exchange": None, "asset": asset, "symbol": None}))
+    # Final 33-endpoint policy: exchange discovery is configuration-owned, not
+    # a runtime provider primitive.  `refresh_discovery` is kept for API
+    # compatibility but does not issue an external request.
     if not reuse_hourly:
         plan.append(_request(COINGLASS_PROVIDER, "aggregated_liquidation_history", {
             "exchange_list": ",".join(exchanges), "symbol": asset, "interval": DEFAULT_INTERVAL,
             "limit": limit, "start_time": start * 1000, "end_time": end * 1000,
         }, f"{asset}:{DEFAULT_INTERVAL}:{start}:{end}",
             {"exchange": None, "asset": asset, "symbol": asset}))
-        positioning_limit = min(1000, max(1, history_window))
+        # Long/Short Positioning is multi-timeframe without adding endpoints:
+        # the same three CoinGlass paths are parameterized at 1m/5m/15m/30m/1h/4h.
+        positioning_limit = 1000
         for endpoint_id in (COINGLASS_TOP_POSITION_ENDPOINT_ID, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID, COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID):
-            plan.append(_request(COINGLASS_PROVIDER, endpoint_id, {
-                "exchange": "Binance", "symbol": "BTCUSDT", "interval": DEFAULT_INTERVAL,
-                "limit": positioning_limit, "start_time": start * 1000, "end_time": end * 1000,
-            }, f"Binance:BTCUSDT:{DEFAULT_INTERVAL}:{start}:{end}",
-                {"exchange": "Binance", "asset": asset, "symbol": "BTCUSDT"}))
-        plan.append(_request(COINGLASS_PROVIDER, "liquidation_exchange_list", {
-            "symbol": asset, "range": exchange_range,
-        }, f"{asset}:{exchange_range}", {"exchange": None, "asset": asset, "symbol": asset}))
+            for positioning_timeframe in POSITIONING_TIMEFRAMES:
+                plan.append(_request(COINGLASS_PROVIDER, endpoint_id, {
+                    "exchange": "Binance", "symbol": "BTCUSDT", "interval": positioning_timeframe,
+                    "limit": positioning_limit, "start_time": start * 1000, "end_time": end * 1000,
+                }, f"Binance:BTCUSDT:{positioning_timeframe}:{start}:{end}",
+                    {"exchange": "Binance", "asset": asset, "symbol": "BTCUSDT"}))
+        # Exchange-distribution snapshot was a drilldown-only duplicate and is
+        # intentionally not requested in the 33-endpoint runtime.
 
     # High-frequency realized liquidation events: one stream/window per exchange.
     for exchange in exchanges:
@@ -379,11 +380,8 @@ def build_long_short_liquidations_fetch_plan(
                     "exchange": exchange, "symbol": pair, "range": map_range,
                 }, f"{exchange}:{pair}:{map_range}",
                     {"exchange": exchange, "asset": asset, "symbol": pair}))
-        # Max pain is a bootstrap/secondary diagnostic, not a recurrent Screen primitive.
-        if mode == "bootstrap":
-            plan.append(_request(COINGLASS_PROVIDER, "liquidation_max_pain", {
-                "range": max_pain_range,
-            }, max_pain_range, {"exchange": None, "asset": asset, "symbol": asset}))
+        # Max-pain was a diagnostic-only endpoint and is retired from the
+        # contractual Emulator surface.
     if include_confirmations:
         cq_common = {
             "window": "hour",

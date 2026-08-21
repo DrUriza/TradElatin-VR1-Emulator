@@ -74,6 +74,7 @@ def _event_endpoint(endpoint_id: str) -> bool:
 @dataclass
 class AcquisitionMetrics:
     requests: int = 0
+    requests_avoided: int = 0
     records_read: int = 0
     records_new: int = 0
     records_deduplicated: int = 0
@@ -95,17 +96,30 @@ class AcquisitionManager:
         stored = self._metadata("raw_inventory_sha256")
         count = self._metadata("raw_inventory_count")
         completed = self._metadata("bootstrap_complete") == "1"
-        self.cold_start = not completed or stored != self.inventory["sha256"] or count != str(self.inventory["count"])
+        # RAW fixture changes after a completed bootstrap are an incremental
+        # runtime event, not a reason to erase acquisition history.  The
+        # continuous watcher uses this flag to force a new acquisition cycle.
+        self.raw_inventory_changed = bool(
+            completed
+            and (stored != self.inventory["sha256"] or count != str(self.inventory["count"]))
+        )
+        self.cold_start = not completed
         if self.cold_start:
             self.connection.execute("DELETE FROM records")
             self.connection.execute("DELETE FROM endpoint_state")
             self._set_metadata("bootstrap_complete", "0")
         self._set_metadata("schema_version", str(SCHEMA_VERSION))
-        self._set_metadata("raw_inventory_sha256", self.inventory["sha256"])
-        self._set_metadata("raw_inventory_count", str(self.inventory["count"]))
+        # Commit the RAW inventory fingerprint only after a successful runtime
+        # cycle (mark_complete).  If the pipeline fails, the next cycle must
+        # still see the pending RAW change.
         self.connection.commit()
         self.mode = "bootstrap" if self.cold_start else "incremental"
         self.metrics: dict[str, AcquisitionMetrics] = {}
+        # Exact network-request coalescing for one Main run.  This sits before
+        # the provider call and safely shares identical requests between
+        # families (for example CVD/Liquidity footprint windows) without
+        # suppressing revisions across later runtime cycles.
+        self._response_cache: dict[str, Any] = {}
         self.started = time.perf_counter()
 
     def _create_schema(self) -> None:
@@ -145,17 +159,32 @@ class AcquisitionManager:
         return AcquisitionRouter(self, router)
 
     def fetch(self, family: str, fetcher: Any, request: Mapping[str, Any]) -> Any:
-        response = fetcher(**deepcopy(dict(request)))
         provider = str(request.get("provider", ""))
         endpoint = str(request.get("endpoint_id", ""))
         params = request.get("params") if isinstance(request.get("params"), Mapping) else {}
         dimensions = request.get("dimensions") if isinstance(request.get("dimensions"), Mapping) else {}
+        metric = self.metrics.setdefault(family, AcquisitionMetrics())
+        network_identity = {
+            "provider": provider,
+            "endpoint_id": endpoint,
+            "path": request.get("path"),
+            "transport": request.get("transport", "rest"),
+            "channel": request.get("channel"),
+            "params": dict(params),
+        }
+        request_signature = hashlib.sha256(_json(network_identity).encode()).hexdigest()
+        cached = self._response_cache.get(request_signature)
+        if cached is not None:
+            metric.requests_avoided += 1
+            return deepcopy(cached)
+
+        response = fetcher(**deepcopy(dict(request)))
+        self._response_cache[request_signature] = deepcopy(response)
         stable_params = {k: v for k, v in params.items() if k not in TEMPORAL_PARAMS}
         identity_payload = {"family": family, "provider": provider, "endpoint_id": endpoint,
                             "params": stable_params, "dimensions": dimensions}
         identity = hashlib.sha256(_json(identity_payload).encode()).hexdigest()
         rows = _rows(response)
-        metric = self.metrics.setdefault(family, AcquisitionMetrics())
         metric.requests += 1
         metric.records_read += len(rows)
         event_stream = _event_endpoint(endpoint)
@@ -230,6 +259,7 @@ class AcquisitionManager:
             "cold_start": self.cold_start,
             "database": str(self.database_path),
             "raw_inventory": {"count": self.inventory["count"], "sha256": self.inventory["sha256"]},
+            "raw_inventory_changed": self.raw_inventory_changed,
             "endpoint_states": int(endpoints),
             "records_persisted": int(persisted),
             "duration_seconds": round(time.perf_counter() - self.started, 6),
@@ -261,6 +291,9 @@ class AcquisitionManager:
 
     def mark_complete(self) -> None:
         self._set_metadata("bootstrap_complete", "1")
+        self._set_metadata("raw_inventory_sha256", self.inventory["sha256"])
+        self._set_metadata("raw_inventory_count", str(self.inventory["count"]))
+        self.raw_inventory_changed = False
         self.connection.commit()
 
     def close(self) -> None:

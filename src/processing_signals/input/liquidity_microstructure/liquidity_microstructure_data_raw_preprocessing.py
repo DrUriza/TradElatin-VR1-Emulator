@@ -282,6 +282,79 @@ def _merge(existing: Mapping[str, Any] | None, incoming: list[dict[str, Any]], *
     return sorted(merged.values(), key=lambda row: (row["timestamp"], str(identity(row))))
 
 
+def _derive_depth_dataset(orderbook: Mapping[str, Any], *, market_type: str, range_percent: int = 10) -> dict[str, Any]:
+    records = []
+    for row in orderbook.get("records", []):
+        if not isinstance(row, Mapping):
+            continue
+        bids = row.get("bid_levels") or []
+        asks = row.get("ask_levels") or []
+        if not bids or not asks:
+            continue
+        try:
+            best_bid = max(float(level["price"]) for level in bids)
+            best_ask = min(float(level["price"]) for level in asks)
+        except (KeyError, TypeError, ValueError):
+            continue
+        mid = (best_bid + best_ask) / 2.0
+        lower = mid * (1.0 - range_percent / 100.0)
+        upper = mid * (1.0 + range_percent / 100.0)
+        selected_bids = [level for level in bids if float(level.get("price", 0.0)) >= lower]
+        selected_asks = [level for level in asks if float(level.get("price", 0.0)) <= upper]
+        records.append({
+            "timestamp": int(row["timestamp"]), "market_type": market_type,
+            "exchange": row.get("exchange"), "symbol": row.get("symbol"),
+            "timeframe": row.get("timeframe"), "range_percent": range_percent,
+            "bids_usd": sum(float(level["price"]) * float(level["quantity"]) for level in selected_bids),
+            "bids_quantity": sum(float(level["quantity"]) for level in selected_bids),
+            "asks_usd": sum(float(level["price"]) * float(level["quantity"]) for level in selected_asks),
+            "asks_quantity": sum(float(level["quantity"]) for level in selected_asks),
+            "mid_price": mid, "calculation": "derived_from_orderbook_levels_10pct",
+        })
+    status = "available" if records else "unavailable"
+    return {
+        "status": status, "reason": None if records else "orderbook_depth_derivation_unavailable",
+        "records": records, "incoming_records": len(records),
+        "source_data_as_of": max((row["timestamp"] for row in records), default=None),
+        "provenance": {"provider": "calculated", "source": f"coinglass.orderbook.{market_type}",
+                       "calculation": "sum levels inside +/-10% of snapshot mid", "timestamp_units": ["seconds"] if records else []},
+        "warnings": [], "errors": [],
+    }
+
+
+def _derive_whale_activity_dataset(spot_orders: Mapping[str, Any], perpetual_orders: Mapping[str, Any]) -> dict[str, Any]:
+    buckets: dict[int, dict[str, float]] = {}
+    for dataset in (spot_orders, perpetual_orders):
+        for row in dataset.get("events", []):
+            if not isinstance(row, Mapping) or type(row.get("timestamp")) is not int:
+                continue
+            bucket = int(row["timestamp"]) // 3600 * 3600
+            state = buckets.setdefault(bucket, {"buy": 0.0, "sell": 0.0})
+            side = str(row.get("side", "")).lower()
+            notional = float(row.get("notional_quote", row.get("volume_usd", 0.0)) or 0.0)
+            if side in {"buy", "bid", "long"}: state["buy"] += notional
+            elif side in {"sell", "ask", "short"}: state["sell"] += notional
+    records = []
+    for timestamp in sorted(buckets):
+        buy, sell = buckets[timestamp]["buy"], buckets[timestamp]["sell"]
+        total = buy + sell
+        if total <= 0:
+            continue
+        records.append({"timestamp": timestamp, "market_type": "aggregate", "exchange": "Binance",
+                        "symbol": "BTCUSDT", "timeframe": "1h",
+                        "whale_index_value": (buy - sell) / total,
+                        "buy_notional_quote": buy, "sell_notional_quote": sell,
+                        "calculation": "large_limit_order_notional_imbalance"})
+    status = "available" if records else "unavailable"
+    return {"status": status, "reason": None if records else "large_limit_order_history_unavailable",
+            "records": records, "incoming_records": len(records),
+            "source_data_as_of": max((row["timestamp"] for row in records), default=None),
+            "provenance": {"provider": "calculated", "source": "coinglass.whale_orders",
+                           "calculation": "(buy_notional-sell_notional)/(buy_notional+sell_notional)",
+                           "timestamp_units": ["seconds"] if records else []},
+            "warnings": [], "errors": []}
+
+
 class LiquidityMicrostructureInputPreprocessor:
     def preprocess(self, raw_bundle: Mapping[str, Any], *, existing_contract: Mapping[str, Any] | None = None,
                    reference_timestamp: int | None = None, execution_timestamp: int | None = None,
@@ -348,6 +421,13 @@ class LiquidityMicrostructureInputPreprocessor:
                        "warnings": sorted(set(warnings)), "errors": errors}
             dataset["events" if events else "records"] = merged
             datasets[key] = dataset
+        # Derive the two retired provider datasets from primitives that are
+        # already required by Screen A.
+        datasets["coinglass.order_depth.spot"] = _derive_depth_dataset(datasets["coinglass.orderbook.spot"], market_type="spot")
+        datasets["coinglass.order_depth.perpetual"] = _derive_depth_dataset(datasets["coinglass.orderbook.perpetual"], market_type="perpetual")
+        datasets["coinglass.whale_activity"] = _derive_whale_activity_dataset(
+            datasets["coinglass.whale_orders.spot"], datasets["coinglass.whale_orders.perpetual"])
+
         coinglass = {"orderbook": {"spot": datasets["coinglass.orderbook.spot"], "perpetual": datasets["coinglass.orderbook.perpetual"]},
                      "order_depth": {"spot": datasets["coinglass.order_depth.spot"], "perpetual": datasets["coinglass.order_depth.perpetual"]},
                      "large_trades": {"spot": datasets["coinglass.large_trades.spot"], "perpetual": datasets["coinglass.large_trades.perpetual"]},

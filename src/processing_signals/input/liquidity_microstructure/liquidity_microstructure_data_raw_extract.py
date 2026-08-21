@@ -153,11 +153,12 @@ def build_liquidity_microstructure_fetch_plan(
     common = {"asset": asset, "exchange": exchange}
     plan: list[dict[str, Any]] = []
 
-    # Orderbook + 10% depth.  Bootstrap keeps 1m and 1h; recurring acquisition
-    # only pays for 1m and derives/retains the historical 1h state locally.
-    for market_type, symbol, heatmap_id, depth_id in (
-        ("spot", spot_symbol, "spot_orderbook_heatmap", "spot_order_depth"),
-        ("perpetual", perpetual_symbol, "perpetual_orderbook_heatmap", "perpetual_order_depth"),
+    # Orderbook is the only depth primitive in the final 33-endpoint policy.
+    # Bid/ask depth at the contractual 10% window is derived deterministically
+    # from each normalized orderbook snapshot in Input.
+    for market_type, symbol, heatmap_id in (
+        ("spot", spot_symbol, "spot_orderbook_heatmap"),
+        ("perpetual", perpetual_symbol, "perpetual_orderbook_heatmap"),
     ):
         for timeframe in selected_timeframes:
             if mode == "incremental" and not _needs_bucket(
@@ -180,15 +181,6 @@ def build_liquidity_microstructure_fetch_plan(
             if orderbook_needed:
                 plan.append(_request(heatmap_id, params=params, dimensions=dimensions))
 
-            if mode == "incremental" and not _needs_bucket(
-                existing_contract, ("providers", "coinglass", "order_depth", market_type), reference, TIMEFRAME_SECONDS[timeframe]
-            ):
-                depth_needed = False
-            else:
-                depth_needed = True
-            if depth_needed:
-                depth_dimensions = {**dimensions, "range_percent": 10}
-                plan.append(_request(depth_id, params={**params, "range": 10}, dimensions=depth_dimensions))
 
     # Recent executed price-bin detail is required for Screen A.  Historical
     # Screen-B absorption reuses CVD Processing; therefore Footprint no longer
@@ -226,23 +218,8 @@ def build_liquidity_microstructure_fetch_plan(
         dimensions = {**common, "market_type": market_type, "symbol": symbol, "timeframe": "1m", "range_percent": None}
         plan.append(_request(endpoint_id, params={"exchange": exchange, "symbol": symbol}, dimensions=dimensions))
 
-    # Whale Index is used only as hourly analytical context.  One 1h history
-    # request replaces the old 1m/5m/15m/1h fan-out.
-    if mode != "incremental" or _needs_bucket(
-        existing_contract, ("providers", "coinglass", "whale_activity"), reference, whale_index_ttl_seconds
-    ):
-        timeframe = "1h"
-        limit = limit_for(timeframe)
-        start = start_for(timeframe)
-        dimensions = {**common, "market_type": "perpetual", "symbol": perpetual_symbol, "timeframe": timeframe, "range_percent": None}
-        plan.append(_request("whale_index", params={
-            "exchange": exchange,
-            "symbol": perpetual_symbol,
-            "interval": timeframe,
-            "limit": limit,
-            "start_time": start * 1000,
-            "end_time": reference * 1000,
-        }, dimensions=dimensions))
+    # Whale activity/persistence is derived from the retained large-limit-order
+    # history.  No separate Whale Index request is required.
 
     if mode != "recovery":
         return plan

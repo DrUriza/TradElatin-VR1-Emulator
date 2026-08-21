@@ -1,8 +1,7 @@
-"""Public ETF Exchange Flows main vertical API."""
+"""TradELATIN runtime package.
 
-from .etf_exchange_flows.etf_exchange_flows_vertical import (
-    DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH,
-    run_etf_exchange_flows_vertical,
-)
-
-__all__ = ["DEFAULT_ETF_EXCHANGE_FLOWS_OUTPUT_PATH", "run_etf_exchange_flows_vertical"]
+Keep package initialization intentionally side-effect free. Runtime entrypoints
+must be imported from their concrete modules (for example
+``processing_signals.main.runtime_orchestrator``) so unrelated verticals cannot
+break ``python main.py`` during package import.
+"""

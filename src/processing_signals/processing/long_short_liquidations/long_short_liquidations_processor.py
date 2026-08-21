@@ -18,6 +18,7 @@ from .long_short_liquidations_feature_builder import (
 )
 
 REFERENCE_PRICE_MAX_AGE_SECONDS = 120
+POSITIONING_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h")
 VALID_DATASET_STATES = {"available", "partial", "unavailable", "invalid"}
 VALID_INPUT_QUALITY_STATES = VALID_DATASET_STATES | {"ok"}
 PROCESSING_REQUIRED_FEATURES = ["realized.series", "realized.windows.1h", "realized.windows.4h", "realized.windows.12h",
@@ -261,8 +262,11 @@ def validate_reference_price_context(context: Mapping[str, Any] | None, snapshot
         _json_safe(context, "reference_price_context")
     except ValueError:
         return None, {"status": "unavailable", "reason": "invalid_reference_price_context"}
-    required = {"source_family": "prices_ohlcv", "source_market": "spot", "source_timeframe": "1m",
-                "price_field": "close", "is_closed_bar": True}
+    live_required = {"source_family": "prices_ohlcv", "source_market": "spot", "source_timeframe": "1m",
+                     "price_field": "close", "is_closed_bar": True}
+    synthetic_required = {"source_family": "long_short_liquidations", "source_market": "futures",
+                          "source_timeframe": "snapshot", "price_field": "provider_price", "is_closed_bar": True}
+    required = synthetic_required if context.get("synthetic_fixture_alignment") is True else live_required
     if not isinstance(context, Mapping) or any(context.get(key) != value for key, value in required.items()):
         return None, {"status": "unavailable", "reason": "invalid_reference_price_context"}
     value, timestamp = context.get("value"), context.get("timestamp")
@@ -378,6 +382,78 @@ def _invalid_output(reference_timestamp: int, config: Mapping[str, Any] | None, 
 
 
 
+
+def _build_positioning_history(
+    positioning: Mapping[str, Sequence[Mapping[str, Any]]] | None,
+    *,
+    limit: int = 730,
+) -> dict[str, Any]:
+    """Build Screen-A positioning history on the provider ratio timeline.
+
+    Positioning is an independent market series.  It must not inherit the
+    timestamp domain of realized liquidations; doing so can turn valid ratio
+    history into an all-None chart whenever the two datasets have different
+    coverage.  We select a canonical hourly timeline from the best available
+    CoinGlass ratio series and align the other two ratios by the same UTC hour.
+    No neutral/fallback values are injected.
+    """
+
+    positioning = positioning or {}
+    names = ("top_position_ratio", "top_account_ratio", "global_account_ratio")
+    buckets: dict[str, dict[int, tuple[int, float]]] = {}
+    for name in names:
+        by_hour: dict[int, tuple[int, float]] = {}
+        for row in positioning.get(name, ()):
+            if not isinstance(row, Mapping) or type(row.get("timestamp")) is not int:
+                continue
+            value = row.get("long_short_ratio")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                continue
+            ts = int(row["timestamp"])
+            hour = ts // 3600
+            # If a provider revises the same bucket, keep the newest observation.
+            previous = by_hour.get(hour)
+            if previous is None or ts >= previous[0]:
+                by_hour[hour] = (ts, float(value))
+        buckets[name] = by_hour
+
+    # Prefer Top Position because it is the primary Screen-A series; otherwise
+    # use whichever valid ratio has the broadest coverage.
+    primary = "top_position_ratio"
+    if not buckets[primary]:
+        primary = max(names, key=lambda name: len(buckets[name]))
+    primary_rows = buckets[primary]
+    hours = sorted(primary_rows)[-max(1, int(limit)):] if primary_rows else []
+
+    points: list[dict[str, Any]] = []
+    for hour in hours:
+        timestamp = primary_rows[hour][0]
+        values = {name: (buckets[name].get(hour) or (None, None))[1] for name in names}
+        shares: dict[str, float | None] = {}
+        for ratio_name, ratio_value in values.items():
+            stem = ratio_name.removesuffix("_ratio")
+            long_share = None if ratio_value is None or ratio_value <= 0 else ratio_value / (1.0 + ratio_value)
+            short_share = None if long_share is None else 1.0 - long_share
+            shares[f"long_share_{stem}"] = long_share
+            shares[f"short_share_{stem}"] = short_share
+            shares[f"long_percent_{stem}"] = None if long_share is None else long_share * 100.0
+            shares[f"short_percent_{stem}"] = None if short_share is None else short_share * 100.0
+        points.append({
+            "timestamp": timestamp,
+            **values,
+            **shares,
+        })
+
+    coverage = {name: sum(point.get(name) is not None for point in points) for name in names}
+    return {
+        "status": "available" if points and any(coverage.values()) else "unavailable",
+        "primary_series": primary if points else None,
+        "points": points,
+        "coverage_points": coverage,
+        "first_timestamp": points[0]["timestamp"] if points else None,
+        "last_timestamp": points[-1]["timestamp"] if points else None,
+    }
+
 def _native_liquidation_analysis(
     realized_series: Sequence[Mapping[str, Any]], *,
     price_history: Sequence[Mapping[str, Any]] | None = None,
@@ -407,10 +483,14 @@ def _native_liquidation_analysis(
     price_regime = [None if p is None or i is None or z is None else float(p) * 0.35 - float(i) * abs(float(z)) for p,i,z in zip(price_z,imbalance,intensity_z,strict=True)]
 
     positioning = positioning or {}
+    positioning_history = _build_positioning_history(positioning)
+
     def ratio_series(name: str) -> list[float | None]:
-        lookup = {int(row["timestamp"]): row.get("long_short_ratio") for row in positioning.get(name, ())
-                  if isinstance(row, Mapping) and row.get("timestamp") is not None}
-        return [lookup.get(ts) for ts in timestamps]
+        # CoinGlass ratio candles are UTC-hour aligned while liquidation history
+        # may carry the run's minute offset.  Join by the same closed 1h bucket.
+        lookup = {int(row["timestamp"]) // 3600: row.get("long_short_ratio") for row in positioning.get(name, ())
+                  if isinstance(row, Mapping) and type(row.get("timestamp")) is int}
+        return [lookup.get(int(ts) // 3600) for ts in timestamps]
     top_position = ratio_series("top_position_ratio")
     top_account = ratio_series("top_account_ratio")
     global_account = ratio_series("global_account_ratio")
@@ -424,6 +504,7 @@ def _native_liquidation_analysis(
     return {
         "status":"available" if rows else "unavailable", "timestamps":timestamps,
         "positioning": {"top_position_ratio":top_position, "top_account_ratio":top_account, "global_account_ratio":global_account},
+        "positioning_history": positioning_history,
         "indicators": {
             "liquidation_intensity_zscore": {"intensity_zscore":intensity_z,"intensity_percentile":intensity_pct,"total_liquidations_musd":total_musd},
             "long_short_liquidation_imbalance": {"liquidation_imbalance":imbalance,"long_liquidations_musd":[None if v is None else float(v)/1e6 for v in long_values],"short_liquidations_musd":[None if v is None else float(v)/1e6 for v in short_values]},
@@ -522,6 +603,15 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
     by_exchange_maps, included, excluded, exclusion_reasons = {}, [], [], {}
     for exchange, dataset in cg.get("pair_maps", {}).items():
         feature = build_map_features(_usable(dataset, "levels"), price, reference_reason=reference_reason)
+        feature["provenance"] = {
+            **(feature.get("provenance", {}) if isinstance(feature.get("provenance"), Mapping) else {}),
+            "provider": "coinglass",
+            "endpoint_id": dataset.get("provenance", {}).get("endpoint_id"),
+            "source_dataset": f"coinglass.pair_maps.{exchange}",
+            "source_snapshot_timestamp": dataset.get("snapshot_observed_at"),
+            "reference_price_timestamp": reference_payload.get("timestamp"),
+            "reference_price_value": price,
+        }
         by_exchange_maps[exchange] = feature
         if feature["status"] == "available" and feature["buckets"]["status"] in {"available", "partial"} and feature["buckets"]["items"]:
             included.append(exchange)
@@ -593,6 +683,14 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
     else:
         quality_status = "available"
     warnings = list(dict.fromkeys(source["quality"].get("warnings", []) + history.get("warnings", []) + map_source.get("warnings", [])))
+    positioning_by_timeframe = {}
+    raw_positioning_tf = cg.get("positioning_by_timeframe", {}) if isinstance(cg.get("positioning_by_timeframe"), Mapping) else {}
+    for timeframe in POSITIONING_TIMEFRAMES:
+        positioning_by_timeframe[timeframe] = _build_positioning_history({
+            name: raw_positioning_tf.get(name, {}).get(timeframe, {}).get("records", [])
+            for name in ("top_position_ratio", "top_account_ratio", "global_account_ratio")
+        })
+
     result = {"family": "long_short_liquidations", "stage": "processing", "reference_timestamp": reference_timestamp,
         "configuration": {"version": "0.1", **configuration}, "source_selection": _source_selection(providers),
         "realized": {"series": realized_series, "windows": windows, "variations": variations, "confirmations": confirmations,
@@ -609,6 +707,8 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
         "quality": {"status": quality_status, "required_features": PROCESSING_REQUIRED_FEATURES,
                     "optional_features": PROCESSING_OPTIONAL_FEATURES, "missing_features": missing, "invalid_features": invalid,
                     "partial_features": partial, "unavailable_features": unavailable, "warnings": warnings, "errors": []}}
+    result["liquidation_analysis"]["positioning_history_by_timeframe"] = positioning_by_timeframe
+    result["liquidation_analysis"]["positioning_timeframes"] = list(POSITIONING_TIMEFRAMES)
     _json_safe(result, "output")
     json.dumps(result, ensure_ascii=False, allow_nan=False)
     return result

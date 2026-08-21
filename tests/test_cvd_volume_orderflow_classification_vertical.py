@@ -52,7 +52,7 @@ def processing_contract():
     markets = {}
     for market in ("spot", "futures"):
         markets[market] = {"timeframes": {name: timeframe(previous=bar(NOW - 60, imbalance=-.10, open_value=90, close_value=95))
-            for name in ("1m", "5m", "15m", "1h", "4h", "1d")},
+            for name in ("1m", "5m", "15m", "30m", "1h", "4h", "1d")},
             "window_summaries": {"1h": summary(), "24h": summary()}, "footprint_summaries": {"1h": {}},
             "price_vs_vwap": {"value": .0042, "status": "available", "reason": None, "price_timestamp": NOW, "price_usd": 100.0},
             "availability": {}}
@@ -62,7 +62,7 @@ def processing_contract():
         "footprint_summaries": {"1h": {"status": "unavailable", "reason": "not_in_fixture"}}}
     return {"family": "cvd_volume_orderflow", "stage": "processing", "version": "0.1.0", "mode": "bootstrap",
         "context": {"base_asset": "BTC", "pair_symbol": "BTCUSDT", "markets": ["spot", "futures"],
-            "base_timeframes": ["1m", "15m"], "available_timeframes": ["1m", "5m", "15m", "1h", "4h", "1d"],
+            "base_timeframes": ["1m", "15m"], "available_timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
             "data_mode": "synthetic", "is_demo": True, "reference_timestamp": NOW, "input_requested_at": "x",
             "input_execution_timestamp": NOW, "processing_timestamp": NOW}, "parameters": {"source_timeframes": {}},
         "markets": markets, "cross_market": cross_market,
@@ -102,7 +102,7 @@ def test_contract_immutable_clock_context_and_strict_json():
     assert contract == before
     assert first == second
     assert first["context"] == {"base_asset": "BTC", "pair_symbol": "BTCUSDT", "markets": ["spot", "futures"],
-        "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d"], "data_mode": "synthetic", "is_demo": True,
+        "timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], "data_mode": "synthetic", "is_demo": True,
         "reference_timestamp": NOW, "processing_timestamp": NOW, "classification_timestamp": NOW + 1}
     json.dumps(first, allow_nan=False)
 

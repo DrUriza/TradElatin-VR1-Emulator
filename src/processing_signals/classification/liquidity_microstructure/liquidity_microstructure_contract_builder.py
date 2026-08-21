@@ -205,21 +205,40 @@ def build_liquidity_microstructure_screen_contract(bundle: Mapping[str, Any], *,
     ob, cob = p["markets"][selected_market]["orderbook"]["timeframes"][selected_timeframe], c["markets"][selected_market]["orderbook"]["timeframes"][selected_timeframe]
     current = ob.get("current") or {}; depth = p["markets"][selected_market]["order_depth"]["timeframes"][selected_timeframe]
     reference = next((row for row in reversed(depth.get("direct_ranges", [])) if row.get("range_percent") == REFERENCE_DEPTH_RANGE_PERCENT and row.get("status") in {"available", "partial"}), None)
-    base = (reference or {}).get(DISPLAY_DEPTH_BASIS, {}); timestamp = (reference or {}).get("timestamp")
+    provider_base = (reference or {}).get(DISPLAY_DEPTH_BASIS, {})
+    visible_base = current.get("bands", {}).get("full_visible_book", {}).get("base_quantity", {}) if isinstance(current, Mapping) else {}
+    timestamp = current.get("timestamp")
+    bid_max_distance = max((float(row.get("distance_percent")) for row in current.get("bid_levels", []) if row.get("distance_percent") is not None), default=None)
+    ask_max_distance = max((float(row.get("distance_percent")) for row in current.get("ask_levels", []) if row.get("distance_percent") is not None), default=None)
+    depth_window_metadata = {
+        "depth_window": "full_visible_orderbook",
+        "max_bid_distance_percent": bid_max_distance,
+        "max_ask_distance_percent": ask_max_distance,
+        "provider_reference_depth_range_percent": REFERENCE_DEPTH_RANGE_PERCENT,
+        "provider_reference_bid_depth": provider_base.get("bid"),
+        "provider_reference_ask_depth": provider_base.get("ask"),
+    }
     depth_class = c["markets"][selected_market]["order_depth"]["timeframes"][selected_timeframe].get("classification", {}).get("reference_balance") or {}
     ob_class = cob.get("classification", {}); impact = current.get("market_impact", {}); worst = impact.get("worst_side_impact_bps")
     filled = bool(impact.get("buy", {}).get("fully_filled")) and bool(impact.get("sell", {}).get("fully_filled"))
-    kpis = [_kpi("bid_depth", "Bid Depth", base.get("bid"), "BTC", "btc", base.get("status", "unavailable"), [f"{depth_path}.direct_ranges[range_percent=10].base_quantity.bid"], timestamp, depth_class.get("display_color_token", "neutral")),
-            _kpi("ask_depth", "Ask Depth", base.get("ask"), "BTC", "btc", base.get("status", "unavailable"), [f"{depth_path}.direct_ranges[range_percent=10].base_quantity.ask"], timestamp, depth_class.get("display_color_token", "neutral")),
+    kpis = [_kpi("bid_depth", "Bid Depth", visible_base.get("bid"), "BTC", "btc", visible_base.get("status", "unavailable"), [f"{ob_path}.current.bands.full_visible_book.base_quantity.bid"], timestamp, depth_class.get("display_color_token", "neutral"), depth_window_metadata),
+            _kpi("ask_depth", "Ask Depth", visible_base.get("ask"), "BTC", "btc", visible_base.get("status", "unavailable"), [f"{ob_path}.current.bands.full_visible_book.base_quantity.ask"], timestamp, depth_class.get("display_color_token", "neutral"), depth_window_metadata),
             _kpi("spread", "Spread", current.get("spread_bps"), "bps", "bps", current.get("status", "unavailable"), [f"{ob_path}.current.spread_bps"], current.get("timestamp"), ob_class.get("spread_condition", {}).get("display_color_token", "neutral"), current),
-            _kpi("liquidity_imbalance", "Liquidity Imbalance", base.get("imbalance_percent"), "%", "percent", base.get("status", "unavailable"), [f"{depth_path}.direct_ranges[range_percent=10].base_quantity.imbalance_percent"], timestamp, depth_class.get("display_color_token", "neutral"), base | {"basis": DISPLAY_DEPTH_BASIS, "range_percent": 10}),
+            _kpi("liquidity_imbalance", "Liquidity Imbalance", visible_base.get("imbalance_percent"), "%", "percent", visible_base.get("status", "unavailable"), [f"{ob_path}.current.bands.full_visible_book.base_quantity.imbalance_percent"], timestamp, depth_class.get("display_color_token", "neutral"), depth_window_metadata | {"basis": DISPLAY_DEPTH_BASIS}),
             _kpi("mid_price", "Mid Price", current.get("mid_price"), "USD", "usd", current.get("status", "unavailable"), [f"{ob_path}.current.mid_price"], current.get("timestamp"), metadata={"best_bid": current.get("best_bid"), "best_ask": current.get("best_ask")}),
             _kpi("impact_1_btc", "Impact 1 BTC", worst if filled else None, "bps", "bps", impact.get("status", "unavailable") if filled else "partial", [f"{ob_path}.current.market_impact.worst_side_impact_bps"], current.get("timestamp"), ob_class.get("market_impact", {}).get("worst_side", {}).get("display_color_token", "neutral"), impact)]
     order_depth = _depth_chart("order_depth", "ORDER DEPTH", current, display_point_limit, None, ob_path)
     for row in order_depth["records"]:
         distance = row.get("distance_percent")
         row["band"] = "0_to_1" if distance is not None and distance <= 1 else "1_to_5" if distance is not None and distance <= 5 else "over_5"
-    order_depth["metadata"].update(bands=["0_to_1", "1_to_5", "over_5"], provenance={"provider": "coinglass", "source_path": ob_path})
+    order_depth["metadata"].update(
+        bands=["0_to_1", "1_to_5", "over_5"],
+        provenance={"provider": "coinglass", "source_path": ob_path},
+        depth_window="full_visible_orderbook",
+        max_bid_distance_percent=bid_max_distance,
+        max_ask_distance_percent=ask_max_distance,
+        provider_reference_depth_range_percent=REFERENCE_DEPTH_RANGE_PERCENT,
+    )
     charts = {"order_depth": order_depth}
     bands = current.get("bands", {})
     tables = {"orderbook_snapshot": _table("orderbook_snapshot", "ORDER BOOK SNAPSHOT", charts["order_depth"], bands.get("full_visible_book", {}), orderbook_table_limit, ob_path)}

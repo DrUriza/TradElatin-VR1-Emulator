@@ -37,10 +37,11 @@ def test_incremental_reuses_previous_input_without_mutating_bundle():
     assert incremental["input"]["series"]["miner_reserve"]["records"]
 
 
-def test_revenue_breakdown_is_derived_from_total_and_fee_share():
+def test_revenue_breakdown_is_unavailable_without_retired_fee_endpoint():
     result = _run()
-    rows = result["processing"]["features"]["miner_revenue_breakdown"]["records"]
-    assert rows
+    feature = result["processing"]["features"]["miner_revenue_breakdown"]
+    assert feature["records"] == []
+    assert feature["current"]["status"] == "unavailable"
     row = rows[-1]
     assert abs(row["total_revenue_usd"] - row["block_reward_revenue_usd"] - row["fee_revenue_usd"]) < 1e-6
     assert abs(row["derived_fee_share_ratio"] - row["provider_fee_ratio"]) < 1e-12

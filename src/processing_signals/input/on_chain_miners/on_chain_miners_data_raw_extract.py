@@ -14,11 +14,15 @@ CRYPTOQUANT_PROVIDER     = "cryptoquant"
 COINGLASS_PROVIDER       = "coinglass"
 VALID_MODES              = {"bootstrap", "incremental", "recovery"}
 CORE_METRIC_IDS          = ("miner_reserve", "sopr", "hashrate", "difficulty", "miner_net_position_change", "mpi")
-SCREEN_EXTENSION_METRIC_IDS = ("miner_entities", "miner_outflow_by_pool", "miner_outflow_total", "miners_unspent_supply", "utxo_age_distribution",
-                               "miner_revenue_total_usd", "miner_revenue_from_fees", "nupl")
-TIME_SERIES_EXTENSION_IDS   = ("miner_outflow_total", "miners_unspent_supply", "utxo_age_distribution", "miner_revenue_total_usd",
-                               "miner_revenue_from_fees", "nupl")
-COLLECTION_EXTENSION_IDS    = ("miner_entities", "miner_outflow_by_pool")
+# External primitives actually fetched in the final 33-endpoint policy.
+# miner_net_position_change is derived locally from miner_reserve.
+FETCH_CORE_METRIC_IDS    = ("miner_reserve", "sopr", "hashrate", "difficulty", "mpi")
+# Only the two Screen-native extension primitives that cannot be reconstructed
+# from the core series remain external.  Legacy extension keys are preserved
+# downstream as unavailable placeholders for contract compatibility.
+SCREEN_EXTENSION_METRIC_IDS = ("miner_outflow_total", "miner_revenue_total_usd")
+TIME_SERIES_EXTENSION_IDS   = SCREEN_EXTENSION_METRIC_IDS
+COLLECTION_EXTENSION_IDS: tuple[str, ...] = ()
 UTXO_AGE_BANDS = ("0d_1d", "1d_1w", "1w_1m", "1m_3m", "3m_6m", "6m_12m", "12m_18m", "18m_2y", "2y_3y", "3y_5y", "5y_7y", "7y_10y", "10y_inf")
 DEFAULT_INCLUDE_SCREEN_EXTENSIONS = True
 ENRICHMENT_METRIC_IDS    = ("puell_multiple", "sth_sopr", "lth_sopr")
@@ -195,7 +199,7 @@ def build_on_chain_miners_fetch_plan(*, mode: str, reference_timestamp: int, exi
         raise ValueError(f"Unsupported on_chain_miners input mode: {mode}")
     reference_day = _utc_day(reference_timestamp)
     existing_contract = resolve_existing_input_state(existing_contract)
-    metric_ids = CORE_METRIC_IDS + (SCREEN_EXTENSION_METRIC_IDS if include_screen_extensions else ()) + (ENRICHMENT_METRIC_IDS if include_enrichment else ())
+    metric_ids = FETCH_CORE_METRIC_IDS + (SCREEN_EXTENSION_METRIC_IDS if include_screen_extensions else ()) + (ENRICHMENT_METRIC_IDS if include_enrichment else ())
     requests: list[dict[str, Any]] = []
     if mode == "recovery":
         if not recovery_requests:

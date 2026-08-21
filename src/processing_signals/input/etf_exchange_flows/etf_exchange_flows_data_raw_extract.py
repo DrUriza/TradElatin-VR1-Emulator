@@ -28,7 +28,7 @@ ETF_HISTORICAL_BOOTSTRAP_LIMITS = {
 # slow ETF state is daily.  CryptoQuant netflow is a confirmation because
 # Processing can derive it exactly as inflow - outflow.
 HOURLY_COINGLASS_ENDPOINTS = ("bitcoin_etf_flows",)
-SLOW_COINGLASS_ENDPOINTS = ("bitcoin_etf_net_assets_history", "bitcoin_etf_premium_discount_history")
+SLOW_COINGLASS_ENDPOINTS: tuple[str, ...] = ()
 BOOTSTRAP_STATIC_COINGLASS_ENDPOINTS = ("bitcoin_etf_list",)
 PRIMARY_CRYPTOQUANT_ENDPOINTS = ("exchange_inflow", "exchange_outflow", "exchange_reserve")
 SECONDARY_CRYPTOQUANT_ENDPOINTS = ("exchange_netflow",)

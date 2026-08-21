@@ -12,8 +12,8 @@ from .cvd_volume_orderflow_data_raw_extract import (
     TIMEFRAME_SECONDS, CvdVolumeOrderflowFetcher, CvdVolumeOrderflowRawExtractor, required_base_records,
 )
 
-READINESS_SOURCE = {"1m": "1m", "5m": "1m", "15m": "15m", "1h": "15m", "4h": "15m", "1d": "15m"}
-READINESS_FACTORS = {"1m": 1, "5m": 5, "15m": 1, "1h": 4, "4h": 16, "1d": 96}
+READINESS_SOURCE = {"1m": "1m", "5m": "1m", "15m": "15m", "30m": "15m", "1h": "15m", "4h": "15m", "1d": "15m"}
+READINESS_FACTORS = {"1m": 1, "5m": 5, "15m": 1, "30m": 2, "1h": 4, "4h": 16, "1d": 96}
 GLASSNODE_METRICS = ("spot_cvd_sum", "spot_vd_sum", "spot_buying_volume_sum", "spot_selling_volume_sum")
 
 

@@ -12,7 +12,7 @@ from processing_signals.processing.cvd_volume_orderflow.cvd_volume_orderflow_pro
 from processing_signals.runtime.emulator import SyntheticProviderRouter
 
 
-TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
+TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
 IDENTITY_KEYS = (
     "metric_id", "kpi_id", "widget_id", "chart_id", "table_id", "badge_id",
     "id", "role", "family", "group", "indicator_id", "event_type", "event_group",
@@ -182,7 +182,7 @@ def test_events_are_only_approved_ma_crosses_and_are_anchored_to_visible_window(
 def test_delta_chart_is_owned_by_processing_not_hmi(vertical: dict[str, Any]) -> None:
     for market in ("spot", "futures"):
         chart = vertical["charts"][f"delta_buy_sell_{market}"]
-        assert chart["chart_type"] == "delta_histogram_with_ma"
+        assert chart["chart_type"] == "buy_sell_flow_percent"
         for timeframe in TIMEFRAMES:
             payload = chart["series_by_timeframe"][timeframe]
             assert payload["calculation"]["formula"] == "cvd_close - cvd_open"

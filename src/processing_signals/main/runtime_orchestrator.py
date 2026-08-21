@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, datetime
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -72,6 +73,36 @@ def _strict_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=False) + "\n"
 
 
+def _validate_json_tree(value: Any) -> None:
+    """Validate JSON finiteness/types without serializing the whole runtime twice.
+
+    ``run_all`` can hold hundreds of MB of order-book history across Input,
+    Processing and Classification.  Building an indented JSON string only to
+    discard it made cold bootstrap unnecessarily slow.  Atomic publication
+    still uses ``_strict_json`` per artifact; this pass only rejects NaN/Inf or
+    non-JSON values before publication.
+    """
+    stack = [("root", value)]
+    while stack:
+        path, item = stack.pop()
+        if item is None or isinstance(item, (str, int, bool)):
+            continue
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError(f"non_finite_json_number:{path}")
+            continue
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                if not isinstance(key, (str, int, float, bool)) and key is not None:
+                    raise TypeError(f"non_json_mapping_key:{path}:{type(key).__name__}")
+                stack.append((f"{path}.{key}", child))
+            continue
+        if isinstance(item, (list, tuple)):
+            stack.extend((f"{path}[{index}]", child) for index, child in enumerate(item))
+            continue
+        raise TypeError(f"non_json_value:{path}:{type(item).__name__}")
+
+
 def _atomic_write_json(path: Path, value: Any) -> Path:
     serialized = _strict_json(value)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,7 +154,9 @@ def build_input_arguments(
             "existing_contract": previous.get("etf_exchange_flows"),
             # Confirmations are worth paying during cold bootstrap, not on every
             # one-minute runtime cycle.  ETF Input has its own hourly/daily TTLs.
-            "include_secondary": requested_mode == "bootstrap",
+            # ETF confirmations duplicate canonical CoinGlass/CryptoQuant
+            # primitives and are not required by the final HMI contract.
+            "include_secondary": False,
             "data_mode": data_mode,
             "is_demo": is_demo,
             "exchange_scope": "all_exchange",
@@ -153,7 +186,9 @@ def build_input_arguments(
             "clock": lambda ref=refs["long_short_liquidations"]: ref + (5 if synthetic else 0),
             "exchange_pairs": pairs,
             "history_hours": 730,
-            "include_confirmations": requested_mode == "bootstrap",
+            # Liquidation provider confirmations are optional diagnostics and
+            # no longer part of the paid default acquisition path.
+            "include_confirmations": False,
         },
         "on_chain_miners": {
             "fetcher": router.for_family("on_chain_miners"),
@@ -188,6 +223,10 @@ def build_input_arguments(
             "clock": lambda ref=refs["cvd_volume_orderflow"]: ref + (5 if synthetic else 0),
             "data_mode": data_mode,
             "is_demo": is_demo,
+            # CoinGlass CVD/Footprint are canonical. Duplicate CQ/GN
+            # confirmations are removed from the default paid path.
+            "include_cryptoquant_confirmation": False,
+            "include_glassnode_confirmation": False,
         },
     }
 
@@ -211,6 +250,7 @@ def _latest_spot_close(prices_processing: Mapping[str, Any]) -> dict[str, Any]:
 def build_liquidations_reference_price_context(
     prices_processing: Mapping[str, Any], *, target_timestamp: int,
     synthetic_replay_alignment: bool,
+    liquidations_input: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the only allowed cross-family price dependency for Liquidations.
 
@@ -221,7 +261,29 @@ def build_liquidations_reference_price_context(
     never rebase timestamps.
     """
     latest = _latest_spot_close(prices_processing)
-    timestamp = int(target_timestamp) if synthetic_replay_alignment else int(latest["timestamp"])
+    if synthetic_replay_alignment and isinstance(liquidations_input, Mapping):
+        cg = liquidations_input.get("providers", {}).get("coinglass", {})
+        max_pain = cg.get("max_pain", {}) if isinstance(cg, Mapping) else {}
+        records = max_pain.get("records", []) if isinstance(max_pain, Mapping) else []
+        btc = next((row for row in records if isinstance(row, Mapping) and row.get("symbol") == "BTC"
+                    and isinstance(row.get("provider_price"), (int, float)) and not isinstance(row.get("provider_price"), bool)
+                    and float(row.get("provider_price")) > 0), None)
+        map_snapshot = cg.get("aggregated_map", {}).get("snapshot_observed_at") if isinstance(cg, Mapping) else None
+        if btc is not None and type(map_snapshot) is int:
+            return {
+                "source_family": "long_short_liquidations",
+                "source_market": "futures",
+                "source_timeframe": "snapshot",
+                "price_field": "provider_price",
+                "is_closed_bar": True,
+                "value": float(btc["provider_price"]),
+                "timestamp": int(map_snapshot),
+                "provider": "coinglass",
+                "source_dataset": "coinglass.max_pain.provider_price",
+                "synthetic_fixture_alignment": True,
+                "source_fixture_timestamp": int(map_snapshot),
+            }
+    timestamp = int(latest["timestamp"])
     context = {
         "source_family": "prices_ohlcv",
         "source_market": "spot",
@@ -231,11 +293,6 @@ def build_liquidations_reference_price_context(
         "value": latest["value"],
         "timestamp": timestamp,
     }
-    if synthetic_replay_alignment:
-        context.update({
-            "source_fixture_timestamp": int(latest["timestamp"]),
-            "timestamp_alignment": "synthetic_fixture_rebased_to_target_reference",
-        })
     return context
 
 
@@ -296,6 +353,8 @@ def run_all(
     overlay_root: str | Path | None = None,
     dirty_timeframes: Mapping[str, Sequence[str]] | None = None,
     existing_processing: Mapping[str, Mapping[str, Any]] | None = None,
+    progress_root: str | Path | None = None,
+    prebuilt_inputs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Execute all configured stages using either fixture emulator or live APIs."""
     families = tuple(enabled_families)
@@ -312,10 +371,25 @@ def run_all(
         router, source=normalized_source, reference_timestamp=reference_timestamp,
         requested_mode=requested_mode, existing_inputs=existing_inputs,
     )
-    inputs = run_input_pipeline(
-        enabled_families=families,
-        family_arguments={family: all_arguments[family] for family in families},
-    )
+    progress = Path(progress_root) if progress_root is not None else None
+
+    # Input contracts are produced by Main; they are not preregistration files.
+    # Persist each family as soon as its Input stage completes so a clean runtime
+    # tree is populated progressively during execution.
+    inputs: dict[str, Any] = {
+        family: deepcopy(value)
+        for family, value in (prebuilt_inputs or {}).items()
+        if family in families
+    }
+    for family in families:
+        if family not in inputs:
+            family_output = run_input_pipeline(
+                enabled_families=(family,),
+                family_arguments={family: all_arguments[family]},
+            )
+            inputs[family] = family_output[family]
+        if progress is not None:
+            _atomic_write_json(progress / "input" / f"{family}.json", inputs[family])
 
     processing: dict[str, Any] = {}
     now_timestamp = (
@@ -343,6 +417,8 @@ def run_all(
             }},
             existing_processing=existing_processing,
         ))
+        if progress is not None:
+            _atomic_write_json(progress / "processing" / "cvd_volume_orderflow.json", processing["cvd_volume_orderflow"])
 
     if "prices_ohlcv" in families:
         processing.update(run_processing_pipeline(
@@ -355,6 +431,8 @@ def run_all(
             }},
             existing_processing=existing_processing,
         ))
+        if progress is not None:
+            _atomic_write_json(progress / "processing" / "prices_ohlcv.json", processing["prices_ohlcv"])
 
     remaining = tuple(family for family in families if family not in {"prices_ohlcv", "cvd_volume_orderflow"})
     processing_arguments: dict[str, dict[str, Any]] = {}
@@ -385,6 +463,7 @@ def run_all(
                 prices_context,
                 target_timestamp=target_timestamp,
                 synthetic_replay_alignment=synthetic,
+                liquidations_input=inputs.get("long_short_liquidations"),
             ),
             "price_history": price_history,
         }
@@ -401,13 +480,17 @@ def run_all(
         }
     if remaining:
         remaining_now = max(SYNTHETIC_REFERENCE_TIMESTAMPS.values()) + 5 if synthetic else now_timestamp
-        processing.update(run_processing_pipeline(
-            input_contracts=inputs,
-            enabled_families=remaining,
-            now_timestamp=remaining_now,
-            family_arguments=processing_arguments,
-            existing_processing=existing_processing,
-        ))
+        for family in remaining:
+            family_processing = run_processing_pipeline(
+                input_contracts=inputs,
+                enabled_families=(family,),
+                now_timestamp=remaining_now,
+                family_arguments={family: processing_arguments.get(family, {})},
+                existing_processing=existing_processing,
+            )
+            processing[family] = family_processing[family]
+            if progress is not None:
+                _atomic_write_json(progress / "processing" / f"{family}.json", processing[family])
 
     processing = {family: processing[family] for family in families}
 
@@ -415,11 +498,16 @@ def run_all(
     if "cvd_volume_orderflow" in processing:
         cvd_reference = int(processing["cvd_volume_orderflow"]["context"]["reference_timestamp"])
         classification_arguments["cvd_volume_orderflow"] = {"clock": lambda ref=cvd_reference: ref}
-    classification = run_classification_pipeline(
-        processing_contracts=processing,
-        enabled_families=families,
-        family_arguments=classification_arguments,
-    )
+    classification: dict[str, Any] = {}
+    for family in families:
+        family_classification = run_classification_pipeline(
+            processing_contracts=processing,
+            enabled_families=(family,),
+            family_arguments={family: classification_arguments.get(family, {})},
+        )
+        classification[family] = family_classification[family]
+        if progress is not None:
+            _atomic_write_json(progress / "classification" / f"{family}.json", classification[family])
     data_mode = "synthetic" if synthetic else "live"
     contracts = run_contract_builder_pipeline(
         processing_contracts=processing,
@@ -433,7 +521,11 @@ def run_all(
         "classification": classification,
         "hmi": contracts,
     }
-    _strict_json(result)
+    # Per-artifact atomic publication performs strict JSON serialization with
+    # allow_nan=False. Avoid a second full-tree validation pass here: the runtime
+    # contains large order-book histories and validating the entire duplicated
+    # Input/Processing/Classification/HMI tree before export is prohibitively
+    # expensive and redundant.
     return result
 
 
@@ -470,21 +562,21 @@ def export_all_runtime_json(
         for stage in ("input", "processing", "classification"):
             path = stage_dirs[stage] / f"{family}.json"
             _atomic_write_json(path, runtime_output[stage][family])
-            written[stage][family] = str(path.relative_to(root))
+            written[stage][family] = path.relative_to(root).as_posix()
         screen_name = SCREEN_FILENAMES[family]
         screen_path = stage_dirs["hmi"] / screen_name
         _atomic_write_json(screen_path, runtime_output["hmi"][family])
-        written["hmi"][family] = str(screen_path.relative_to(root))
+        written["hmi"][family] = screen_path.relative_to(root).as_posix()
     for family in reused_families:
         if family in written["hmi"]:
             continue
         for stage in ("input", "processing", "classification"):
             path = stage_dirs[stage] / f"{family}.json"
             if path.is_file():
-                written[stage][family] = str(path.relative_to(root))
+                written[stage][family] = path.relative_to(root).as_posix()
         path = stage_dirs["hmi"] / SCREEN_FILENAMES[family]
         if path.is_file():
-            written["hmi"][family] = str(path.relative_to(root))
+            written["hmi"][family] = path.relative_to(root).as_posix()
 
     manifest = {
         "schema": {"id": "trad_elatin.runtime.run_manifest.v1", "version": "1.0.0"},
@@ -530,6 +622,188 @@ def export_all_runtime_json(
     return {"root": str(root), "written": written, "manifest": str(manifest_path), "quality": manifest["quality"]}
 
 
+
+def poll_and_export_families(
+    *, families: Sequence[str], source: str = "emulator",
+    input_raw_root: str | Path | None = None, contracts_root: str | Path | None = None,
+    reference_timestamp: int | None = None, state_root: str | Path | None = None,
+    golden_root: str | Path | None = None, overlay_root: str | Path | None = None,
+    force_recompute: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Poll only ``families`` and rebuild only families whose inputs changed.
+
+    Acquisition is allowed to run at a faster cadence than Processing.  A family
+    reaches Processing/Classification/HMI only when Acquisition records NEW,
+    REVISION or LATE_ARRIVAL data, or when a dependency change explicitly marks
+    the family for recomputation via ``force_recompute``.
+    """
+    requested = tuple(dict.fromkeys(str(f) for f in families))
+    unknown = [family for family in requested if family not in FAMILY_ORDER]
+    if unknown:
+        raise ValueError(f"unsupported families: {unknown}")
+    if not requested:
+        return {"polled_families": [], "processed_families": [], "changed_families": [], "noop": True}
+
+    root = Path(contracts_root) if contracts_root is not None else _repo_root() / "runtime" / "contracts"
+    raw_root = Path(input_raw_root) if input_raw_root is not None else root / "input_raw"
+    persistent_root = Path(state_root) if state_root is not None else root.parent / "state"
+    runtime_overlay_root = Path(overlay_root) if overlay_root is not None else persistent_root / "emulator_overlay"
+
+    # Selective refresh assumes the initial eight-family bootstrap has already
+    # published a coherent baseline.  If not, let the normal bootstrap create it.
+    missing_baseline = [
+        family for family in FAMILY_ORDER
+        if not (root / "input" / f"{family}.json").is_file()
+        or not (root / "processing" / f"{family}.json").is_file()
+        or not (root / "classification" / f"{family}.json").is_file()
+        or not (root / "hmi" / SCREEN_FILENAMES[family]).is_file()
+    ]
+    if missing_baseline:
+        output, publication = run_and_export_all(
+            source=source, input_raw_root=raw_root, contracts_root=root,
+            reference_timestamp=reference_timestamp, state_root=persistent_root,
+            golden_root=golden_root, overlay_root=runtime_overlay_root,
+        )
+        return {
+            "polled_families": list(FAMILY_ORDER),
+            "changed_families": list(FAMILY_ORDER),
+            "processed_families": list(FAMILY_ORDER),
+            "noop": False,
+            "bootstrap": True,
+            "publication": publication,
+        }
+
+    existing_inputs = {
+        family: json.loads((root / "input" / f"{family}.json").read_text(encoding="utf-8"))
+        for family in FAMILY_ORDER
+    }
+    existing_processing = {
+        family: json.loads((root / "processing" / f"{family}.json").read_text(encoding="utf-8"))
+        for family in FAMILY_ORDER
+    }
+    previous_quality = {}
+    manifest_path = root / "run_manifest.json"
+    if manifest_path.is_file():
+        previous_quality = json.loads(manifest_path.read_text(encoding="utf-8")).get("quality", {})
+
+    manager = AcquisitionManager(persistent_root, input_raw_root=raw_root)
+    try:
+        normalized_source = str(source).strip().lower()
+        router = build_provider_router(normalized_source, input_raw_root=raw_root, overlay_root=runtime_overlay_root)
+        router = manager.wrap_router(router)
+        input_arguments = build_input_arguments(
+            router, source=normalized_source, reference_timestamp=reference_timestamp,
+            requested_mode=manager.mode, existing_inputs=existing_inputs,
+        )
+
+        refreshed_inputs: dict[str, Any] = {}
+        for family in requested:
+            family_output = run_input_pipeline(
+                enabled_families=(family,),
+                family_arguments={family: input_arguments[family]},
+            )
+            refreshed_inputs[family] = family_output[family]
+
+        changed: list[str] = []
+        changed_by_raw: set[str] = set()
+        forced = set(force_recompute)
+        for family in requested:
+            metric = manager.metrics.get(family)
+            changed_records = 0 if metric is None else (
+                int(metric.records_new) + int(metric.records_revised) + int(metric.late_arrivals)
+            )
+            if changed_records > 0:
+                changed_by_raw.add(family)
+            if changed_records > 0 or family in forced:
+                changed.append(family)
+
+        if not changed:
+            manager.mark_complete()
+            return {
+                "polled_families": list(requested),
+                "changed_families": [],
+                "processed_families": [],
+                "noop": True,
+                "acquisition": manager.summary(),
+            }
+
+        # Persist Input only when Acquisition actually changed that family's
+        # source records. Dependency-only recomputes reuse the last canonical
+        # Input contract and rebuild Processing/Classification/HMI from the
+        # newer dependency state. This prevents timer polls from rewriting
+        # stage JSONs when nothing changed.
+        selected_inputs: dict[str, Any] = {}
+        for family in changed:
+            if family in changed_by_raw:
+                selected_inputs[family] = refreshed_inputs[family]
+                _atomic_write_json(root / "input" / f"{family}.json", refreshed_inputs[family])
+            else:
+                selected_inputs[family] = existing_inputs[family]
+
+        all_inputs = dict(existing_inputs)
+        all_inputs.update(selected_inputs)
+        overlay = EmulatorOverlay(runtime_overlay_root) if normalized_source == "emulator" else None
+        effective_reference = reference_timestamp
+        if overlay is not None and overlay.maximum_timestamp is not None:
+            effective_reference = max(int(reference_timestamp or 0), overlay.maximum_timestamp + 60)
+
+        output = run_all(
+            source=normalized_source,
+            input_raw_root=raw_root,
+            reference_timestamp=effective_reference,
+            requested_mode=manager.mode,
+            existing_inputs=all_inputs,
+            acquisition_manager=manager,
+            enabled_families=tuple(changed),
+            overlay_root=runtime_overlay_root,
+            existing_processing=existing_processing,
+            progress_root=root,
+            prebuilt_inputs={family: selected_inputs[family] for family in changed},
+        )
+
+        combined = dict(output["hmi"])
+        reused = tuple(family for family in FAMILY_ORDER if family not in changed)
+        for family in reused:
+            combined[family] = json.loads((root / "hmi" / SCREEN_FILENAMES[family]).read_text(encoding="utf-8"))
+        validation = validate_contracts_against_golden(combined, golden_root=golden_root)
+        if validation["status"] != "passed":
+            raise RuntimeError(f"VR1 contract validation failed: {validation}")
+
+        pending = manager.pending_dirty_windows()
+        manager.mark_complete()
+        acquisition = manager.summary()
+        dirty_execution = {
+            "families": list(changed),
+            "source_timeframes": sorted({str(row.get("source_timeframe")) for row in pending if row.get("source_timeframe")}),
+            "derived_timeframes": [],
+            "windows": list(pending),
+            "processing": {"families_executed": list(changed)},
+            "classification": {"families_executed": list(changed)},
+            "contracts_rebuilt": [SCREEN_FILENAMES[family] for family in changed],
+            "contracts_reused": [SCREEN_FILENAMES[family] for family in reused],
+            "rebuilt_count": len(changed),
+            "validator": {"validated_count": 8, "reused_count": len(reused)},
+        }
+        publication = export_all_runtime_json(
+            output, contracts_root=root, source=normalized_source, mode=manager.mode,
+            acquisition=acquisition, contract_validation=validation,
+            dirty_execution=dirty_execution, reused_families=reused,
+            reused_quality={family: previous_quality[family] for family in reused if family in previous_quality},
+        )
+        manager.mark_dirty_clean([row["id"] for row in pending])
+        if overlay is not None:
+            manager.mark_overlay_processed(overlay.version)
+        return {
+            "polled_families": list(requested),
+            "changed_families": list(changed),
+            "processed_families": list(changed),
+            "noop": False,
+            "publication": publication,
+            "acquisition": acquisition,
+        }
+    finally:
+        manager.close()
+
 def run_and_export_all(
     *, source: str = "emulator", input_raw_root: str | Path | None = None,
     contracts_root: str | Path | None = None,
@@ -545,29 +819,50 @@ def run_and_export_all(
     runtime_overlay_root = Path(overlay_root) if overlay_root is not None else persistent_root / "emulator_overlay"
     manager = AcquisitionManager(persistent_root, input_raw_root=raw_root)
     try:
+        # Runtime JSON artifacts are outputs, never startup prerequisites.
+        # A preserved SQLite acquisition state may outlive a deleted/cleaned
+        # runtime/contracts tree.  Load persisted JSON opportunistically and
+        # rebuild whatever is missing instead of aborting before the pipeline
+        # has a chance to regenerate it.
         existing_inputs: dict[str, Any] = {}
         previous_processing: dict[str, Any] = {}
-        if not manager.cold_start:
-            for family in FAMILY_ORDER:
-                path = root / "input" / f"{family}.json"
-                if not path.is_file():
-                    raise RuntimeError(f"warm start preregistration is incomplete: {path}")
-                existing_inputs[family] = json.loads(path.read_text(encoding="utf-8"))
-                processing_path = root / "processing" / f"{family}.json"
-                if not processing_path.is_file():
-                    raise RuntimeError(f"warm start Processing state is incomplete: {processing_path}")
+        for family in FAMILY_ORDER:
+            input_path = root / "input" / f"{family}.json"
+            if input_path.is_file():
+                existing_inputs[family] = json.loads(input_path.read_text(encoding="utf-8"))
+            processing_path = root / "processing" / f"{family}.json"
+            if processing_path.is_file():
                 previous_processing[family] = json.loads(processing_path.read_text(encoding="utf-8"))
+
         references = Path(golden_root) if golden_root is not None else None
         overlay = EmulatorOverlay(runtime_overlay_root) if source == "emulator" else None
         pending_before = manager.pending_dirty_windows()
         changed = overlay is not None and manager.overlay_changed(overlay.version)
-        missing_hmi = [
-            family for family in FAMILY_ORDER
-            if not (root / "hmi" / SCREEN_FILENAMES[family]).is_file()
-        ]
-        # SQLite state alone is not enough for a warm NOOP: publication state
-        # must also be complete. Missing HMI artifacts force regeneration.
-        if not manager.cold_start and not changed and not pending_before and not missing_hmi:
+
+        missing_runtime: dict[str, list[str]] = {}
+        for family in FAMILY_ORDER:
+            missing_stages: list[str] = []
+            if family not in existing_inputs:
+                missing_stages.append("input")
+            if family not in previous_processing:
+                missing_stages.append("processing")
+            if not (root / "classification" / f"{family}.json").is_file():
+                missing_stages.append("classification")
+            if not (root / "hmi" / SCREEN_FILENAMES[family]).is_file():
+                missing_stages.append("hmi")
+            if missing_stages:
+                missing_runtime[family] = missing_stages
+
+        # A true warm NOOP is valid only when both acquisition state and all
+        # published/runtime artifacts are complete.  Missing generated JSONs
+        # trigger regeneration; they never prevent startup.
+        if (
+            not manager.cold_start
+            and not manager.raw_inventory_changed
+            and not changed
+            and not pending_before
+            and not missing_runtime
+        ):
             output = {stage: {} for stage in ("input", "processing", "classification", "hmi")}
             for family in FAMILY_ORDER:
                 for stage in ("input", "processing", "classification"):
@@ -592,18 +887,39 @@ def run_and_export_all(
                 reused_quality=previous_quality,
             )
             return output, publication
-        affected = tuple(family for family in FAMILY_ORDER if manager.cold_start or overlay is None or family in overlay.families)
+        missing_families = set(missing_runtime)
+        affected = tuple(
+            family for family in FAMILY_ORDER
+            if manager.cold_start
+            or manager.raw_inventory_changed
+            or family in missing_families
+            or overlay is None
+            or family in overlay.families
+        )
         if not affected:
             affected = FAMILY_ORDER
+
+        # If a generated Input/Processing artifact is missing, rebuild the
+        # affected execution from provider-shaped RAW/API data in bootstrap
+        # mode.  Existing JSONs may accelerate a normal warm cycle, but are
+        # never required to start Main.
+        needs_runtime_bootstrap = manager.cold_start or any(
+            stage in {"input", "processing"}
+            for family in affected
+            for stage in missing_runtime.get(family, ())
+        )
+        execution_mode = "bootstrap" if needs_runtime_bootstrap else manager.mode
+
         effective_reference = reference_timestamp
         if overlay is not None and overlay.maximum_timestamp is not None:
             effective_reference = max(int(reference_timestamp or 0), overlay.maximum_timestamp + 60)
         output = run_all(
             source=source, input_raw_root=raw_root, reference_timestamp=effective_reference,
-            requested_mode=manager.mode, existing_inputs=existing_inputs,
+            requested_mode=execution_mode, existing_inputs=existing_inputs,
             acquisition_manager=manager, enabled_families=affected, overlay_root=runtime_overlay_root,
             dirty_timeframes={family: overlay.source_timeframes for family in affected} if overlay is not None else {},
             existing_processing=previous_processing,
+            progress_root=root,
         )
         pending = manager.pending_dirty_windows()
         windows = plan_dirty_windows(pending, reference_timestamp=int(effective_reference or max(SYNTHETIC_REFERENCE_TIMESTAMPS.values())))
@@ -639,7 +955,7 @@ def run_and_export_all(
         previous_quality = (json.loads((root / "run_manifest.json").read_text(encoding="utf-8")).get("quality", {})
                             if (root / "run_manifest.json").is_file() else {})
         publication = export_all_runtime_json(
-            output, contracts_root=root, source=source, mode=manager.mode,
+            output, contracts_root=root, source=source, mode=execution_mode,
             acquisition=acquisition, contract_validation=validation, dirty_execution=dirty_execution,
             reused_families=reused,
             reused_quality={family: previous_quality[family] for family in reused if family in previous_quality},

@@ -439,8 +439,8 @@ def _aggregate_map(processing: Mapping[str, Any], classification: Mapping[str, A
         "bar_series": [{"series_id": exchange.lower(), "label": exchange} for exchange in exchange_points],
         "buckets": visual_buckets if _usable(status) else [], "series_by_exchange": series,
         "provider_levels": deepcopy(source.get("provider_levels", [])) if _usable(status) else [],
-        "estimated_long_curve": deepcopy(source.get("curves", {}).get("estimated_long", [])) if _usable(status) else [],
-        "estimated_short_curve": deepcopy(source.get("curves", {}).get("estimated_short", [])) if _usable(status) else [],
+        "estimated_long_curve": deepcopy(_curve_points(source.get("curves"), "estimated_long")) if _usable(status) else [],
+        "estimated_short_curve": deepcopy(_curve_points(source.get("curves"), "estimated_short")) if _usable(status) else [],
         "estimated_side": _classification_model(_at(classification, "classifications.estimated_side")),
         "central_region": {"items": central if _usable(ref_status) else []}, "clusters": _cluster_payload(processing, classification),
         "concentration": {"source": deepcopy(source.get("concentration", {})),
@@ -451,6 +451,18 @@ def _aggregate_map(processing: Mapping[str, Any], classification: Mapping[str, A
         "provenance": deepcopy(source.get("provenance", {})), "unit": "provider_level",
         "visual_contract": {"renderer": "stacked_bars_plus_dual_cumulative_curves", "reference_line": {"field": "current_price", "label": "CURRENT PRICE"},
             "barmode": "stack", "x_axis": "linear_price", "hmi_calculation": False, "bucket_count": len(visual_buckets)}}
+
+
+def _curve_points(curves: Mapping[str, Any] | None, side: str) -> list[dict[str, Any]]:
+    """Normalize current/legacy cumulative-curve shapes to a point list."""
+    if not isinstance(curves, Mapping):
+        return []
+    raw = curves.get(side, [])
+    if isinstance(raw, Mapping):
+        raw = raw.get("points", [])
+    if not isinstance(raw, list):
+        return []
+    return [dict(item) for item in raw if isinstance(item, Mapping)]
 
 
 def _exchange_visual(processing: Mapping[str, Any], context: Mapping[str, Any], key: str, *, leverage: bool) -> dict[str, Any]:
@@ -465,8 +477,10 @@ def _exchange_visual(processing: Mapping[str, Any], context: Mapping[str, Any], 
     reference = _mapping(_at(processing, "maps.reference_price"), "maps.reference_price")
     status, reason = _view_status(source, f"maps.by_exchange.{key}")
     raw = source.get("buckets", {}).get("items", []) if _usable(status) else []
-    long_curve = {item["price"]: item["cumulative_share"] for item in source.get("curves", {}).get("estimated_long", [])}
-    short_curve = {item["price"]: item["cumulative_share"] for item in source.get("curves", {}).get("estimated_short", [])}
+    long_points = _curve_points(source.get("curves"), "estimated_long")
+    short_points = _curve_points(source.get("curves"), "estimated_short")
+    long_curve = {item.get("price"): item.get("cumulative_share", 0) for item in long_points if item.get("price") is not None}
+    short_curve = {item.get("price"): item.get("cumulative_share", 0) for item in short_points if item.get("price") is not None}
     leverage_ids = sorted({str(value).removesuffix(".0") + "x" for item in raw for value in item.get("leverage_breakdown", {})}, key=lambda value: float(value[:-1]))
     series_ids = leverage_ids if leverage else ["long", "short"]
     buckets = []

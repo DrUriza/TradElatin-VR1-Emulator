@@ -276,6 +276,57 @@ def _history_coverage(records: Sequence[Mapping[str, Any]], requested_from: Any,
     return {"requested_days": requested_days, "covered_days": covered_days, "coverage_ratio": coverage_ratio, "history_complete": history_complete}
 
 
+def derive_miner_net_position_change_from_reserve(reserve_series: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive daily miner net-position change from canonical Miner Reserve.
+
+    This removes the duplicate Glassnode balance_miners_change endpoint while
+    preserving the existing core series contract.  The value at each daily
+    observation is reserve[t] - reserve[t-1].
+    """
+    source_records = [r for r in reserve_series.get("records", []) if isinstance(r, Mapping)
+                      and isinstance(r.get("timestamp"), int) and isinstance(r.get("value"), (int, float))
+                      and not isinstance(r.get("value"), bool)]
+    # Collapse hourly reserve observations to the latest observation of each UTC day.
+    by_day: dict[int, Mapping[str, Any]] = {}
+    for row in source_records:
+        day = int(row["timestamp"]) - int(row["timestamp"]) % SECONDS_PER_DAY
+        previous = by_day.get(day)
+        if previous is None or int(row["timestamp"]) >= int(previous["timestamp"]):
+            by_day[day] = row
+    daily = [by_day[day] for day in sorted(by_day)]
+    records: list[dict[str, Any]] = []
+    for previous, current in zip(daily, daily[1:]):
+        value = float(current["value"]) - float(previous["value"])
+        records.append({
+            "timestamp": int(current["timestamp"]),
+            "value": 0.0 if value == 0.0 else value,
+            "unit": "BTC/day",
+            "provider": "calculated",
+            "endpoint_id": None,
+            "source_field": "miner_reserve_difference",
+            "source_window": "24h",
+        })
+    status = "available" if records else "unavailable"
+    first = records[0]["timestamp"] if records else None
+    last = records[-1]["timestamp"] if records else None
+    return {
+        "metric_id": "miner_net_position_change", "provider": "calculated", "endpoint_id": None,
+        "source_field": "miner_reserve_difference", "source_window": "24h", "unit": "BTC/day",
+        "status": status, "incoming_records": records, "records": records,
+        "unavailable_records": [], "invalid_records": [], "gaps": [],
+        "warnings": [] if records else ["derived_from_miner_reserve_insufficient_history"], "errors": [],
+        "metadata": {"records_before": 0, "records_received": len(source_records),
+                     "records_valid_received": len(records), "records_after": len(records),
+                     "first_timestamp": first, "last_timestamp": last,
+                     "requested_from": None, "requested_to": None, "history_preserved": False,
+                     "first_available_timestamp": first, "last_available_timestamp": last,
+                     "records_available": len(records), "requested_days": len(daily),
+                     "covered_days": len(daily), "coverage_ratio": 1.0 if daily else 0.0,
+                     "history_complete": bool(records), "history_coverage_tolerance_days": HISTORY_COVERAGE_TOLERANCE_DAYS,
+                     "calculation": "miner_reserve[t] - miner_reserve[t-1]"},
+    }
+
+
 def preprocess_on_chain_metric(*, metric_id: str, raw_payload: Mapping[str, Any], existing_series: Mapping[str, Any] | None = None,
                                mode: str = "bootstrap") -> dict[str, Any]:
     endpoint          = ENDPOINTS[metric_id]
@@ -586,6 +637,23 @@ class OnChainMinersInputPreprocessor:
             if metric_id not in COLLECTION_EXTENSION_IDS:
                 series[metric_id] = preprocess_on_chain_metric(
                     metric_id=metric_id, raw_payload=payload, existing_series=existing_series.get(metric_id, {}), mode=mode)
+
+        # Final 33-endpoint policy: net-position change is a deterministic P<-RAW
+        # derivative of Miner Reserve, never a second Glassnode request.
+        if "miner_reserve" in series:
+            series["miner_net_position_change"] = derive_miner_net_position_change_from_reserve(series["miner_reserve"])
+
+        # Preserve legacy extension keys as explicit unavailable contract nodes
+        # without fetching their retired endpoints.
+        if include_screen_extensions:
+            retired_series = ("miners_unspent_supply", "utxo_age_distribution", "miner_revenue_from_fees", "nupl")
+            for metric_id in retired_series:
+                if metric_id not in series:
+                    series[metric_id] = preprocess_on_chain_metric(
+                        metric_id=metric_id,
+                        raw_payload={"status": "error", "error": {"message": "retired_by_33_endpoint_policy"},
+                                     "from_timestamp": None, "to_timestamp": None},
+                        existing_series=existing_series.get(metric_id, {}), mode=mode)
         required_series = CORE_METRIC_IDS + (TIME_SERIES_EXTENSION_IDS if include_screen_extensions else ())
         if mode == "recovery":
             for metric_id in required_series:
@@ -604,10 +672,13 @@ class OnChainMinersInputPreprocessor:
         if "miner_outflow_by_pool" in raw["raw"]:
             collections["miner_outflow_by_pool"] = preprocess_miner_outflow_by_pool(
                 raw["raw"]["miner_outflow_by_pool"], existing_collections.get("miner_outflow_by_pool", {}))
-        if mode == "recovery" and include_screen_extensions:
+        if include_screen_extensions:
+            # These collections are legacy drilldowns.  Keep explicit unavailable
+            # nodes so existing contracts remain structurally compatible without
+            # the retired entity-list/miner-outflow endpoints.
             if "miner_entities" not in collections:
                 collections["miner_entities"] = preprocess_miner_entities(
-                    {"status": "error", "error": {"message": "not_requested_in_recovery"}}, {})
+                    {"status": "error", "error": {"message": "retired_by_33_endpoint_policy"}}, {})
             if "miner_outflow_by_pool" not in collections:
                 collections["miner_outflow_by_pool"] = preprocess_miner_outflow_by_pool(
                     {"status": "error", "entity_symbols": [], "requests": [], "fanout_skipped_no_symbols": True}, {})

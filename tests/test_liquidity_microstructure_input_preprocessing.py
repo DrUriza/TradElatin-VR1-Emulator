@@ -9,7 +9,8 @@ def test_normalizes_all_datasets_and_strict_json():
     provider = output["providers"]["coinglass"]
     assert provider["orderbook"]["spot"]["records"][0]["timestamp"] == 1_700_000_000
     assert {row["range_percent"] for row in provider["order_depth"]["spot"]["records"]} == {10}
-    assert provider["whale_activity"]["records"][0]["whale_index_value"] == -0.25
+    assert provider["whale_activity"]["records"][0]["whale_index_value"] == 1.0
+    assert provider["whale_activity"]["provenance"]["provider"] == "calculated"
     assert provider["market_history"]["status"] == "unavailable"
     assert provider["market_history"]["reason"] == "no_data"
     assert provider["market_history"]["records"] == []

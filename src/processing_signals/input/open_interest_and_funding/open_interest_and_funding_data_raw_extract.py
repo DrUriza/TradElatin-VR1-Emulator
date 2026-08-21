@@ -160,27 +160,21 @@ def build_open_interest_and_funding_fetch_plan(*, mode: str, reference_timestamp
             start = max(0, (existing_last if mode == "incremental" and existing_last is not None else end - (limit - 1) * TIMEFRAME_SECONDS[timeframe]) - TIMEFRAME_SECONDS[timeframe])
             plan.append(_request(spec, metric_id=metric, timeframe=timeframe, start=start, end=end,
                                  params=build_coinglass_history_params(timeframe=timeframe, limit=limit, start_timestamp=start, end_timestamp=end), suffix=timeframe))
-    # The two exchange snapshots drive current OI/Funding widgets and remain live.
-    # Options and confirmation providers are secondary and are refreshed only on
-    # bootstrap or an explicit secondary pass.
-    if include_snapshots:
-        for key, params in (("open_interest_exchange_list", {"symbol": "BTC"}), ("funding_rate_exchange_list", {})):
-            spec = ENDPOINTS[key]
-            plan.append(_request(spec, metric_id=key, timeframe=None, start=None, end=reference, params=params, suffix="snapshot"))
-        if mode != "incremental" or refresh_secondary:
-            spec = ENDPOINTS["options_info"]
-            plan.append(_request(spec, metric_id="options_info", timeframe=None, start=None, end=reference, params={"symbol": "BTC"}, suffix="snapshot"))
+    # VR1 final endpoint policy: exchange-list snapshots and options-info are
+    # not contractual primitives.  Current OI/Funding state is derived from
+    # the canonical OHLC/rate series.  `include_snapshots` is preserved in the
+    # public signature for backward compatibility but intentionally causes no
+    # external request.
     if include_confirmations and (mode != "incremental" or refresh_secondary):
+        # OI and Funding already have canonical CoinGlass primitives.  The
+        # CryptoQuant and duplicate Glassnode OI/Funding confirmations were
+        # removed from the paid path.  ELR is retained because it is a unique
+        # market-context primitive used by the current contract.
         start = max(0, reference - (BOOTSTRAP_LIMIT - 1) * 3_600)
-        for key in ("cryptoquant_open_interest", "cryptoquant_funding_rates"):
-            spec = ENDPOINTS[key]
-            plan.append(_request(spec, metric_id=key, timeframe="hour", start=start, end=reference,
-                                 params=build_cryptoquant_params(from_timestamp=start, to_timestamp=reference, limit=BOOTSTRAP_LIMIT), suffix="hour"))
-        for key in ("glassnode_futures_open_interest_sum", "glassnode_futures_funding_rate_perpetual", "glassnode_futures_estimated_leverage_ratio"):
-            spec = ENDPOINTS[key]
-            currency = "USD" if key == "glassnode_futures_open_interest_sum" else None
-            plan.append(_request(spec, metric_id=key, timeframe="1h", start=start, end=reference,
-                                 params=build_glassnode_params(from_timestamp=start, to_timestamp=reference, currency=currency), suffix="1h"))
+        key = "glassnode_futures_estimated_leverage_ratio"
+        spec = ENDPOINTS[key]
+        plan.append(_request(spec, metric_id=key, timeframe="1h", start=start, end=reference,
+                             params=build_glassnode_params(from_timestamp=start, to_timestamp=reference), suffix="1h"))
     return plan
 
 

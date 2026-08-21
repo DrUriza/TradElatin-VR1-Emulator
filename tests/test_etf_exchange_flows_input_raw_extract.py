@@ -17,9 +17,9 @@ def test_bootstrap_and_incremental_plans_are_deterministic_and_primary_only():
                                                 refresh_hourly=True, refresh_slow=True)
     noop = build_etf_exchange_flows_fetch_plan(mode="incremental", exchange_scope="all_exchange",
                                                 refresh_hourly=False, refresh_slow=False)
-    assert len(bootstrap) == 10
+    assert len(bootstrap) == 8
     assert len(hourly) == 4
-    assert len(slow) == 6
+    assert len(slow) == 4
     assert noop == []
     assert {x["endpoint_id"] for x in hourly} == {"bitcoin_etf_flows", "exchange_inflow", "exchange_outflow", "exchange_reserve"}
     assert not any(x["endpoint_id"] in {"exchange_balance_list", "exchange_balance_chart", "exchange_netflow"} for x in hourly)

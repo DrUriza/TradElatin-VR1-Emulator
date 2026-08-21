@@ -75,9 +75,7 @@ def test_incremental_limits_and_overlap():
     for row in primary:
         assert row["params"]["limit"] == INCREMENTAL_LIMITS["1m"]
         assert row["from_timestamp"] < row["to_timestamp"]
-    assert [row["metric_id"] for row in plan if row["request_kind"] == "snapshot"] == [
-        "open_interest_exchange_list", "funding_rate_exchange_list"
-    ]
+    assert [row for row in plan if row["request_kind"] == "snapshot"] == []
 
 
 def test_recovery_is_explicit_and_validated():
@@ -97,8 +95,7 @@ def test_provider_parameters_are_exact():
     assert cq["exchange"] == "all_exchange" and cq["window"] == "hour" and cq["format"] == "json" and "T" in cq["from"]
     assert build_glassnode_params(from_timestamp=1, to_timestamp=2) == {"a": "BTC", "i": "1h", "s": 1, "u": 2}
     plan = build_open_interest_and_funding_fetch_plan(mode="bootstrap", reference_timestamp=NOW)
-    funding_snapshot = next(row for row in plan if row["metric_id"] == "funding_rate_exchange_list")
-    assert funding_snapshot["params"] == {}
+    assert not any(row["request_kind"] == "snapshot" for row in plan)
 
 
 def test_data_mode_and_clocks():
@@ -149,9 +146,11 @@ def test_full_input_shape_snapshots_confirmations_and_strict_json():
     assert output["family"] == "open_interest_and_funding" and output["stage"] == "input"
     assert output["snapshots"]["open_interest_by_exchange"]["aggregate_record"]["exchange"] == "All"
     assert output["snapshots"]["options_open_interest"]["aggregate_record"]["exchange"] == "All"
-    assert output["confirmations"]["open_interest"]["cryptoquant"]["provider_window"] == "hour"
-    assert output["confirmations"]["open_interest"]["glassnode"]["provider_interval"] == "1h"
-    assert "open" not in output["confirmations"]["open_interest"]["glassnode"]["records"][0]
+    assert output["confirmations"]["open_interest"]["cryptoquant"]["status"] == "unavailable"
+    assert output["confirmations"]["open_interest"]["glassnode"]["status"] == "unavailable"
+    assert output["confirmations"]["funding_rate"]["cryptoquant"]["status"] == "unavailable"
+    assert output["confirmations"]["funding_rate"]["glassnode"]["status"] == "unavailable"
+    assert output["confirmations"]["estimated_leverage_ratio"]["glassnode"]["status"] == "available"
     assert output["availability"]["open_interest_market_cap_ratio"]["reason"] == "market_cap_source_not_configured"
     json.dumps(output, ensure_ascii=False, allow_nan=False, sort_keys=False)
 
@@ -291,25 +290,15 @@ def test_future_incoming_preserves_existing_history():
     assert payload["status"] == "partial" and payload["last_timestamp"] == NOW and payload["records"][0]["open"] == 100.0
 
 
-@pytest.mark.parametrize("provider,endpoint_id,container", [
-    ("cryptoquant", "open_interest", ("open_interest", "cryptoquant")),
-    ("cryptoquant", "funding_rates", ("funding_rate", "cryptoquant")),
-    ("glassnode", "futures_open_interest_sum", ("open_interest", "glassnode")),
-    ("glassnode", "futures_funding_rate_perpetual", ("funding_rate", "glassnode")),
-])
-def test_future_confirmation_records_are_invalid(provider, endpoint_id, container):
+def test_future_elr_confirmation_record_is_invalid():
     def fetcher(**kwargs):
         response = _fetcher(**kwargs)
-        if kwargs["provider"] == provider and kwargs["endpoint_id"] == endpoint_id:
-            if provider == "cryptoquant":
-                field = "open_interest" if endpoint_id == "open_interest" else "funding_rates"
-                return {"status": {"code": 200}, "result": {"window": "hour", "data": [{"date": NOW + 1, field: 1}]}}
+        if kwargs["provider"] == "glassnode" and kwargs["endpoint_id"] == "futures_estimated_leverage_ratio":
             return [{"t": NOW + 1, "v": 1}]
         return response
-    payload = preprocess_open_interest_and_funding_raw(_raw(fetcher))["confirmations"][container[0]][container[1]]
+    payload = preprocess_open_interest_and_funding_raw(_raw(fetcher))["confirmations"]["estimated_leverage_ratio"]["glassnode"]
     assert payload["status"] == "invalid" and payload["records"] == []
     assert payload["invalid_records"][0]["reason"] == "timestamp_after_reference_timestamp"
-
 
 def test_future_next_funding_timestamp_remains_valid_snapshot_metadata():
     def fetcher(**kwargs):
@@ -390,16 +379,6 @@ def test_cryptoquant_requires_exact_hour_window(window):
     with pytest.raises(ValueError, match="invalid_cryptoquant_window"):
         unwrap_cryptoquant_response({"status": {"code": 200}, "result": result})
     assert unwrap_cryptoquant_response({"status": {"code": 200}, "result": {"window": "hour", "data": []}}) == ("hour", [])
-
-
-def test_invalid_cryptoquant_window_produces_invalid_confirmation():
-    def fetcher(**kwargs):
-        response = _fetcher(**kwargs)
-        if kwargs["provider"] == "cryptoquant":
-            response["result"]["window"] = "day"
-        return response
-    output = preprocess_open_interest_and_funding_raw(_raw(fetcher))
-    assert output["confirmations"]["open_interest"]["cryptoquant"]["status"] == "invalid"
 
 
 def test_all_confirmations_always_expose_contractual_provenance():

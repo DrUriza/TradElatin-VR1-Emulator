@@ -119,9 +119,10 @@ def build_volatility_market_regimes_fetch_plan(
         86400 if mode == "bootstrap" else INTERVAL_SECONDS
     )
     start = max(0, reference - duration)
+    # DVOL is the only external primitive owned by this family.  Realized
+    # volatility is derived from Prices daily OHLC and no longer requires a
+    # duplicate Glassnode bootstrap request.
     requests = [_instruction(GLASSNODE_DVOL_ENDPOINT_ID, start, reference)]
-    if mode == "bootstrap":
-        requests.append(_instruction(GLASSNODE_REALIZED_VOL_ENDPOINT_ID, start, reference))
     if mode != "incremental" or not isinstance(existing_contract, Mapping):
         return requests
     glassnode = existing_contract.get("providers", {}).get("glassnode", {})

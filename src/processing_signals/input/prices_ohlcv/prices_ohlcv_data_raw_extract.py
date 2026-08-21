@@ -32,8 +32,11 @@ def build_prices_fetch_plan(*, mode: str, requests: Sequence[Mapping[str, Any]] 
     if bootstrap <= 0:
         raise ValueError("bootstrap must be positive")
     if mode == "bootstrap":
-        requests = [{"market": market, "timeframe": timeframe, "limit": bootstrap}
-                    for market in ("spot", "futures")
+        # VR1 final endpoint policy: Spot is the canonical Prices primitive.
+        # Futures OHLC is derivable/contextual and is no longer part of the
+        # contractual Emulator surface.  Keep the extractor for compatibility,
+        # but do not request it in the default bootstrap/runtime.
+        requests = [{"market": "spot", "timeframe": timeframe, "limit": bootstrap}
                     for timeframe in BOOTSTRAP_TIMEFRAMES]
     elif mode == "incremental":
         limits = dict(INCREMENTAL_LIMITS)
@@ -92,11 +95,13 @@ def build_glassnode_market_params(*, asset: str = "BTC", interval: str = "1h", s
 
 
 def extract_glassnode_prices_raw(*, fetcher: PricesFetcher, asset: str = "BTC", interval: str = "1h") -> dict[str, Any]:
-    """Fetch Glassnode Price OHLC for validation/fallback and Market Cap for the KPI."""
+    """Fetch the unique Glassnode Market Cap primitive used by the Prices KPI."""
     params = build_glassnode_market_params(asset=asset, interval=interval)
     output: dict[str, Any] = {}
+    # CoinGlass Spot is the canonical price source.  The duplicate Glassnode
+    # Price OHLC confirmation was removed from the paid bootstrap path; Market
+    # Cap remains because it is a unique KPI primitive.
     for endpoint_id, path in (
-        (GLASSNODE_PRICE_OHLC_ENDPOINT_ID, GLASSNODE_PRICE_OHLC_PATH),
         (GLASSNODE_MARKET_CAP_ENDPOINT_ID, GLASSNODE_MARKET_CAP_PATH),
     ):
         try:

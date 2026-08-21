@@ -19,8 +19,8 @@ SCREEN_ROUTE = "/cvd-orderflow"
 SCREEN_TITLE = "CVD & ORDER FLOW"
 SCREEN_SUBTITLE = "Cumulative volume delta, trades & market microstructure"
 MARKETS = ("spot", "futures")
-TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
-TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
+TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 DEFAULT_MARKET = "spot"
 DEFAULT_TIMEFRAME = "15m"
 DISPLAY_POINT_LIMIT = 220
@@ -373,9 +373,25 @@ class CvdVolumeOrderflowContractBuilder:
         for timeframe in TIMEFRAMES:
             source = processing["markets"][market]["timeframes"][timeframe]
             records = source["records"]
-            full_points = [{"timestamp": row["timestamp"], "delta_buy_sell_usd": _number(row.get("cvd_ohlc_usd", {}).get("close"), "delta.close") - _number(row.get("cvd_ohlc_usd", {}).get("open"), "delta.open"),
-                "delta_ma_21": _number(row.get("delta_ma_21_usd"), "delta.ma"),
-                "direction": "buy" if row.get("volume_delta_usd", 0) > 0 else "sell" if row.get("volume_delta_usd", 0) < 0 else "neutral"} for row in records[-CALCULATION_HISTORY_LIMIT:]]
+            full_points = []
+            for row in records[-CALCULATION_HISTORY_LIMIT:]:
+                buy = float(_number(row.get("taker_buy_volume_usd"), "flow.buy", nullable=False))
+                sell = float(_number(row.get("taker_sell_volume_usd"), "flow.sell", nullable=False))
+                total = buy + sell
+                buy_percent = (100.0 * buy / total) if total > 0 else None
+                sell_percent = (100.0 * sell / total) if total > 0 else None
+                net_flow_percent = (buy_percent - sell_percent) if buy_percent is not None else None
+                full_points.append({
+                    "timestamp": row["timestamp"],
+                    "delta_buy_sell_usd": _number(row.get("cvd_ohlc_usd", {}).get("close"), "delta.close") - _number(row.get("cvd_ohlc_usd", {}).get("open"), "delta.open"),
+                    "delta_ma_21": _number(row.get("delta_ma_21_usd"), "delta.ma"),
+                    "direction": "buy" if row.get("volume_delta_usd", 0) > 0 else "sell" if row.get("volume_delta_usd", 0) < 0 else "neutral",
+                    "taker_buy_volume_usd": buy,
+                    "taker_sell_volume_usd": sell,
+                    "buy_percent": buy_percent,
+                    "sell_percent": sell_percent,
+                    "net_flow_percent": net_flow_percent,
+                })
             points = full_points[-self.display_point_limit:]
             status, reason = self._visual_status(source, len(points))
             series[timeframe] = {"timeframe": timeframe, "seconds": TIMEFRAME_SECONDS[timeframe], "status": status, "reason": reason,
@@ -386,12 +402,16 @@ class CvdVolumeOrderflowContractBuilder:
                     "timestamps": [row["timestamp"] for row in full_points],
                     "delta_buy_sell_usd": [row["delta_buy_sell_usd"] for row in full_points],
                     "delta_ma_21": [row["delta_ma_21"] for row in full_points],
-                    "recalculate_in_hmi": False, "construction": "cvd_close_minus_cvd_open"}}
+                    "buy_percent": [row["buy_percent"] for row in full_points],
+                    "sell_percent": [row["sell_percent"] for row in full_points],
+                    "net_flow_percent": [row["net_flow_percent"] for row in full_points],
+                    "recalculate_in_hmi": False, "construction": "taker_buy_sell_volume_normalized_to_100_percent"}}
         selected = series[self.selected_timeframe]["bars"]
         period = processing["parameters"].get("delta_ma_period", processing["parameters"].get("delta_ma", {}).get("period", 21))
         chart_status = _combine([payload["status"] for payload in series.values()])
-        return {"chart_id": f"delta_buy_sell_{market}", "title": f"Delta Buy/Sell {market.title()}", "subtitle": "CVD candle close minus open", "chart_type": "delta_histogram_with_ma",
-            "presentation": {"bar_field": "delta_buy_sell_usd", "line_field": "delta_ma_21", "moving_average_period": period},
+        display_name = "Spot Flow" if market == "spot" else "Futures Flow"
+        return {"chart_id": f"delta_buy_sell_{market}", "title": display_name, "subtitle": "Aggressive buy/sell flow normalized to 100%", "chart_type": "buy_sell_flow_percent",
+            "presentation": {"bar_field": "net_flow_percent", "buy_field": "buy_percent", "sell_field": "sell_percent", "moving_average_period": period},
             "unit": "USD", "market": market, "status": chart_status,
             "reason": _reason(chart_status, "chart_series_incomplete"), "selected_timeframe": self.selected_timeframe,
             "current": copy.deepcopy(selected[-1]) if selected else None, "series_by_timeframe": series,

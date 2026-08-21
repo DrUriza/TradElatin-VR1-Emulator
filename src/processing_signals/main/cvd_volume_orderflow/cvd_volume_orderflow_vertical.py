@@ -17,7 +17,7 @@ FAMILY = "cvd_volume_orderflow"
 MODES = {"bootstrap", "incremental", "recovery"}
 MARKETS = ("spot", "futures")
 CLASSIFICATION_MARKETS = ("spot", "futures")
-TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
+TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
 SCREEN_ROOT = ("schema", "screen", "stage", "mode", "context", "badges", "selectors", "operational_status",
     "kpis", "charts", "tables", "drilldowns", "events", "availability", "quality", "technical_analysis",
     "history_contract")

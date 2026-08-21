@@ -199,7 +199,7 @@ def test_bootstrap_shape_readiness_quality_and_no_downstream_fields():
     assert result["mode"] == "bootstrap"
     assert set(result["markets"]) == {"spot", "futures"}
     assert "general" not in result["markets"]
-    assert set(result["readiness"]["target_timeframes"]) == {"1m", "5m", "15m", "1h", "4h", "1d"}
+    assert set(result["readiness"]["target_timeframes"]) == {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
     assert result["readiness"]["target_timeframes"]["5m"]["source_timeframe"] == "1m"
     assert result["readiness"]["target_timeframes"]["1d"]["source_timeframe"] == "15m"
     encoded = json.dumps(result, allow_nan=False)

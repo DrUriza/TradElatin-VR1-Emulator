@@ -78,9 +78,11 @@ def test_processing_uses_real_spot_and_futures_markets_only() -> None:
         assert vertical["processing"]["markets"]["futures"]["timeframes"][timeframe]["records"]
 
 
-def test_glassnode_confirmation_and_market_cap_reach_screen_contract() -> None:
+def test_glassnode_market_cap_reaches_screen_contract_without_requiring_duplicate_price_confirmation() -> None:
     vertical = _vertical()
-    assert vertical["input"]["confirmations"]["glassnode"]["price_ohlc"]["status"] == "available"
+    # Spot OHLC from Prices is canonical. The duplicate Glassnode price OHLC
+    # confirmation was removed from the default 52-endpoint acquisition plan.
+    assert vertical["input"]["confirmations"]["glassnode"]["price_ohlc"]["status"] == "unavailable"
     market_cap_input = vertical["input"]["provider_features"]["market_cap"]
     assert market_cap_input["status"] == "available"
     market_cap = next(item for item in vertical["screen"]["kpis"]["items"] if item["metric_id"] == "market_cap")
