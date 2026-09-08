@@ -1,0 +1,13 @@
+{
+  "method": "GET",
+  "url": "/coinglass/api/futures/open-interest/history",
+  "headers": {
+    "CG-API-KEY": "emulator-coinglass-key"
+  },
+  "query": {
+    "exchange": "Binance",
+    "symbol": "BTCUSDT",
+    "interval": "1h",
+    "limit": 2
+  }
+}

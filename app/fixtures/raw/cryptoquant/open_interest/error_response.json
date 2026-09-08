@@ -1,0 +1,7 @@
+{
+  "status": {
+    "code": 400,
+    "message": "Invalid value for 'window': century"
+  },
+  "result": null
+}

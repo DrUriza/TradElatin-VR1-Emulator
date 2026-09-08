@@ -1,0 +1,20 @@
+simulation:
+  seed: 4271
+  update_seconds: 1
+  history_size: 500
+  endpoint_records: 500
+  liquidations_history_samples_per_period: 4
+  initial_regime: lateral
+
+providers:
+  coinglass:
+    enabled: true
+    update_seconds: 1
+
+  cryptoquant:
+    enabled: true
+    update_seconds: 60
+
+  glassnode:
+    enabled: true
+    update_seconds: 60

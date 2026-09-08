@@ -1,0 +1,12 @@
+{
+  "method": "GET",
+  "url": "/cryptoquant/v1/btc/market-data/open-interest",
+  "headers": {
+    "Authorization": "Bearer emulator-cryptoquant-key"
+  },
+  "query": {
+    "exchange": "binance",
+    "window": "day",
+    "limit": 2
+  }
+}

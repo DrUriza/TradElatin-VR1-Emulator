@@ -1,0 +1,5 @@
+{
+  "code": "40000",
+  "msg": "Invalid value for 'symbol': XRPUSDT. Allowed values: ['BTCUSDT', 'ETHUSDT']",
+  "data": null
+}

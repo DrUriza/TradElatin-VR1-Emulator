@@ -1,5 +1,4 @@
 import asyncio
-import os
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request
@@ -73,16 +72,3 @@ app.include_router(coinglass_router, prefix="/coinglass")
 app.include_router(cryptoquant_router, prefix="/cryptoquant")
 app.include_router(glassnode_router, prefix="/glassnode")
 app.include_router(admin_router)
-
-
-def run() -> None:
-    """Run the standalone Emulator with Integration's configured address."""
-    import uvicorn
-
-    host = os.getenv("TRADELATIN_EMULATOR_HOST", "127.0.0.1")
-    port = int(os.getenv("TRADELATIN_EMULATOR_PORT", "8000"))
-    uvicorn.run(app, host=host, port=port, log_level="warning")
-
-
-if __name__ == "__main__":
-    run()

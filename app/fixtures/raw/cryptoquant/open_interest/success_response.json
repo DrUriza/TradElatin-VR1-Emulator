@@ -1,0 +1,19 @@
+{
+  "status": {
+    "code": 200,
+    "message": "success"
+  },
+  "result": {
+    "window": "day",
+    "data": [
+      {
+        "date": "2026-07-16T00:00:00+00:00",
+        "open_interest": 36415892012.55
+      },
+      {
+        "date": "2026-07-17T00:00:00+00:00",
+        "open_interest": 36975218410.20
+      }
+    ]
+  }
+}

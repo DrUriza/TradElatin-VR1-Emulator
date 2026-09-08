@@ -1,0 +1,14 @@
+{
+  "method": "GET",
+  "url": "/glassnode/v1/metrics/indicators/sopr",
+  "headers": {
+    "X-Api-Key": "emulator-glassnode-key"
+  },
+  "query": {
+    "a": "BTC",
+    "i": "24h",
+    "s": 1784304000,
+    "u": 1784311200,
+    "f": "json"
+  }
+}
