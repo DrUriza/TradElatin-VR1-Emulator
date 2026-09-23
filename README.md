@@ -5,11 +5,23 @@ Standalone FastAPI market-data Emulator.
 - Internal market state advances every **1 second**.
 - Endpoints publish only when they receive an HTTP request.
 - Frozen inventory: **33 logical endpoints**.
+- The frozen 33-endpoint inventory refers to the existing C1–C8 architecture. Stacks/C9 is proposed grant work and is not included in the current Emulator endpoint inventory.
 - Emulator historical transport policy: **500 records per request**.
 - Prices uses a moderately more abrupt stochastic profile in build HF2:
   regime volatility, order-flow impact and jump amplitude are higher, while
   regime durations, jump frequency and the ±12% per-step safety clamp remain
   unchanged.
+
+## C9 / Stacks proposed extension
+
+The current Emulator exposes **no C9 endpoints** and contains **no Stacks
+fixtures**. Synthetic and replay-compatible Stacks/sBTC endpoint responses
+would be implemented only as part of the proposed funded work. This
+documentation does not implement Milestone 1 and does not claim that C9 is
+operational.
+
+- [C9 Stacks Technical Specification](docs/c9/stacks/C9_STACKS_TECHNICAL_SPEC.md)
+- [C9 Stacks Endpoint Catalog](docs/c9/stacks/C9_STACKS_ENDPOINT_CATALOG.md)
 
 ## Run
 
