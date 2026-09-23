@@ -73,8 +73,8 @@ The proposed C9 scope freezes exactly three financial observables:
 2. **C9.2 — sBTC Bridge Flow** — normalized deposit and withdrawal activity
    across the sBTC bridge, preserving direction, amount, status and time.
 3. **C9.3 — sBTC Bridge Operational State** — bridge limits, chain state and
-   signer condition needed to describe operational availability and
-   constraints.
+   publicly observable signer/registry state needed to describe
+   protocol-defined operational constraints.
 
 Their runtime contracts, endpoint paths, adapters, fixtures and replay engines
 remain **PROPOSED / NOT IMPLEMENTED**.
@@ -94,6 +94,8 @@ endpoints.
 | `sbtc_bridge_limits` | C9.3 | C4, C6 | PROPOSED / NOT IMPLEMENTED |
 | `sbtc_bridge_chainstate` | C9.3 | C4, C5, C6 | PROPOSED / NOT IMPLEMENTED |
 | `sbtc_signer_state` | C9.3 | C5, C6 | PROPOSED / NOT IMPLEMENTED |
+
+For `sbtc_signer_state`: **Do not infer signer availability, consensus, security, or custody health unless supported by a validated protocol-defined measure.**
 
 ### Transversal surfaces
 

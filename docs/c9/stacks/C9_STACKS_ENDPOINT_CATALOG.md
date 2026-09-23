@@ -43,7 +43,9 @@ column records only optional downstream contextual use by C1–C8.
 | `sbtc_bridge_withdrawals` | C9.2; may contribute to C9.3 where operational fields apply | C4, C5, C6 | Withdrawal lifecycle and operational-field scenarios. | PROPOSED / NOT IMPLEMENTED |
 | `sbtc_bridge_limits` | C9.3 | C4, C6 | Bridge-limit and capacity-constraint scenarios. | PROPOSED / NOT IMPLEMENTED |
 | `sbtc_bridge_chainstate` | C9.3 | C4, C5, C6 | Bridge chain-state and availability scenarios. | PROPOSED / NOT IMPLEMENTED |
-| `sbtc_signer_state` | C9.3 | C5, C6 | Signer health, quorum and availability scenarios. | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_signer_state` | C9.3 | C5, C6 | Publicly observable signer/registry-state synthetic/replay scenarios. | PROPOSED / NOT IMPLEMENTED |
+
+For `sbtc_signer_state`: **Do not infer signer availability, consensus, security, or custody health unless supported by a validated protocol-defined measure.**
 
 ## Transversal proposed logical source surfaces
 
