@@ -15,10 +15,12 @@ Standalone FastAPI market-data Emulator.
 ## C9 / Stacks proposed extension
 
 The current Emulator exposes **no C9 endpoints** and contains **no Stacks
-fixtures**. Synthetic and replay-compatible Stacks/sBTC endpoint responses
-would be implemented only as part of the proposed funded work. This
+provider, routes, or fixtures**. Synthetic and replay-compatible Stacks/sBTC
+responses would be implemented only as part of the proposed funded work. This
 documentation does not implement Milestone 1 and does not claim that C9 is
 operational.
+
+The C9 pre-implementation catalog freezes 14 proposed logical source surfaces — 6 Core and 8 transversal — but none is part of the current 33-endpoint Emulator registry.
 
 - [C9 Stacks Technical Specification](docs/c9/stacks/C9_STACKS_TECHNICAL_SPEC.md)
 - [C9 Stacks Endpoint Catalog](docs/c9/stacks/C9_STACKS_ENDPOINT_CATALOG.md)

@@ -5,16 +5,17 @@
 **Status: PROPOSED / NOT IMPLEMENTED**
 
 This document defines a future C9/Stacks extension for the TradELATIN VR1
-Emulator. It is grant-scope documentation only. It does not add endpoints,
-providers, fixtures, public probes, or Stacks API calls, and it does not
-implement Milestone 1.
+Emulator. It is grant-scope pre-implementation documentation only. It does not
+add endpoints, providers, routes, fixtures, public probes, or Stacks API calls,
+and Milestone 1 has not started.
 
 **Frozen inventory: 33 logical endpoints**
 
-The frozen 33-endpoint inventory refers to the existing C1–C8 architecture.
-Stacks/C9 is proposed grant work and is not included in the current Emulator
-endpoint inventory. The current Emulator has no C9 endpoints and no Stacks
-fixtures.
+The frozen 33-endpoint inventory refers exclusively to the existing C1–C8
+architecture: 20 CoinGlass, 4 CryptoQuant and 9 Glassnode. The current C9/Stacks
+endpoint count is zero.
+
+The C9 pre-implementation catalog freezes 14 proposed logical source surfaces — 6 Core and 8 transversal — but none is part of the current 33-endpoint Emulator registry.
 
 ## Architectural boundary
 
@@ -58,61 +59,60 @@ C9 contracts
 ```
 
 This future role would permit Processing and Integration tests without
-requiring live provider availability. The Emulator would model transport and
-domain scenarios while remaining substitutable with real provider adapters.
-No such Stacks behavior exists in the current repository.
+requiring live provider availability. No Stacks provider, Stacks HTTP route,
+Stacks fixture, synthetic response, or replay response exists in the current
+repository.
 
 ## Frozen C9 financial observables
 
-The proposed C9 scope freezes three financial observables:
+The proposed C9 scope freezes exactly three financial observables:
 
-1. **C9.1 sBTC Supply & Peg State** — observable supply, mint/burn reconciliation,
-   and peg-state context derived from normalized Stacks/sBTC evidence.
-2. **C9.2 sBTC Bridge Flow** — normalized deposit and withdrawal activity across
-   the sBTC bridge, preserving direction, amount, status and time.
-3. **C9.3 sBTC Bridge Operational State** — bridge limits, chain state and signer
-   condition needed to describe operational availability and constraints.
+1. **C9.1 — sBTC Supply & Peg State** — observable supply, mint/burn
+   reconciliation and peg-state context derived from normalized Stacks/sBTC
+   evidence.
+2. **C9.2 — sBTC Bridge Flow** — normalized deposit and withdrawal activity
+   across the sBTC bridge, preserving direction, amount, status and time.
+3. **C9.3 — sBTC Bridge Operational State** — bridge limits, chain state and
+   signer condition needed to describe operational availability and
+   constraints.
 
-These observable names are frozen for documentation and contract design. Their
-runtime contracts, endpoint paths, provider adapters, fixtures and replay
-engines remain **PROPOSED / NOT IMPLEMENTED**.
+Their runtime contracts, endpoint paths, adapters, fixtures and replay engines
+remain **PROPOSED / NOT IMPLEMENTED**.
 
-## Proposed data surfaces
+## Canonical proposed logical source-surface map
 
-Every surface below is **PROPOSED / NOT IMPLEMENTED**.
+All 14 IDs below are proposed logical source surfaces. They are not registered
+endpoints.
 
-### C9 Native
+### Core surfaces
 
-- `sbtc_token_supply`
-- `sbtc_bridge_deposits`
-- `sbtc_bridge_withdrawals`
-- `sbtc_bridge_limits`
-- `sbtc_bridge_chainstate`
-- `sbtc_signer_state`
+| Proposed logical source surface | C9 observable ownership/support | Contextual consumers C1–C8 | Status |
+|---|---|---|---|
+| `sbtc_token_supply` | C9.1 | C5 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_bridge_deposits` | C9.2; may contribute to C9.3 where operational fields apply | C4, C5, C6 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_bridge_withdrawals` | C9.2; may contribute to C9.3 where operational fields apply | C4, C5, C6 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_bridge_limits` | C9.3 | C4, C6 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_bridge_chainstate` | C9.3 | C4, C5, C6 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_signer_state` | C9.3 | C5, C6 | PROPOSED / NOT IMPLEMENTED |
 
-The native surfaces are intended to support the three frozen C9 observables.
-They do not exist in `app/endpoint_registry.py` and have no Emulator routes
-or fixtures.
+### Transversal surfaces
 
-### Transversal
+| Proposed logical source surface | Contextual consumers C1–C8 | Status |
+|---|---|---|
+| `sbtc_ft_transfers` | C2, C5 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_holder_distribution` | C5 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_dex_trades` | C1, C2, C8 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_amm_pool_state` | C1, C8 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_lending_market_state` | C3, C6 | PROPOSED / NOT IMPLEMENTED |
+| `sbtc_protocol_liquidations` | C6, C7 | PROPOSED / NOT IMPLEMENTED |
+| `stacks_fee_state` | C6 | PROPOSED / NOT IMPLEMENTED |
+| `stacks_mempool_activity` | C6 | PROPOSED / NOT IMPLEMENTED |
 
-- `sbtc_ft_transfers`
-- `sbtc_holder_distribution`
-- `sbtc_dex_trades`
-- `sbtc_amm_pool_state`
-- `sbtc_lending_market_state`
-- `sbtc_protocol_liquidations`
-- `stacks_fee_state`
-- `stacks_mempool_activity`
+C9 does not appear in the contextual-consumer column because C9 owns and
+normalizes the Stacks/sBTC data; that column is reserved for downstream
+contextual consumers among C1–C8.
 
-Transversal surfaces would supply contextual observables that other VR1
-families may consume through versioned contracts. They remain owned and
-normalized by C9.
-
-## Cross-family use and semantic safeguards
-
-Proposed C9 observables could provide context to the existing C1–C8 families,
-but the following distinctions are mandatory:
+## Cross-family semantic guardrails
 
 - Token transfers may inform C2 flow context, but **transfers != CVD automatically**.
   CVD requires an aggressor-side trade model; raw transfers do not encode it.
@@ -130,18 +130,30 @@ Any future derived mapping must identify its source surface, transformation,
 contract version and limitations. It must never relabel a C9 primitive as a
 native C1–C8 measurement without an explicit validated derivation.
 
+## Pre-implementation exclusions
+
+At the current repository state:
+
+- the 14 IDs are proposed logical source surfaces, not registered endpoints;
+- no Stacks HTTP routes exist;
+- no Stacks fixtures exist;
+- no Stacks provider exists;
+- Milestone 1 has not started;
+- `app/endpoint_registry.py` remains limited to the 33 existing C1–C8
+  endpoints.
+
 ## Future contract requirements
 
 Future funded implementation should define, before adding routes:
 
-- provider-shape adapters for the approved Stacks/Hiro/Emily sources;
+- provider-shape adapters for approved Stacks/Hiro/Emily sources;
 - normalized timestamps, identifiers, assets, amounts, units and status enums;
 - versioned C9 schemas with provenance and data-quality metadata;
 - deterministic seeds and scenario IDs for synthetic responses;
 - replay ordering, cursor and pagination behavior;
 - error, stale-data, reorganization and provider-unavailable scenarios;
 - contract parity tests between real-provider shapes and Emulator responses;
-- explicit cross-family derivations that enforce the semantic safeguards above.
+- explicit cross-family derivations that enforce the semantic guardrails.
 
 These requirements are design constraints, not evidence of current
 implementation.
