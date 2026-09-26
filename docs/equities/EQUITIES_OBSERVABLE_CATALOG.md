@@ -1,123 +1,120 @@
-# Equities Observable Catalog
+# Proposed Equities Observable Catalog
 
-## Catalog status
+**Status for every entry:** PROPOSED EQUITIES OBSERVABLE — NOT IMPLEMENTED  
+**Scope:** TradELATIN VR1 Emulator  
+**Evaluated source:** SSL Market / IBKR
 
-**Status: PROPOSED EQUITIES OBSERVABLE / NOT IMPLEMENTED**
+## 1. Catalog rules
 
-This catalog assigns documentation-only IDs to the Equities observables found
-necessary from the SSL Market/IBKR source analysis. The IDs are not route IDs,
-endpoint IDs, registry entries or C9 observables.
+These are proposed logical observable IDs, not active endpoints, runtime
+registrations, contract fields, allowlist entries, or additions to the frozen
+**33 BTC/CRYPTO logical endpoints across C1–C8**.
 
-The existing BTC/CRYPTO inventory remains frozen at **33 logical endpoints
-across C1–C8**: 20 CoinGlass, 4 CryptoQuant and 9 Glassnode. Current Equities
-endpoint count: **0**. Current C9 endpoint count: **0**.
+The catalog does not freeze request parameters, venues, subscriptions, production
+symbols, URLs, pacing, payload schemas, or provider assignments. Availability
+depends on connection, entitlement, data type, instrument, venue, session, pacing,
+and completeness. Cross-family use does not transfer ownership or establish
+causality.
 
-## Source evidence
+## 2. C1 — Prices
 
-The SSL Market package consumes or constructs equivalents of IBKR Level I
-market data, daily historical OHLC, 5-second `TRADES` bars, Tick-by-Tick `Last`,
-SMART/direct market depth, reference instruments, shortable shares and an
-indicative halt field. SSL does not establish source support for Tick-by-Tick
-BidAsk, an options chain, option open interest, put/call metrics, market Greeks,
-an equity implied-volatility surface, borrow fee, participant identity,
-institutional flows or liquidations.
-
-Availability values below describe the approved source model, not current
-Emulator runtime availability. Every row remains **PROPOSED / NOT
-IMPLEMENTED**.
-
-## C1 — Prices
-
-| ID | Proposed observable | Class | SSL/IBKR source | Purpose | Availability and limitation |
+| Logical observable ID | Type | SSL/IBKR source | Measurement | Availability | Restrictions |
 |---|---|---|---|---|---|
-| `EQ.C1.1` | Daily OHLCV | RAW | Historical bars | Reproduce session price/volume bars. | `COMPLETE`; preserve session, timezone, bar size and adjustment policy. |
-| `EQ.C1.2` | 5-second trade bar | RAW | Real-time `TRADES` bars | Reproduce intraday OHLC, volume, WAP and trade count. | `COMPLETE`; not a quote bar. |
-| `EQ.C1.3` | Last trade | RAW | Tick-by-Tick `Last` | Reproduce timestamped trade price and size. | `COMPLETE`; conditions/exchange fields remain source dependent. |
-| `EQ.C1.4` | Level I quote | RAW | Market data bid/ask ticks | Reproduce best bid/ask and visible sizes. | `COMPLETE`; not full depth. |
-| `EQ.C1.5` | Traded volume | RAW | Market data and trade bars | Reproduce observable volume with declared interval. | `COMPLETE`; source volume conventions must remain explicit. |
+| `eq_c1_trade_price` | RAW | Tick-by-tick Last; Level I last | Execution/last price | DIRECT | Preserve source granularity. |
+| `eq_c1_best_quote` | RAW | Level I bid/ask | Reported best bid and ask | DIRECT | Preserve venue/routing, data type, staleness, crossed state. |
+| `eq_c1_ohlcv_bar` | RAW | Historical; real-time bars | Provider OHLCV by interval/session | DIRECT | Declare bar size, session, adjustment policy, volume units. |
+| `eq_c1_previous_close` | RAW | Historical/Level I | Provider previous close | DIRECT | Declare session and adjustment basis. |
+| `eq_c1_wap` | RAW | Real-time bars | Provider weighted average price for bar | DIRECT | Do not relabel as session VWAP without matching semantics. |
+| `eq_c1_reference_quote` | RAW | ES/NQ/VIX requests | Separate reference-instrument quote | PARTIAL | Preserve instrument, asset class, timestamp, source; context is not causality. |
+| `eq_c1_midpoint` | DERIVED | Valid best quote | Quote midpoint | DERIVED | Suppress for missing, stale, invalid, or crossed quotes. |
+| `eq_c1_return` | DERIVED | Versioned price series | Return over explicit window | DERIVED | Publish price basis, window, session boundary, missing-data policy. |
 
-## C2 — CVD & Order Flow
+## 3. C2 — CVD & Order Flow
 
-| ID | Proposed observable | Class | SSL/IBKR source | Purpose | Availability and limitation |
+| Logical observable ID | Type | SSL/IBKR source | Measurement | Availability | Restrictions |
 |---|---|---|---|---|---|
-| `EQ.C2.1` | Time & Sales trade | RAW | Tick-by-Tick `Last` | Reproduce ordered trade prints. | `PARTIAL`; consolidated/venue coverage depends on subscription and routing. |
-| `EQ.C2.2` | Estimated aggressor side | INFERRED | Trade plus contemporaneous quote | Classify `BUY`, `SELL` or `UNKNOWN`. | `PARTIAL`; method/version and quote timing are mandatory; no actor identity. |
-| `EQ.C2.3` | Classified buy/sell/unknown volume | DERIVED | `EQ.C2.1–2` | Preserve signed and unclassified volume totals. | `PARTIAL`; unknown volume must remain visible. |
-| `EQ.C2.4` | Cumulative volume delta | DERIVED | `EQ.C2.3` | Validate deterministic CVD over a declared range. | `PARTIAL`; report classification coverage; trades do not imply CVD automatically. |
-| `EQ.C2.5` | Large trade event | DERIVED | Tick-by-Tick `Last` | Mark prints meeting a versioned size/notional rule. | `PARTIAL`; large does not mean institutional and is not predictive. |
+| `eq_c2_trade_size` | RAW | Tick-by-tick Last | Reported executed size | PARTIAL | Coverage, units, and exposed conditions must be retained. |
+| `eq_c2_trade_count` | RAW | Real-time bars | Provider trade count per bar | PARTIAL | A bar count cannot reconstruct trade sequence. |
+| `eq_c2_volume_rate` | DERIVED | Trades/bars | Executed volume per time | DERIVED | Declare granularity, window, session, missing-event policy. |
+| `eq_c2_trade_rate` | DERIVED | Trade events/counts | Trades per time | DERIVED | Do not mix bar and tick counts without a method. |
+| `eq_c2_estimated_aggressor_volume` | INFERRED | Time & Sales + quotes | Estimated BUY/SELL/UNKNOWN volume | PARTIAL | Quote test only; preserve unknown volume and skew rules. |
+| `eq_c2_estimated_cvd` | INFERRED | Estimated aggressor volume | Classified buy minus sell cumulative volume | PARTIAL | Label estimated; publish coverage, unknown volume, method/window/reset. |
+| `eq_c2_classification_coverage` | DERIVED | Classification results | Fraction classified BUY/SELL | DERIVED | Quality fact, not predictive confidence. |
+| `eq_c2_large_trade_activity` | DERIVED | Trade-size distribution | Trades above versioned threshold | PARTIAL | No institution, whale, or intent claim. |
 
-## C3 — Open Interest / Positioning
+## 4. C3 — Open Interest / Positioning
 
-| ID | Proposed observable | Class | SSL/IBKR source | Purpose | Availability and limitation |
+| Logical observable ID | Type | SSL/IBKR source | Measurement | Availability | Restrictions |
 |---|---|---|---|---|---|
-| `EQ.C3.1` | Shortable shares | RAW | Generic market-data tick 236 | Reproduce reported shortable-share availability. | `PARTIAL`; broker-specific availability, not short interest, option OI or borrow fee. |
+| `eq_c3_shortable_shares` | RAW | Generic tick 236 | Indicative shares available to short | PARTIAL | Not OI, short interest, positioning, borrow fee, confirmed locate, or guaranteed availability. |
 
-## C6 — Volatility
+The evaluated SSL code does not acquire options OI, put/call, Greeks, IV
+surfaces, real borrow fees, or consolidated positioning.
 
-| ID | Proposed observable | Class | SSL/IBKR source | Purpose | Availability and limitation |
+## 5. Unsupported or non-applicable families
+
+| Family | Capability | Reason |
+|---|---|---|
+| C4 — Flows | UNSUPPORTED | Volume, signed volume, and depth changes are not ETF/fund/capital flows. |
+| C5 — On-Chain / Market State | NOT_APPLICABLE | Equities data is not the BTC on-chain/miner domain. |
+| C7 — Liquidations / Stress | UNSUPPORTED | No liquidation feed; halts, VIX, spread, and depth withdrawal are not liquidations. |
+| C9 — Blockchain Financial Networks | NOT_APPLICABLE | SSL/IBKR is not a blockchain source and does not change C9. |
+
+No observable IDs are assigned to these families from the evaluated SSL surfaces.
+
+## 6. C6 — Volatility
+
+| Logical observable ID | Type | SSL/IBKR source | Measurement | Availability | Restrictions |
 |---|---|---|---|---|---|
-| `EQ.C6.1` | Realized volatility | DERIVED | Price/trade-bar history | Validate observed return dispersion over a declared window. | `PARTIAL`; formula, sampling, annualization and minimum coverage are mandatory. |
-| `EQ.C6.2` | VIX reference price | RAW | VIX reference instrument quote | Reproduce an observable volatility-index value. | `PARTIAL`; a VIX quote is not the selected asset's implied-volatility surface. |
-| `EQ.C6.3` | Reference-market price | RAW | SPY, QQQ, SMH, ES or NQ quote | Reproduce explicit cross-market reference context. | `PARTIAL`; context only, not a regime or prediction. |
+| `eq_c6_realized_volatility` | DERIVED | Trade/OHLC returns | Realized variability by estimator/window | DERIVED | Publish sampling, estimator, annualization, session, gap policy; no regime. |
+| `eq_c6_intraday_range` | DERIVED | Intraday OHLC | High-low range in price/bps | DERIVED | Declare interval, session, missing bars, price basis. |
+| `eq_c6_gap` | DERIVED | Previous close + open/current | Session gap in price/bps | DERIVED | Adjustment policy and session boundary required. |
+| `eq_c6_vix_reference` | RAW | VIX market data | Observed VIX reference | PARTIAL | Separate instrument/context, not selected-equity realized volatility. |
 
-## C8 — Liquidity Microstructure
+Volatility regime, impulse, continuation, exhaustion, breakout, rejection, and
+market-state interpretation are excluded.
 
-| ID | Proposed observable | Class | SSL/IBKR source | Purpose | Availability and limitation |
+## 7. C8 — Liquidity Microstructure
+
+| Logical observable ID | Type | SSL/IBKR source | Measurement | Availability | Restrictions |
 |---|---|---|---|---|---|
-| `EQ.C8.1` | Level I bid/ask state | RAW | Market data bid/ask ticks | Reproduce best prices and visible sizes. | `COMPLETE`; retain venue/routing context. |
-| `EQ.C8.2` | Market-depth row | RAW | SMART/direct `reqMktDepth` | Reproduce price, size, side, position and operation. | `COMPLETE`; visible subscribed depth only. |
-| `EQ.C8.3` | Order-book update stream | RAW | Ordered depth callbacks | Reconstruct deterministic book state. | `COMPLETE`; sequence and reset boundaries are required. |
-| `EQ.C8.4` | Quoted spread | DERIVED | `EQ.C8.1` | Validate `ask - bid` and optional basis-point form. | `COMPLETE`; crossed/locked/invalid quotes require explicit quality handling. |
-| `EQ.C8.5` | Visible depth imbalance | DERIVED | `EQ.C8.2–3` | Compare declared bid/ask depth ranges. | `COMPLETE`; not a directional signal. |
-| `EQ.C8.6` | Depth concentration | DERIVED | `EQ.C8.2–3` | Measure visible liquidity concentration by level/range. | `COMPLETE`; does not include hidden liquidity. |
-| `EQ.C8.7` | Large visible order | DERIVED | `EQ.C8.2–3` | Identify rows meeting a versioned visible-size rule. | `COMPLETE`; visibility is not execution or participant identity. |
-| `EQ.C8.8` | Liquidity persistence | DERIVED | Repeated depth states | Measure how long qualifying visible liquidity remains observed. | `COMPLETE`; does not prove intent. |
-| `EQ.C8.9` | Liquidity disappearance | DERIVED | Depth remove/change events | Record loss of previously visible liquidity. | `COMPLETE`; cannot distinguish cancellation, fill or feed change without evidence. |
-| `EQ.C8.10` | Liquidity replenishment | DERIVED | Ordered depth events | Record visible size restored after removal or consumption. | `COMPLETE`; no participant attribution. |
-| `EQ.C8.11` | Sweep-like sequence | DERIVED | Trades plus ordered depth changes | Reproduce a multi-level observable consumption pattern. | `COMPLETE`; “sweep-like” is descriptive, not actor identity or intent. |
-| `EQ.C8.12` | Inferred large-liquidity activity | INFERRED | Large-order, persistence and depth-event evidence | Validate a bounded inference from observable inputs. | `PARTIAL`; evidence/rule/confidence required; no spoofing or institutional claim. |
+| `eq_c8_top_of_book_size` | RAW | Level I sizes | Displayed best bid/ask size | DIRECT | Venue/routing and units required. |
+| `eq_c8_depth_level` | RAW | Depth callbacks | Price, size, side, position/venue where exposed | PARTIAL | Visible book only; handle operations, resets, sequence integrity. |
+| `eq_c8_spread` | DERIVED | Valid best quote | Absolute/bps bid-ask spread | DERIVED | Suppress stale, crossed, missing, or mismatched scope. |
+| `eq_c8_top_imbalance` | DERIVED | Top sizes | Top-of-book imbalance | DERIVED | Define zero/missing behavior and formula version. |
+| `eq_c8_microprice` | DERIVED | Best prices/sizes | Size-weighted top price estimate | DERIVED | Descriptive only, not forecast/fair value. |
+| `eq_c8_visible_bid_depth` | DERIVED | Rebuilt bid book | Displayed bid depth by scope | PARTIAL | Publish levels/range, completeness, venue, timestamp. |
+| `eq_c8_visible_ask_depth` | DERIVED | Rebuilt ask book | Displayed ask depth by scope | PARTIAL | Same restrictions as bid depth. |
+| `eq_c8_depth_imbalance` | DERIVED | Bid/ask depth | Relative visible-depth imbalance | PARTIAL | Matched scopes and complete-enough snapshot required. |
+| `eq_c8_depth_concentration` | DERIVED | Depth levels | Concentration across prices/levels | PARTIAL | Formula, scope, venue, reset state required. |
+| `eq_c8_displayed_liquidity_change` | DERIVED | Depth history | Added/removed displayed size | PARTIAL | Removal does not identify cancellation, execution, replacement, or correction. |
+| `eq_c8_large_visible_order` | DERIVED | Depth-size distribution | Visible size above threshold | PARTIAL | No participant identity, intent, or guaranteed executable liquidity. |
+| `eq_c8_visible_liquidity_persistence` | DERIVED | Depth history | Duration/recurrence of large visible liquidity | PARTIAL | Does not prove one participant; identity/replacement rules required. |
+| `eq_c8_time_sales` | RAW | Tick-by-tick Last | Normalized observed execution sequence | PARTIAL | Preserve feed coverage, conditions where exposed, event/receipt time. |
+| `eq_c8_large_liquidity_activity` | INFERRED | Large trades + depth changes | Qualified concurrence of large executed/displayed activity | PARTIAL | No institution, whale, intent, causality, absorption, or setup claim. |
+| `eq_c8_observable_sweep_behavior` | INFERRED | Trades, quotes, depth | Rapid executions across levels with book changes | PARTIAL | No LONG/SHORT, breakout, rejection, continuation, exhaustion, or advice. |
+| `eq_c8_depth_tape_alignment` | INFERRED | Depth + classified tape | Quantitative alignment/conflict | PARTIAL | Tape side remains estimated; alignment is not confirmation/causality. |
 
-## Required fixture and scenario map
+## 8. Existing inputs versus additional acquisition
 
-| SSL observable | C-family | Raw/Derived/Inferred | Required future fixture | Suggested deterministic scenarios |
-|---|---|---|---|---|
-| Historical and 5-second OHLCV | C1 | RAW | Timestamped bars with explicit session/units | normal, quiet, high-volume, volatility expansion/contraction |
-| Last trades / Time & Sales | C1, C2, C8 | RAW | Ordered trade events plus source metadata | aggressive buying/selling, large buy/sell, burst of large trades, gap |
-| Bid/ask and sizes | C1, C8 | RAW | Level I quote-event stream | spread widening/compression, stale data, locked/crossed quality case |
-| Depth rows and updates | C8 | RAW | Initial book plus ordered insert/update/delete events | thin/deep, bid-heavy, ask-heavy, balanced, removal/replenishment |
-| Estimated aggressor flow and CVD | C2 | INFERRED / DERIVED | Trades synchronized with quote evidence and expected classification | buying, selling, mixed flow and explicit UNKNOWN coverage |
-| Large-trade classification | C2, C8 | DERIVED | Trades around a versioned threshold | large buy, large sell, threshold boundary, burst |
-| Spread, imbalance and concentration | C8 | DERIVED | Level I/depth inputs plus expected calculations | widening/compression and thin/deep/balanced/heavy books |
-| Large visible orders and persistence | C8 | DERIVED | Repeated depth states with controlled changes | large bid/ask, persistence, disappearance, cancellation-like removal |
-| Sweep-like sequence | C8 | DERIVED | Synchronized prints and multi-level depth depletion | observable buy-side and sell-side sweep-like sequences |
-| Realized volatility | C6 | DERIVED | Price series plus formula/window/annualization | expansion and contraction |
-| VIX/reference instruments | C6 | RAW | Synchronized reference quotes | normal, stale reference and temporary gap |
-| Shortable shares | C3 | RAW | Timestamped broker-reported quantity/status | available, constrained, stale and unavailable |
+Expected Processing results that future Emulator fixtures must make reproducible from evaluated SSL surfaces: midpoint, returns, spread, microprice,
+depth totals/imbalance/concentration, displayed changes/persistence, large visible
+orders/trades, estimated aggression/CVD/coverage, realized volatility/ranges/gaps,
+and qualified large-liquidity/sweep observations.
 
-## Expected-value requirements
+Additional real-source acquisition in Processing and separate approval are required for options chains/OI/Greeks/IV,
+put/call metrics, borrow fee/rebate, confirmed locates, consolidated short
+interest, ETF creations/redemptions, capital flows, full consolidated depth where
+not supplied, participant identity, and C7 liquidation data.
 
-Every future fixture must contain known expected values or explicit tolerances.
-At minimum:
+## 9. Approval gate
 
-- bars: exact OHLC, volume, WAP/trade-count fields where supplied;
-- trades: event count, total volume, large-trade IDs and threshold version;
-- C2: BUY/SELL/UNKNOWN volume, classification coverage and terminal CVD;
-- Level I: bid, ask, sizes, spread and data age;
-- depth: exact reconstructed rows, bid/ask totals, imbalance, concentration and
-  event-sequence checksum;
-- liquidity events: qualifying order IDs/levels, first/last observation,
-  duration, disappearance/replenishment evidence and inference confidence;
-- volatility: return convention, window, annualization and expected result;
-- quality cases: expected `source_status`, gap interval and stale-age boundary.
+Before promotion, each ID requires definition/ownership approval, source and
+entitlement validation, units/windows/session behavior, method version, replay
+fixtures and deterministic tests, versioned contract mapping, BTC compatibility
+evidence, and coordinated capability mapping for Emulator, Integration, and
+Screen.
 
-## Blocked observables
+Until then every ID remains **PROPOSED EQUITIES OBSERVABLE — NOT IMPLEMENTED**
+and excluded from the current runtime.
 
-The following must not be simulated until a validated source and semantic
-contract are approved: option open interest, put/call metrics, option-chain
-implied volatility, market Greeks, dealer/GEX positioning, real borrow fee,
-institutional/fund flows, dark-pool or participant identity, hidden liquidity,
-queue position, spoofing intent, full consolidated order book, forced
-liquidations, and blockchain observables.
-
-No proxy from C1, C2, C6 or C8 may be relabeled as one of these blocked
-observables.
